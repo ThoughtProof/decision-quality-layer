@@ -27,8 +27,10 @@
  *   emits {PASS, FAIL, UNCERTAIN, confidence, reasoning, objection} per axis.
  *   Rebuilding this thin cascade lets us keep our verdict vocabulary and
  *   avoid synthesising dummy step_evaluations on every call. The ADR-0007
- *   invariants (cross-family primary/secondary; disagreement→more conservative)
- *   are ported wholesale — see the guards below.
+ *   invariant used here is disagreement→more-conservative. (The cross-vendor-
+ *   family part of ADR-0007 does NOT apply: DQL runs serv-nano→serv-swift, two
+ *   SERV models of different capability tiers on the same provider.) The
+ *   early-exit and conservative-aggregation guards are ported wholesale — see below.
  */
 
 import type { AxisPrompt } from './axes/types.js';
@@ -50,6 +52,17 @@ export interface PotCliCascadeConfig {
    * — chosen to align with the aggregation rule "FAIL≥0.7 → BLOCK".
    */
   earlyExitFailConfidence?: number;
+  /**
+   * confirmFail (2026-07-08, env-gated via DQL_CONFIRM_FAIL, default OFF):
+   * mirrors Sentinel's confirmBlocks fix. When ON, a high-confidence primary
+   * FAIL no longer early-exits — the secondary is called to confirm. If the
+   * secondary agrees (FAIL/UNCERTAIN) the FAIL stands; if it disagrees (PASS)
+   * combineVerdicts applies (disagreement → FAIL stays, but now it's a
+   * two-model decision, not a single unstable serv-nano call). Default OFF
+   * keeps the cheap early-exit. Rationale: today's Sentinel RCA showed
+   * nano-solo verdicts can be unstable; confirming them removes that risk.
+   */
+  confirmFail?: boolean;
   /** Per-call maxTokens for the underlying LLM client. Default: 512. */
   maxTokens?: number;
 }
@@ -58,6 +71,7 @@ const DEFAULT_CONFIG: Required<PotCliCascadeConfig> = {
   primaryModel: 'serv-nano',
   secondaryModel: 'serv-swift',
   earlyExitFailConfidence: 0.7,
+  confirmFail: process.env.DQL_CONFIRM_FAIL === '1',
   maxTokens: 512,
 };
 
@@ -80,7 +94,11 @@ export class PotCliCascade implements Cascade {
     modelsUsed.push(primary.modelId);
 
     // Early-exit on high-confidence FAIL — conservative and cheap.
+    // Skipped when confirmFail is ON: then even a high-confidence primary FAIL
+    // is confirmed by the secondary (mirrors Sentinel confirmBlocks), so a
+    // single unstable serv-nano call can't decide a FAIL alone.
     if (
+      !this.config.confirmFail &&
       primary.result.verdict === 'FAIL' &&
       primary.result.confidence >= this.config.earlyExitFailConfidence
     ) {

@@ -29,7 +29,7 @@ The cascade is wired but the 40 spike cases from [docs/SPIKE-RESULTS.md](./docs/
 
 - Vercel project setup (mirror `thoughtproof-sentinel` config).
 - DNS: `dql.thoughtproof.ai` CNAME → Vercel.
-- Env vars — see [docs/ENV.md](./docs/ENV.md). Minimum for a live deploy: `DQL_CASCADE=pot-cli`, `OPENAI_API_KEY`, `GROQ_API_KEY`. Upstash Redis for rate-limit lands with payment gates.
+- Env vars — see [docs/ENV.md](./docs/ENV.md). Minimum for a live deploy: `DQL_CASCADE=pot-cli`, `SERV_API_KEY`. Upstash Redis for rate-limit lands with payment gates.
 
 ### 3. HF endpoint (for BrowseSafe-Bench run, separate track)
 

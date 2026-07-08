@@ -18,16 +18,16 @@ deterministic for developer integration testing.
 
 The production cascade is `serv-nano → serv-swift`, mapped to concrete
 provider models in `src/engine/llm-client.ts:DEFAULT_MODEL_MAP`. It
-enforces the ADR-0007 cross-family invariant: primary and secondary must
-belong to different provider families.
+uses distinct SERV models of different capability tiers for the two-stage
+validation approach.
 
 | Alias         | Provider (default) | Model                       | Env var         |
-|---------------|--------------------|-----------------------------|-----------------|
-| `serv-nano`   | OpenAI             | `gpt-4o-mini`               | `OPENAI_API_KEY`|
-| `serv-swift`  | Groq               | `llama-3.1-70b-versatile`   | `GROQ_API_KEY`  |
+|---------------|--------------------|-----------------------------|-----------------| 
+| `serv-nano`   | SERV (openserv.ai) | `serv-nano`                 | `SERV_API_KEY`  |
+| `serv-swift`  | SERV (openserv.ai) | `serv-swift`                | `SERV_API_KEY`  |
 
-Both keys are required when `DQL_CASCADE=pot-cli`. The client makes plain
-OpenAI-compatible `POST /v1/chat/completions` calls with
+The key is required when `DQL_CASCADE=pot-cli`. The client makes plain
+OpenAI-compatible `POST /v1/chat/completions` calls to `inference-api.openserv.ai/v1` with
 `response_format: json_object`; no additional SDK setup is needed.
 
 If a secondary call fails at runtime the cascade enters **degraded mode**:
@@ -41,8 +41,7 @@ Set these in the Vercel dashboard for `dql.thoughtproof.ai`:
 
 ```
 DQL_CASCADE=pot-cli
-OPENAI_API_KEY=sk-...
-GROQ_API_KEY=gsk_...
+SERV_API_KEY=serv_...
 ```
 
 Non-cascade variables (payment, rate-limit) land in Phase 2 and will be
@@ -63,7 +62,7 @@ Vercel template.
 ## Auditing what a call used
 
 Every response's `meta.models_used` array reports the concrete backends
-that answered — e.g. `["openai:gpt-4o-mini", "groq:llama-3.1-70b-versatile"]`
-when the cascade ran both stages, or `["openai:gpt-4o-mini"]` when the
+that answered — e.g. `["serv:serv-nano", "serv:serv-swift"]`
+when the cascade ran both stages, or `["serv:serv-nano"]` when the
 primary early-exited on a high-confidence FAIL. This is the fastest way
 to confirm the env is wired correctly against a live deployment.

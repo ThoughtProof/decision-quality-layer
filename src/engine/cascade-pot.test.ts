@@ -77,6 +77,39 @@ describe('PotCliCascade: early exit', () => {
   });
 });
 
+describe('PotCliCascade: confirmFail (mirrors Sentinel confirmBlocks)', () => {
+  // Discriminating test: SAME high-confidence primary FAIL, OFF vs ON must differ.
+  const HIGH_CONF_FAIL = { verdict: 'FAIL' as const, confidence: 0.85, objection: 'primary saw problem' };
+
+  it('OFF (default): high-conf FAIL early-exits, secondary NOT called', async () => {
+    const client = makeClient([HIGH_CONF_FAIL, { verdict: 'PASS', confidence: 0.9 }]);
+    const cascade = new PotCliCascade(client, { confirmFail: false });
+    const out = await cascade.run(AXIS_INPUT);
+    expect(out.modelsUsed).toEqual(['mock:serv-nano']);        // secondary skipped
+    expect(out.result.verdict).toBe('FAIL');
+    expect(out.result.reasoning).toMatch(/early-exit/);
+  });
+
+  it('ON: high-conf FAIL is confirmed by secondary (secondary IS called)', async () => {
+    // Secondary disagrees (PASS) — under combineVerdicts a PASS↔FAIL disagreement
+    // stays FAIL (conservative), but now it is a TWO-model decision, not nano-solo.
+    const client = makeClient([HIGH_CONF_FAIL, { verdict: 'PASS', confidence: 0.9 }]);
+    const cascade = new PotCliCascade(client, { confirmFail: true });
+    const out = await cascade.run(AXIS_INPUT);
+    expect(out.modelsUsed).toEqual(['mock:serv-nano', 'mock:serv-swift']);  // secondary called
+    expect(out.result.verdict).toBe('FAIL');                                // conservative outcome
+    expect(out.result.reasoning).not.toMatch(/early-exit/);                 // no early-exit path
+    expect(out.result.reasoning).toMatch(/disagreement/);                   // went through combineVerdicts
+  });
+
+  it('ON: secondary CONFIRMS the FAIL → FAIL stands as a two-model verdict', async () => {
+    const client = makeClient([HIGH_CONF_FAIL, { verdict: 'FAIL', confidence: 0.6, objection: 'secondary confirms' }]);
+    const out = await new PotCliCascade(client, { confirmFail: true }).run(AXIS_INPUT);
+    expect(out.modelsUsed).toEqual(['mock:serv-nano', 'mock:serv-swift']);
+    expect(out.result.verdict).toBe('FAIL');
+  });
+});
+
 describe('PotCliCascade: agreement paths', () => {
   it('agreement PASS → PASS with min-confidence', async () => {
     const client = makeClient([

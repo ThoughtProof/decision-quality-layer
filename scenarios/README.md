@@ -63,8 +63,7 @@ To exercise the full suite against a live cascade:
 
 ```bash
 export DQL_CASCADE=pot-cli
-export OPENAI_API_KEY=sk-...
-export GROQ_API_KEY=gsk_...
+export SERV_API_KEY=serv_...
 
 npm run scenarios:spike             # runs all 40 cases, prints per-case + summary
 npm run scenarios:spike -- --limit 5  # smoke-test the first 5

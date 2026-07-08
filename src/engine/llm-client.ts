@@ -14,6 +14,7 @@
  * ADR-0007 in the Sentinel repo for the empirical basis of that pattern.
  *
  * Supported providers:
+ *   - `serv`    — SERV provider (openserv.ai) - default for DQL cascade  
  *   - `openai`  — raw OpenAI chat-completions API
  *   - `groq`    — Groq chat-completions (OpenAI-compatible)
  *   - `mock`    — in-memory router, driven by MockRegistry (tests only)
@@ -43,12 +44,15 @@ export interface LlmClient {
  * Map alias → concrete backend. Keys are the aliases used by the cascade
  * (`serv-nano` = fast/cheap primary; `serv-swift` = stronger secondary).
  *
- * Kept minimal on purpose: the ADR-0007 cross-family invariant (primary
- * and secondary must differ in provider family) is checked at cascade
- * build time, not here.
+ * Kept minimal on purpose. NOTE (2026-07-08): DQL runs both stages on the SERV
+ * stack (serv-nano primary, serv-swift secondary) — same provider, different
+ * capability tiers. This is NOT the ADR-0007 cross-vendor-family setup; the
+ * second-opinion value here comes from serv-swift being a stronger SERV model
+ * than serv-nano, not from a different vendor. There is intentionally no
+ * cross-family assertion at build time (it would reject two 'serv' bindings).
  */
 export interface ModelBinding {
-  provider: 'openai' | 'groq';
+  provider: 'openai' | 'groq' | 'serv';
   modelId: string;
   /** Name of the env var that carries the API key. */
   apiKeyEnv: string;
@@ -56,21 +60,23 @@ export interface ModelBinding {
 }
 
 export const DEFAULT_MODEL_MAP: Record<string, ModelBinding> = {
-  // Primary — fast/cheap. OpenAI's cheapest capable chat model.
+  // Primary — SERV serv-nano (openserv.ai). Same model Sentinel uses as its
+  // standard-tier primary. NOT OpenAI gpt-4o-mini — DQL runs on the SERV stack
+  // via SERV_API_KEY, identical to pot-cli's model-router bindings.
   'serv-nano': {
-    provider: 'openai',
-    modelId: 'gpt-4o-mini',
-    apiKeyEnv: 'OPENAI_API_KEY',
-    baseUrl: 'https://api.openai.com/v1',
+    provider: 'serv',
+    modelId: 'serv-nano',
+    apiKeyEnv: 'SERV_API_KEY',
+    baseUrl: process.env.SERV_BASE_URL ?? 'https://inference-api.openserv.ai/v1',
   },
-  // Secondary — different family (cross-family invariant, ADR-0007).
-  // Groq's Llama-3.1-70b hits the "different family, comparable strength"
-  // slot without pulling in a second commercial vendor.
+  // Secondary — SERV serv-swift. The cross-family strength comes from serv-swift
+  // being a distinct, larger SERV model than serv-nano (mirrors Sentinel's
+  // nano→swift standard-tier cascade), not from a second commercial vendor.
   'serv-swift': {
-    provider: 'groq',
-    modelId: 'llama-3.1-70b-versatile',
-    apiKeyEnv: 'GROQ_API_KEY',
-    baseUrl: 'https://api.groq.com/openai/v1',
+    provider: 'serv',
+    modelId: 'serv-swift',
+    apiKeyEnv: 'SERV_API_KEY',
+    baseUrl: process.env.SERV_BASE_URL ?? 'https://inference-api.openserv.ai/v1',
   },
 };
 
@@ -109,13 +115,17 @@ export class HttpLlmClient implements LlmClient {
           { role: 'system', content: input.system },
           { role: 'user', content: input.user },
         ],
-        // Low temperature: we want the JSON payload to be as stable as
-        // possible across runs. The orthogonality spike was run at 0.1.
-        temperature: 0.1,
+        // Deterministic decoding — matches Sentinel's cascade (temperature: 0,
+        // seed: 42). The DQL orthogonality spike was itself run through the
+        // pot-cli grader at temp 0 / seed 42; running the live cascade at 0.1
+        // without a seed would reintroduce exactly the verdict non-determinism
+        // that the Sentinel RCA (2026-07-08) tracked down. Keep it pinned.
+        temperature: 0,
+        seed: 42,
         max_tokens: input.maxTokens ?? 512,
-        // JSON mode where supported. Groq accepts response_format on newer
-        // models; OpenAI supports it broadly. If a model rejects the field
-        // we fall back to plain text and let parseAxisResponse handle it.
+        // JSON mode: SERV (openserv.ai) is OpenAI-compatible and accepts
+        // response_format. If a model rejects the field we fall back to plain
+        // text and let parseAxisResponse handle it.
         response_format: { type: 'json_object' },
       }),
     });
