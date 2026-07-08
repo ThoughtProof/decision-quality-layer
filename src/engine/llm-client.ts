@@ -122,7 +122,9 @@ export class HttpLlmClient implements LlmClient {
         // that the Sentinel RCA (2026-07-08) tracked down. Keep it pinned.
         temperature: 0,
         seed: 42,
-        max_tokens: input.maxTokens ?? 512,
+        // SERV (openserv.ai) requires 'max_completion_tokens', not the legacy
+        // 'max_tokens' (returns HTTP 400 unsupported_parameter otherwise).
+        max_completion_tokens: input.maxTokens ?? 512,
         // JSON mode: SERV (openserv.ai) is OpenAI-compatible and accepts
         // response_format. If a model rejects the field we fall back to plain
         // text and let parseAxisResponse handle it.
