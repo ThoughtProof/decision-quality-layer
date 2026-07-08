@@ -1,0 +1,30 @@
+{
+  "name": "decision-quality-layer",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Decision Quality Layer — 5-axis reasoning verification for AI agents",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThoughtProof/decision-quality-layer"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "dev": "echo 'Use: npx vercel dev --listen 3002'"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vercel/node": "^5.8.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.0"
+  },
+  "dependencies": {
+    "@upstash/ratelimit": "^2.0.8",
+    "@upstash/redis": "^1.38.0",
+    "canonicalize": "^3.0.0",
+    "pot-cli": "^0.8.8"
+  }
+}
