@@ -276,7 +276,7 @@ const spec = {
                 type: 'array',
                 items: { type: 'string' },
                 description:
-                  'Concrete provider:model identifiers the cascade actually invoked, e.g. "openai:gpt-4o-mini".',
+                  'Concrete provider:model identifiers the cascade actually invoked, e.g. "serv:serv-nano".',
               },
               axes_evaluated: {
                 type: 'array',

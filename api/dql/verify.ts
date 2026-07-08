@@ -17,8 +17,7 @@
  *   sandbox: true         → SandboxCascade (regardless of DQL_CASCADE)
  *
  * PotCliCascade requires:
- *   OPENAI_API_KEY  — serv-nano (gpt-4o-mini)
- *   GROQ_API_KEY    — serv-swift (llama-3.1-70b-versatile)
+ *   SERV_API_KEY    — for both serv-nano and serv-swift models
  * See docs/ENV.md for the full list.
  *
  * Pricing (see src/pricing.ts):

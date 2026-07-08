@@ -18,8 +18,7 @@
  *
  * Env:
  *   DQL_CASCADE=pot-cli
- *   OPENAI_API_KEY=...
- *   GROQ_API_KEY=...
+ *   SERV_API_KEY=...
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -75,7 +74,7 @@ const sandboxCascade = new SandboxCascade();
 
 if (cascade instanceof StubCascade) {
   console.warn('⚠  DQL_CASCADE not set to pot-cli — running against StubCascade will report 0% axis-hit-rate.');
-  console.warn('   For a real regression run, export DQL_CASCADE=pot-cli plus OPENAI_API_KEY and GROQ_API_KEY.');
+  console.warn('   For a real regression run, export DQL_CASCADE=pot-cli plus SERV_API_KEY.');
 }
 
 // ---- runner ----------------------------------------------------------------

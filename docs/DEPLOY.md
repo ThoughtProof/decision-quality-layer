@@ -60,16 +60,14 @@ Setzen für **Production, Preview, Development** (alle drei Environments):
 | Name             | Wert                          | Notes                                                                 |
 |------------------|-------------------------------|-----------------------------------------------------------------------|
 | `DQL_CASCADE`    | `pot-cli`                     | `stub` in Preview reicht, wenn keine Cost verbraucht werden soll      |
-| `OPENAI_API_KEY` | `sk-...`                      | Für serv-nano (gpt-4o-mini). ThoughtProof-Org-Key.                    |
-| `GROQ_API_KEY`   | `gsk_...`                     | Für serv-swift (llama-3.1-70b-versatile).                             |
+| `SERV_API_KEY`   | `serv_...`                    | Für beide serv-nano und serv-swift Modelle (openserv.ai).            |
 | `NODE_ENV`       | `production` (auto)           | Setzt Vercel automatisch, nicht überschreiben.                        |
 
 CLI-Weg (nur Prod):
 
 ```bash
 npx vercel env add DQL_CASCADE production
-npx vercel env add OPENAI_API_KEY production
-npx vercel env add GROQ_API_KEY production
+npx vercel env add SERV_API_KEY production
 ```
 
 Verify:
@@ -194,7 +192,7 @@ Rutscht eine Kennzahl unter Floor → deploy als **nicht** produktionsreif
 markieren, Ursachen in `scenarios/last-run.json` prüfen (per-Case-Verdicts),
 ggf. Cascade zurück auf `stub` und rausbugfixen.
 
-Kosten: ~$2 pro Full-Run (40 × 2 LLM calls, gpt-4o-mini + llama-3.1-70b).
+Kosten: ~$2 pro Full-Run (40 × 2 LLM calls, serv-nano + serv-swift via SERV).
 
 ---
 
@@ -222,7 +220,7 @@ muss existieren. Redeploy.
 neu triggern (Env-Änderungen brauchen einen Redeploy).
 
 **`/dql/verify` gibt `insufficient_upstream_credit`**
-→ `OPENAI_API_KEY` oder `GROQ_API_KEY` invalidiert. Neuen Key setzen, Redeploy.
+→ `SERV_API_KEY` invalidiert. Neuen Key setzen, Redeploy.
 
 **TLS-Handshake schlägt fehl auf `dql.thoughtproof.ai`**
 → Cloudflare-Proxy-Status auf **DNS only** stellen (grau, kein orange).
