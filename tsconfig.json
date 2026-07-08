@@ -19,6 +19,6 @@
     "sourceMap": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src/**/*", "api/**/*"],
-  "exclude": ["node_modules", "dist", "scenarios"]
+  "include": ["src/**/*", "api/**/*", "scenarios/**/*.test.ts"],
+  "exclude": ["node_modules", "dist", "scripts"]
 }

@@ -1,6 +1,6 @@
 {
   "name": "decision-quality-layer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "description": "Decision Quality Layer — 5-axis reasoning verification for AI agents",
@@ -13,7 +13,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "dev": "echo 'Use: npx vercel dev --listen 3002'"
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "echo 'Use: npx vercel dev --listen 3002'",
+    "scenarios:spike": "npm run build && node scripts/run-spike-scenarios.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
