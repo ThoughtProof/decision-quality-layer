@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": false,
   "type": "module",
-  "description": "Decision Quality Layer — 5-axis reasoning verification for AI agents",
+  "description": "Decision Quality Layer \u2014 5-axis reasoning verification for AI agents",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,7 +15,11 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "dev": "echo 'Use: npx vercel dev --listen 3002'",
-    "scenarios:spike": "npm run build && node scripts/run-spike-scenarios.mjs"
+    "scenarios:spike": "npm run build && node scripts/run-spike-scenarios.mjs --file scenarios/spike-40-coarse.jsonl --expect 40",
+    "scenarios:spike-coarse": "npm run build && node scripts/run-spike-scenarios.mjs --file scenarios/spike-40-coarse.jsonl --expect 40",
+    "scenarios:spike-subtle": "npm run build && node scripts/run-spike-scenarios.mjs --file scenarios/spike-40-subtle.jsonl --expect 40",
+    "scenarios:spike-80": "npm run build && node scripts/run-spike-scenarios.mjs --file scenarios/spike-80.jsonl --expect 80",
+    "scenarios:spike-80-live": "node scripts/run-spike-scenarios-http.mjs --file scenarios/spike-80.jsonl --base https://dql.thoughtproof.ai --expect 80"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

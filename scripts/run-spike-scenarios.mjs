@@ -14,7 +14,10 @@
  * `npm run scenarios:spike`.
  *
  * Usage:
- *   node scripts/run-spike-scenarios.mjs [--limit N] [--ids id1,id2] [--out path]
+ *   node scripts/run-spike-scenarios.mjs [--file path] [--limit N] [--ids id1,id2] [--out path] [--expect N]
+ *
+ * Defaults to scenarios/spike-40.jsonl with an expected count of 40. Override
+ * with --file for pilots or Spike-80. Pass --expect 0 to skip the count check.
  *
  * Env:
  *   DQL_CASCADE=pot-cli
@@ -41,17 +44,20 @@ function argVal(name) {
 const limit = Number(argVal('--limit') ?? '0') || 0;
 const idsFilter = (argVal('--ids') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 const outPath = argVal('--out') ?? resolve(__dirname, '..', 'scenarios', 'last-run.json');
+const fileArg = argVal('--file') ?? 'scenarios/spike-40.jsonl';
+const expected = argVal('--expect');
+const expectedCount = expected === undefined ? 40 : Number(expected);
 
 // ---- load scenarios --------------------------------------------------------
 
-const scenarioPath = resolve(__dirname, '..', 'scenarios', 'spike-40.jsonl');
+const scenarioPath = resolve(__dirname, '..', fileArg);
 const scenarios = readFileSync(scenarioPath, 'utf8')
   .split('\n')
   .filter((l) => l.trim())
   .map((l) => JSON.parse(l));
 
-if (scenarios.length !== 40) {
-  throw new Error(`expected 40 scenarios, got ${scenarios.length}`);
+if (expectedCount > 0 && scenarios.length !== expectedCount) {
+  throw new Error(`expected ${expectedCount} scenarios in ${fileArg}, got ${scenarios.length}`);
 }
 
 const filtered = scenarios

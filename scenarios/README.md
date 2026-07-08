@@ -6,10 +6,23 @@ Orthogonality Spike (see [docs/SPIKE-RESULTS.md](../docs/SPIKE-RESULTS.md)).
 
 ## Files
 
-- **`spike-40.jsonl`** — the 40 hand-crafted cases from the spike, one JSON
-  object per line. Each case is designed so a single axis should emit
-  `FAIL`; the other four should stay quiet (`PASS`) if the axes are
-  genuinely orthogonal.
+- **`spike-40-coarse.jsonl`** — the original 40 hand-crafted cases from the
+  orthogonality spike, one JSON object per line. Each case is a *coarse*
+  single-axis-fail scenario: the designed axis is clearly violated and
+  the other four *should* stay quiet if the axes are orthogonal. In
+  practice on the live cascade, coarse errors trigger multiple axes
+  (genuine two-model agreement, not aggregation artifact — see
+  `docs/SPIKE-RESULTS.md`).
+
+- **`spike-40-subtle.jsonl`** — 40 hand-crafted *subtle* single-axis cases,
+  8 per axis, added in Spike-80 (2026-07-08). Cases are constructed so the
+  designed axis is violated but the other four are more defensibly clean.
+  On the live cascade these push mean pairwise axis correlation down from
+  0.184 (coarse) to 0.043 (subtle) — the primary orthogonality signal.
+
+- **`spike-80.jsonl`** — concatenation of coarse + subtle (80 cases). Used
+  for the combined regression baseline. This is the canonical file for
+  `npm run scenarios:spike-80`.
 
 ## Scenario schema
 
