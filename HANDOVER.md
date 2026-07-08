@@ -1,6 +1,6 @@
 # HANDOVER — Decision Quality Layer (DQL)
 
-**Status:** Phase 0 scaffold committed. Ready for Phase 1 (real cascade wiring + Vercel deploy).
+**Status:** Phase 0.2 committed — real cascade adapter wired behind `DQL_CASCADE=pot-cli`. Ready for Vercel deploy + payment gates (Phase 2).
 
 **Owner handoff:** Raul (product / repo) → Hermes (cascade wiring, deploy, HF token).
 
@@ -13,25 +13,23 @@
 - Per-axis prompt builders for all 5 axes (`src/engine/axes/*.ts`) — carrying the spike-validated framing.
 - Aggregation logic with pre-registered rules (`src/aggregation.ts`).
 - Cascade interface + `StubCascade` for local dev + `parseAxisResponse` shared parser.
-- Vitest test suite covering aggregation, validation, cascade parsing, and engine orchestration.
-- Docs: `README.md`, `docs/ARCHITECTURE.md`, `docs/SPIKE-RESULTS.md`.
+- **PotCliCascade** (`src/engine/cascade-pot.ts`) — real two-stage cascade (`serv-nano` → `serv-swift`) with early-exit, degraded-mode, and conservative disagreement rules ported from the Sentinel `runCascade` ADR-0007 pattern.
+- **HttpLlmClient** (`src/engine/llm-client.ts`) — minimal OpenAI-compatible provider router. Cross-family default (OpenAI + Groq).
+- ENV-gated cascade swap in `api/dql/verify.ts` (`DQL_CASCADE=stub` default, `pot-cli` for live).
+- Vitest suite — 50 tests covering aggregation, validation, cascade parsing, engine orchestration, and the full cascade decision matrix (early-exit, agreement, disagreement, UNCERTAIN handling, degraded mode).
+- Docs: `README.md`, `docs/ARCHITECTURE.md`, `docs/SPIKE-RESULTS.md`, `docs/PAYMENT.md`, `docs/ENV.md`.
 
 ## What is NOT done (Phase 1 work — Hermes)
 
-### 1. Wire the real cascade
+### 1. Regression scenarios from the Orthogonality Spike
 
-`api/dql/verify.ts` instantiates `StubCascade` (returns `UNCERTAIN` for every axis). To go live:
-
-1. Implement a `PotCliCascade` in `src/engine/cascade-pot.ts` that calls `pot-cli`'s `runCascade` with the same nano→swift path validated by the Orthogonality Spike (see [docs/SPIKE-RESULTS.md](./docs/SPIKE-RESULTS.md)).
-2. Reuse `parseAxisResponse` from `src/engine/cascade.ts` for output parsing.
-3. Swap the `new StubCascade()` line in `api/dql/verify.ts`.
-4. Add scenarios in `scenarios/` covering the 40 spike cases as regression tests.
+The cascade is wired but the 40 spike cases from [docs/SPIKE-RESULTS.md](./docs/SPIKE-RESULTS.md) are NOT yet locked in as regression tests. Add `scenarios/spike-40.jsonl` and a runner that replays them through `PotCliCascade` against live models on demand (out of the default vitest run — they cost money and are non-deterministic). Target: 95%+ axis-hit-rate holds after the wiring, matching the spike.
 
 ### 2. Deploy to `dql.thoughtproof.ai`
 
 - Vercel project setup (mirror `thoughtproof-sentinel` config).
 - DNS: `dql.thoughtproof.ai` CNAME → Vercel.
-- Env vars: cascade credentials, Upstash Redis for rate limiting.
+- Env vars — see [docs/ENV.md](./docs/ENV.md). Minimum for a live deploy: `DQL_CASCADE=pot-cli`, `OPENAI_API_KEY`, `GROQ_API_KEY`. Upstash Redis for rate-limit lands with payment gates.
 
 ### 3. HF endpoint (for BrowseSafe-Bench run, separate track)
 

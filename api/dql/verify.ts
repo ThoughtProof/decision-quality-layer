@@ -6,10 +6,20 @@
  * Request body:  DqlRequest  (see src/types.ts)
  * Response:      DqlResponse (200) | DqlError (4xx/5xx)
  *
- * Phase 0 (this file): stub cascade returns UNCERTAIN for every axis; sandbox
- * mode returns deterministic mock verdicts. The scaffolding — request
- * validation, engine orchestration, aggregation, error shape, headers — is
- * production-ready. Real cascade + payment gates land in Phase 1/2.
+ * Phase 0.2 (this file): production cascade (PotCliCascade, nano→swift) is
+ * wired behind the DQL_CASCADE env-switch. Default remains the StubCascade
+ * so local dev + CI stay hermetic. Sandbox mode still returns deterministic
+ * mock verdicts. Payment gates land in Phase 2.
+ *
+ * Cascade selection:
+ *   DQL_CASCADE=stub      → StubCascade (default; all axes UNCERTAIN)
+ *   DQL_CASCADE=pot-cli   → PotCliCascade (serv-nano → serv-swift, live LLM)
+ *   sandbox: true         → SandboxCascade (regardless of DQL_CASCADE)
+ *
+ * PotCliCascade requires:
+ *   OPENAI_API_KEY  — serv-nano (gpt-4o-mini)
+ *   GROQ_API_KEY    — serv-swift (llama-3.1-70b-versatile)
+ * See docs/ENV.md for the full list.
  *
  * Pricing (see src/pricing.ts):
  *   - Pay-as-you-go, $0.05/call
@@ -22,13 +32,22 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { validateVerifyRequest } from '../../src/validation.js';
 import { runVerification } from '../../src/engine/index.js';
 import { StubCascade } from '../../src/engine/cascade.js';
+import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
+import { PotCliCascade } from '../../src/engine/cascade-pot.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const MAX_BODY_SIZE = 1_000_000; // 1 MB
 
 // Cascades constructed once per cold-start.
-const cascade = new StubCascade();
+function pickCascade(): Cascade {
+  const mode = (process.env.DQL_CASCADE ?? 'stub').toLowerCase();
+  if (mode === 'pot-cli' || mode === 'potcli' || mode === 'live') {
+    return new PotCliCascade();
+  }
+  return new StubCascade();
+}
+const cascade = pickCascade();
 const sandboxCascade = new SandboxCascade();
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
