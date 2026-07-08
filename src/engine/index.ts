@@ -6,19 +6,22 @@
  *   2. Runs each axis through the cascade IN PARALLEL.
  *   3. Aggregates the per-axis verdicts into a single aggregate verdict.
  *
- * The engine is deliberately model-agnostic. Swap the Cascade implementation
- * to change how axes are executed (real models, stubs, tests).
+ * The engine is deliberately model-agnostic. Two cascades are provided
+ * (Stub for local dev, Sandbox for developer integration testing); the
+ * production cascade is wired in Phase 1.
  */
 
-import type { DqlRequest, DqlResponse, AxisResult, DqlTier, Axis } from '../types.js';
+import type { DqlRequest, DqlResponse, AxisResult, Axis } from '../types.js';
 import { AXIS_PROMPT_BUILDERS } from './axes/index.js';
 import { aggregate } from '../aggregation.js';
 import type { Cascade } from './cascade.js';
 
 export interface EngineInput {
   request: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'>;
-  tier: DqlTier;
+  /** The cascade to run when `request.sandbox` is false. */
   cascade: Cascade;
+  /** The cascade to run when `request.sandbox` is true. */
+  sandboxCascade: Cascade;
   requestId: string;
   version: string;
 }
@@ -26,6 +29,7 @@ export interface EngineInput {
 export async function runVerification(input: EngineInput): Promise<DqlResponse> {
   const started = Date.now();
   const axes = input.request.axes;
+  const cascade = input.request.sandbox ? input.sandboxCascade : input.cascade;
 
   const promptInput = {
     mandate: input.request.mandate,
@@ -40,7 +44,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
     axes.map(async (axis) => {
       const prompt = AXIS_PROMPT_BUILDERS[axis](promptInput);
       try {
-        return await input.cascade.run({ axis, prompt, tier: input.tier });
+        return await cascade.run({ axis, prompt });
       } catch (err) {
         const result: AxisResult = {
           axis,
@@ -61,13 +65,13 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   return {
     id: input.requestId,
     version: input.version,
-    tier: input.tier,
     axes: axisResults,
     aggregate: aggregateResult,
     meta: {
       duration_ms: Date.now() - started,
       models_used: modelsUsed,
       axes_evaluated: axes as Axis[],
+      sandbox: input.request.sandbox,
     },
   };
 }

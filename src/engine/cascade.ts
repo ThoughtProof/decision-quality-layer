@@ -11,12 +11,11 @@
  */
 
 import type { AxisPrompt } from './axes/types.js';
-import type { AxisResult, Axis, DqlTier } from '../types.js';
+import type { AxisResult, Axis } from '../types.js';
 
 export interface CascadeInput {
   axis: Axis;
   prompt: AxisPrompt;
-  tier: DqlTier;
 }
 
 export interface CascadeOutput {

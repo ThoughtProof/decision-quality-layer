@@ -13,7 +13,7 @@ describe('validateVerifyRequest', () => {
     expect(r.valid).toBe(true);
     if (r.valid) {
       expect(r.request.axes).toEqual(['intent', 'scope', 'risk', 'consistency', 'reversibility']);
-      expect(r.request.tier).toBe('checkpoint');
+      expect(r.request.sandbox).toBe(false);
     }
   });
 
@@ -47,11 +47,6 @@ describe('validateVerifyRequest', () => {
     expect(r.valid).toBe(false);
   });
 
-  it('rejects unknown tier', () => {
-    const r = validateVerifyRequest({ ...good, tier: 'premium' });
-    expect(r.valid).toBe(false);
-  });
-
   it('accepts optional context', () => {
     const r = validateVerifyRequest({ ...good, context: 'user is on Base' });
     expect(r.valid).toBe(true);
@@ -62,5 +57,23 @@ describe('validateVerifyRequest', () => {
     const r = validateVerifyRequest({ ...good, axes: ['intent', 'intent', 'scope'] });
     expect(r.valid).toBe(true);
     if (r.valid) expect(r.request.axes).toEqual(['intent', 'scope']);
+  });
+
+  it('accepts sandbox flag', () => {
+    const r = validateVerifyRequest({ ...good, sandbox: true });
+    expect(r.valid).toBe(true);
+    if (r.valid) expect(r.request.sandbox).toBe(true);
+  });
+
+  it('rejects non-boolean sandbox', () => {
+    const r = validateVerifyRequest({ ...good, sandbox: 'yes' });
+    expect(r.valid).toBe(false);
+  });
+
+  it('ignores legacy tier parameter (no longer part of API)', () => {
+    // Legacy clients that still send `tier` — we silently accept and ignore it.
+    // The API does not error on unknown fields.
+    const r = validateVerifyRequest({ ...good, tier: 'standard' });
+    expect(r.valid).toBe(true);
   });
 });

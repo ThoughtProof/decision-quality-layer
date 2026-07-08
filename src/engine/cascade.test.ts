@@ -58,7 +58,6 @@ describe('StubCascade', () => {
     const out = await cascade.run({
       axis: 'intent',
       prompt: { system: 'x', user: 'y' },
-      tier: 'checkpoint',
     });
     expect(out.result.verdict).toBe('UNCERTAIN');
     expect(out.modelsUsed).toEqual(['stub']);

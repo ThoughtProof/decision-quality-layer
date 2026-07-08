@@ -111,8 +111,13 @@ export interface AggregateResult {
 // Request / Response
 // -----------------------------------------------------------------------------
 
-export type DqlTier = 'checkpoint' | 'standard';
-
+/**
+ * DQL runs a single tier: the nano → swift cascade validated by the
+ * Orthogonality Spike (2026-07-08). Nano-solo (a hypothetical faster/cheaper
+ * "checkpoint" tier) is intentionally not exposed — Prod-Sentinel experience
+ * shows nano-solo oscillates on borderline cases, so DQL always runs the full
+ * cascade to deliver reliable per-axis verdicts.
+ */
 export interface DqlRequest {
   /** Free-text description of the user's mandate / instruction. */
   mandate: string;
@@ -124,20 +129,24 @@ export interface DqlRequest {
   context?: string;
   /** Which axes to evaluate. Defaults to all five. */
   axes?: Axis[];
-  /** Verification tier — checkpoint is faster/cheaper, standard is stronger. */
-  tier?: DqlTier;
+  /**
+   * If true, returns a deterministic mock response without running the cascade.
+   * Used by developers to integrate against the API contract without incurring
+   * calls or cost. Sandbox responses are marked with `meta.sandbox = true`.
+   */
+  sandbox?: boolean;
 }
 
 export interface DqlResponse {
   id: string;
   version: string;
-  tier: DqlTier;
   axes: AxisResult[];
   aggregate: AggregateResult;
   meta: {
     duration_ms: number;
     models_used: string[];
     axes_evaluated: Axis[];
+    sandbox: boolean;
   };
 }
 

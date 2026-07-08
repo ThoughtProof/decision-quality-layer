@@ -6,22 +6,30 @@
  * Request body:  DqlRequest  (see src/types.ts)
  * Response:      DqlResponse (200) | DqlError (4xx/5xx)
  *
- * Phase 0 (this file): stub cascade returns UNCERTAIN for every axis. The
- * scaffolding — request validation, engine orchestration, aggregation, error
- * shape, headers — is production-ready. Wire in the real cascade in a
- * follow-up commit.
+ * Phase 0 (this file): stub cascade returns UNCERTAIN for every axis; sandbox
+ * mode returns deterministic mock verdicts. The scaffolding — request
+ * validation, engine orchestration, aggregation, error shape, headers — is
+ * production-ready. Real cascade + payment gates land in Phase 1/2.
+ *
+ * Pricing (see src/pricing.ts):
+ *   - Pay-as-you-go, $0.05/call
+ *   - No freemium
+ *   - Sandbox calls (`sandbox: true` in body) are free
+ *   - Dev-access API keys are granted manually and are also free
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { validateVerifyRequest } from '../../src/validation.js';
 import { runVerification } from '../../src/engine/index.js';
 import { StubCascade } from '../../src/engine/cascade.js';
+import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
 
 const VERSION = '0.1.0';
 const MAX_BODY_SIZE = 1_000_000; // 1 MB
 
-// A single cascade instance per cold-start.
+// Cascades constructed once per cold-start.
 const cascade = new StubCascade();
+const sandboxCascade = new SandboxCascade();
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const requestId = `dql_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -70,10 +78,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    // TODO(phase-1): payment / dev-access gate goes here.
+    //   - X-DQL-Key present + valid + dev_access → skip charge
+    //   - X-DQL-Key present + valid + billable  → record Stripe meter event
+    //   - PAYMENT-SIGNATURE present              → x402 verify + settle
+    //   - Sandbox request                        → skip charge (free)
+    //   - Otherwise                              → 402 Payment Required with both options
+
     const response = await runVerification({
       request: validation.request,
-      tier: validation.request.tier,
       cascade,
+      sandboxCascade,
       requestId,
       version: VERSION,
     });

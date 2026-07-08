@@ -4,11 +4,9 @@
  * Pure — no I/O. Returns discriminated union so callers can narrow safely.
  */
 
-import { AXES, type Axis, type DqlRequest, type DqlTier } from './types.js';
+import { AXES, type Axis, type DqlRequest } from './types.js';
 
 const MAX_FIELD_LENGTH = 20_000;
-
-const VALID_TIERS: DqlTier[] = ['checkpoint', 'standard'];
 
 export type ValidationResult =
   | { valid: true; request: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> }
@@ -52,12 +50,12 @@ export function validateVerifyRequest(body: unknown): ValidationResult {
     }
   }
 
-  let tier: DqlTier = 'checkpoint';
-  if (b.tier !== undefined) {
-    if (typeof b.tier !== 'string' || !(VALID_TIERS as string[]).includes(b.tier)) {
-      errors.push(`tier must be one of: ${VALID_TIERS.join(', ')}`);
+  let sandbox = false;
+  if (b.sandbox !== undefined) {
+    if (typeof b.sandbox !== 'boolean') {
+      errors.push('sandbox must be a boolean if provided');
     } else {
-      tier = b.tier as DqlTier;
+      sandbox = b.sandbox;
     }
   }
 
@@ -73,7 +71,7 @@ export function validateVerifyRequest(body: unknown): ValidationResult {
       reasoning: reasoning as string,
       context: context ?? undefined,
       axes,
-      tier,
+      sandbox,
     },
   };
 }

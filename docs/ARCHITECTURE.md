@@ -36,9 +36,11 @@ src/
   types.ts           # Public API types (DqlRequest, DqlResponse, ...)
   validation.ts      # Request-body validation
   aggregation.ts     # 5 axis verdicts → 1 aggregate
+  pricing.ts         # $0.05/call, dev-access, sandbox pricing
   engine/
-    index.ts         # runVerification — orchestrator
-    cascade.ts       # Cascade interface + StubCascade + parseAxisResponse
+    index.ts             # runVerification — orchestrator (routes sandbox ↔ real cascade)
+    cascade.ts           # Cascade interface + StubCascade + parseAxisResponse
+    sandbox-cascade.ts   # Deterministic mock cascade for free integration testing
     axes/
       types.ts       # AxisPromptBuilder interface
       intent.ts
@@ -81,9 +83,8 @@ The five axes were pre-registered and validated as orthogonal. Adding a sixth ax
 2. Swap the `new StubCascade()` line in `api/dql/verify.ts` for the real cascade.
 3. Add integration tests in `scenarios/`.
 
-## Tier semantics
+## Cascade
 
-- `checkpoint` — single-model per axis. Fast, cheap, adequate for high-volume gating.
-- `standard` — cascade per axis (nano → swift). Slower, stronger, for consequential decisions.
+DQL runs a **single cascade path per call: nano → swift**, validated by the Orthogonality Spike. There is no faster/cheaper "checkpoint" tier — Prod-Sentinel experience shows nano-solo oscillates on borderline cases, which contradicts DQL's promise of reliable per-axis verdicts. If a customer needs speed at the cost of quality, they should call Sentinel directly for a single verdict.
 
-Both tiers evaluate all five axes; the difference is the depth of the per-axis evaluation.
+The `sandbox` mode is not a cascade tier — it is a completely separate path (`SandboxCascade`) that returns a deterministic mock without touching any model. Use it for integration testing without incurring cost.

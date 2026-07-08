@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { runVerification } from './index.js';
+import { StubCascade } from './cascade.js';
+import { SandboxCascade } from './sandbox-cascade.js';
 import type { Cascade, CascadeInput, CascadeOutput } from './cascade.js';
-import type { AxisResult, DqlRequest, DqlTier } from '../types.js';
+import type { AxisResult, DqlRequest } from '../types.js';
 
 class ScriptedCascade implements Cascade {
   constructor(private readonly script: (axis: string) => AxisResult) {}
@@ -15,9 +17,11 @@ const req: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> =
   proposed_action: 'Approve USDC and swap',
   reasoning: 'User asked for it',
   axes: ['intent', 'scope', 'risk', 'consistency', 'reversibility'],
-  tier: 'checkpoint' as DqlTier,
+  sandbox: false,
   context: undefined,
 };
+
+const sandbox = new SandboxCascade();
 
 describe('runVerification', () => {
   it('returns ALLOW when all axes PASS', async () => {
@@ -31,8 +35,8 @@ describe('runVerification', () => {
 
     const out = await runVerification({
       request: req,
-      tier: 'checkpoint',
       cascade,
+      sandboxCascade: sandbox,
       requestId: 'test_1',
       version: '0.1.0',
     });
@@ -40,6 +44,7 @@ describe('runVerification', () => {
     expect(out.aggregate.verdict).toBe('ALLOW');
     expect(out.axes).toHaveLength(5);
     expect(out.meta.axes_evaluated).toEqual(req.axes);
+    expect(out.meta.sandbox).toBe(false);
   });
 
   it('returns BLOCK when one axis high-confidence FAILs', async () => {
@@ -53,8 +58,8 @@ describe('runVerification', () => {
 
     const out = await runVerification({
       request: req,
-      tier: 'checkpoint',
       cascade,
+      sandboxCascade: sandbox,
       requestId: 'test_2',
       version: '0.1.0',
     });
@@ -82,8 +87,8 @@ describe('runVerification', () => {
 
     const out = await runVerification({
       request: req,
-      tier: 'checkpoint',
       cascade,
+      sandboxCascade: sandbox,
       requestId: 'test_3',
       version: '0.1.0',
     });
@@ -91,8 +96,43 @@ describe('runVerification', () => {
     const risk = out.axes.find((a) => a.axis === 'risk')!;
     expect(risk.verdict).toBe('UNCERTAIN');
     expect(risk.objection).toContain('model 503');
-    // 4 PASS + 1 UNCERTAIN with 0 confidence → REVIEW (single low-conf UNCERTAIN falls through to ALLOW? No — 0 conf UNCERTAIN alone won't hit any rule so ALLOW)
-    // Actually: 1 UNCERTAIN at conf 0, not high-conf, not ≥2 UNCERTAIN → ALLOW
+    // 1 UNCERTAIN at conf 0 (not high-conf, not ≥2) → falls through to ALLOW
     expect(out.aggregate.verdict).toBe('ALLOW');
+  });
+
+  it('routes to sandbox cascade when sandbox=true, marks meta.sandbox', async () => {
+    const cascade = new StubCascade(); // should NOT be used when sandbox=true
+    const out = await runVerification({
+      request: { ...req, sandbox: true },
+      cascade,
+      sandboxCascade: sandbox,
+      requestId: 'test_4',
+      version: '0.1.0',
+    });
+
+    expect(out.meta.sandbox).toBe(true);
+    expect(out.meta.models_used).toContain('sandbox');
+    expect(out.meta.models_used).not.toContain('stub');
+    expect(out.axes).toHaveLength(5);
+  });
+
+  it('sandbox cascade is deterministic for identical inputs', async () => {
+    const a = await runVerification({
+      request: { ...req, sandbox: true },
+      cascade: new StubCascade(),
+      sandboxCascade: sandbox,
+      requestId: 'test_5a',
+      version: '0.1.0',
+    });
+    const b = await runVerification({
+      request: { ...req, sandbox: true },
+      cascade: new StubCascade(),
+      sandboxCascade: sandbox,
+      requestId: 'test_5b',
+      version: '0.1.0',
+    });
+    const aVerdicts = a.axes.map((x) => x.verdict + ':' + x.confidence).join('|');
+    const bVerdicts = b.axes.map((x) => x.verdict + ':' + x.confidence).join('|');
+    expect(aVerdicts).toBe(bVerdicts);
   });
 });
