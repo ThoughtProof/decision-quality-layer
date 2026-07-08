@@ -40,7 +40,7 @@ const MAX_BODY_SIZE = 1_000_000; // 1 MB
 
 // Cascades constructed once per cold-start.
 function pickCascade(): Cascade {
-  const mode = (process.env.DQL_CASCADE ?? 'stub').toLowerCase();
+  const mode = (process.env.DQL_CASCADE ?? 'stub').trim().toLowerCase();
   if (mode === 'pot-cli' || mode === 'potcli' || mode === 'live') {
     return new PotCliCascade();
   }
