@@ -59,12 +59,12 @@ See [docs/PAYMENT.md](./docs/PAYMENT.md) for the full model. Summary:
 5. **Standard-only cascade.** Do NOT expose a "checkpoint" / nano-solo tier. Prod-Sentinel experience shows nano-solo oscillates on borderline cases; DQL always runs nano → swift.
 6. **No freemium.** Consumer decisions are low-frequency; a monthly free tier would let 99 % of consumers never pay. See [docs/PAYMENT.md](./docs/PAYMENT.md).
 
-## Open questions for Raul
+## Decisions locked (2026-07-08)
 
-- **Waitlist comms:** do we announce the DQL API on the existing waitlist ([thoughtproof.ai/decision-quality-layer](https://thoughtproof.ai/decision-quality-layer)) now, or wait until Phase 1 (real cascade) is live?
-- **Domain confirmation:** `dql.thoughtproof.ai` OK, or a different subdomain?
-- **x402 wallet:** same as Sentinel (`0xAB9f84864662f980614bD1453dB9950Ef2b82E83`) or dedicated DQL wallet?
-- **Stripe product:** reuse existing ThoughtProof Stripe account or create a separate DQL product?
+- **Domain:** `dql.thoughtproof.ai` — confirmed.
+- **x402 wallet:** same as Sentinel — `0xAB9f84864662f980614bD1453dB9950Ef2b82E83`. No separate DQL wallet.
+- **Stripe:** reuse the existing ThoughtProof Stripe account. New meter (`dql_verify_call`) inside it, not a new product / account.
+- **Waitlist comms:** hold. No public DQL-API announcement until the real cascade is wired and the endpoint returns real verdicts. The waitlist landing at [thoughtproof.ai/decision-quality-layer](https://thoughtproof.ai/decision-quality-layer) stays as-is.
 
 ## Timing target
 

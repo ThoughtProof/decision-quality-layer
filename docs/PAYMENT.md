@@ -67,9 +67,12 @@ POST /dql/verify received
 - **No cost-per-axis knob.** The customer cannot "pay less by evaluating fewer axes" — the cascade cost dominates, per-axis prompting is marginal.
 - **No BYOK (bring your own key) tier.** Considered — rejected for v1 because it complicates the surface (whose model? whose bill? whose latency?) without opening a segment we can't reach with Stripe or x402.
 
-## Open questions for Phase 2
+## Decisions locked (2026-07-08)
 
-1. **Wallet address for x402** — same as Sentinel (`0xAB9f84864662f980614bD1453dB9950Ef2b82E83`) or a DQL-specific wallet?
-2. **Stripe product/meter setup** — do we reuse the existing ThoughtProof Stripe account or create a separate DQL product?
-3. **Dev-access grant flow** — email-based today; do we want a lightweight form or is a mailto: link enough for v1?
-4. **Refund / dispute policy** — if a customer disputes a Stripe charge, do we auto-refund below some threshold? Manual review above?
+- **x402 wallet:** `0xAB9f84864662f980614bD1453dB9950Ef2b82E83` — same wallet as Sentinel. Simplifies accounting; no separate DQL wallet.
+- **Stripe:** reuse the existing ThoughtProof Stripe account. Create a new meter `dql_verify_call` inside that account. Not a separate product / account.
+
+## Still open for Phase 2
+
+- **Dev-access grant flow** — email-based today; do we want a lightweight form or is a mailto: link enough for v1?
+- **Refund / dispute policy** — if a customer disputes a Stripe charge, do we auto-refund below some threshold? Manual review above?
