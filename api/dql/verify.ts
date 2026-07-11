@@ -33,20 +33,28 @@ import { runVerification } from '../../src/engine/index.js';
 import { StubCascade } from '../../src/engine/cascade.js';
 import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
-import { PotCliCascade } from '../../src/engine/cascade-pot.js';
+import {
+  createProductionRuntime,
+  type ProductionRuntime,
+} from '../../src/engine/production-runtime.js';
 
 const VERSION = '0.2.0';
 const MAX_BODY_SIZE = 1_000_000; // 1 MB
 
-// Cascades constructed once per cold-start.
-function pickCascade(): Cascade {
+// v0.4.3.1 §C.2: production runtime bundle is constructed once per cold-start
+// and holds the concrete HttpLlmClient. The engine only sees the generic
+// Cascade; the Handler owns the client for isolate-scope diagnostics (wired
+// in a follow-up commit). Stub path constructs only a Cascade — no client.
+function pickRuntime(): { cascade: Cascade; production?: ProductionRuntime } {
   const mode = (process.env.DQL_CASCADE ?? 'stub').trim().toLowerCase();
   if (mode === 'pot-cli' || mode === 'potcli' || mode === 'live') {
-    return new PotCliCascade();
+    const production = createProductionRuntime(process.env);
+    return { cascade: production.cascade, production };
   }
-  return new StubCascade();
+  return { cascade: new StubCascade() };
 }
-const cascade = pickCascade();
+const RUNTIME = pickRuntime();
+const cascade = RUNTIME.cascade;
 const sandboxCascade = new SandboxCascade();
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
