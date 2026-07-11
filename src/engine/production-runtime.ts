@@ -18,14 +18,17 @@
  */
 
 import crypto from 'node:crypto';
-import { HttpLlmClient } from './llm-client.js';
+import { HttpLlmClient, type ModelBinding } from './llm-client.js';
 import type { LlmClient } from './llm-client.js';
 import { PotCliCascade } from './cascade-pot.js';
 import type { Cascade } from './cascade.js';
+import type { CircuitBreakerConfig } from './circuit-breaker.js';
 import {
   resolveProductionConfig,
   computeConfigHash,
+  KNOWN_ALIASES,
   type ProductionConfig,
+  type KnownAlias,
 } from './production-config.js';
 
 /**
@@ -91,12 +94,17 @@ export function createProductionRuntime(
 ): ProductionRuntime {
   const config = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
   const configHash = computeConfigHash(config);
-  // v0.4.3.1 §D: capital_path_mode is passed EXPLICITLY into the client.
-  // No `?? false` silent default at any layer below this line.
+  const bindings = resolveModelBindings(config);
+  const cbByAlias = resolveCbByAlias(config);
+  // v0.4.3.1 hardening: capital_path_mode, per-alias CB config and the
+  // validated ModelBindings all flow through EXPLICITLY. No silent default
+  // and no reliance on the ambient DEFAULT_MODEL_MAP anywhere below.
   const client =
     opts.clientOverride ??
-    new HttpLlmClient(undefined, env, {
+    new HttpLlmClient(bindings, env, {
       capitalPathMode: config.capital_path_mode,
+      circuitBreakerConfigByAlias: cbByAlias,
+      disableCircuitBreaker: config.disable_circuit_breaker,
     });
   const cascade = new PotCliCascade(client);
   const identity = opts.identityOverride ?? {
@@ -117,4 +125,59 @@ export function resolveHealthConfig(env: NodeJS.ProcessEnv): {
 } {
   const config = resolveProductionConfig(env, { requiredMode: 'stub' });
   return { config, configHash: computeConfigHash(config) };
+}
+
+/**
+ * Build the ModelBinding map from resolved config so the client's fetch
+ * URL is exactly `config.serv_base_url` — not a stale value captured at
+ * module-load time by DEFAULT_MODEL_MAP.
+ *
+ * All KNOWN_ALIASES (nano + swift) receive the same normalised base URL
+ * and cross-alias fallback wiring per PR #10.
+ */
+export function resolveModelBindings(
+  config: ProductionConfig,
+): Record<string, ModelBinding> {
+  // In stub mode with no override, servBaseUrl is null; keep the OpenServ
+  // default so the client can still be constructed. HttpLlmClient will
+  // never actually reach out because the caller uses StubCascade in that
+  // path (see api/dql/verify.ts).
+  const baseUrl =
+    config.serv_base_url ?? 'https://inference-api.openserv.ai/v1';
+  return {
+    'serv-nano': {
+      provider: 'serv',
+      modelId: 'serv-nano',
+      apiKeyEnv: 'SERV_API_KEY',
+      baseUrl,
+      fallbackAlias: 'serv-swift',
+    },
+    'serv-swift': {
+      provider: 'serv',
+      modelId: 'serv-swift',
+      apiKeyEnv: 'SERV_API_KEY',
+      baseUrl,
+      fallbackAlias: 'serv-nano',
+    },
+  };
+}
+
+/**
+ * Translate the resolver's per-alias CB knobs into the HttpLlmClient's
+ * `circuitBreakerConfigByAlias` shape. Field names align 1:1 today; this
+ * indirection keeps a single boundary point for future divergence.
+ */
+export function resolveCbByAlias(
+  config: ProductionConfig,
+): Record<string, CircuitBreakerConfig> {
+  const out: Record<string, CircuitBreakerConfig> = {};
+  for (const alias of KNOWN_ALIASES) {
+    const src = config.circuit_breaker_config_by_alias[alias as KnownAlias];
+    out[alias] = {
+      tripP90LatencyMs: src.tripP90LatencyMs,
+      tripFailureRate: src.tripFailureRate,
+      cooldownMs: src.cooldownMs,
+    };
+  }
+  return out;
 }

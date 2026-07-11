@@ -1,211 +1,450 @@
 /**
- * PR #12 (v0.4.3.1 §C.2-follow-up + §D): resolveProductionConfig +
- * computeConfigHash — discriminating tests.
+ * PR #12 v0.4.3.1 hardening: resolveProductionConfig, parseRuntimeMode,
+ * normaliseServBaseUrl, computeConfigHash (recursive) — full test matrix.
  *
- * Contract:
- *   1. In pot-cli mode, DQL_CAPITAL_PATH_MODE and SERV_API_KEY are BOTH
- *      required. Absence throws with a precise reason list. No silent
- *      defaults for safety-relevant knobs.
- *   2. In stub mode, both are optional; capital_path_mode defaults to
- *      false but explicit values are respected.
- *   3. computeConfigHash is deterministic AND canonical:
- *      identical config → identical hash across resolvers.
- *   4. Any change to a hashed field changes the hash.
- *   5. Secrets never enter the hash: rotating SERV_API_KEY VALUE while
- *      the KEY remains bound must NOT change the hash.
- *   6. Diagnostics toggle is a hashed field: changing it MUST change
- *      the hash.
+ * Addresses Hermes Review blockers:
+ *   B3  URL validator (creds/query/fragment → error), endpoint_id redaction
+ *   B4  Strict bool (invalid literal → error, no silent false)
+ *   B5  parseRuntimeMode (unknown → error, no silent downgrade)
+ *   B6  Full v0.4.3.1 schema + Canary rule (active + live → diagnostics ON)
+ *   B7  Recursive canonicalisation (nested key-order irrelevant)
+ *   M8  Error code CONFIG_INVALID
  */
 
 import { describe, it, expect } from 'vitest';
 import {
   resolveProductionConfig,
   computeConfigHash,
+  parseRuntimeMode,
+  parseBool,
+  normaliseServBaseUrl,
+  endpointIdFor,
+  canonicaliseJson,
   ProductionConfigError,
+  CONFIG_SCHEMA_VERSION,
 } from './production-config.js';
 
 const cast = (o: Record<string, string | undefined>): NodeJS.ProcessEnv =>
   o as unknown as NodeJS.ProcessEnv;
 
-describe('PR #12 §C.2 — resolveProductionConfig', () => {
-  it('pot-cli: missing DQL_CAPITAL_PATH_MODE → throws with precise reason', () => {
-    const env = cast({ SERV_API_KEY: 'sk-test' });
+const potCliMinimum = () =>
+  cast({ SERV_API_KEY: 'sk-test', DQL_CAPITAL_PATH_MODE: '0' });
+
+// ---------------------------------------------------------------------------
+// B5 — parseRuntimeMode
+// ---------------------------------------------------------------------------
+describe('B5 — parseRuntimeMode', () => {
+  it('unset → stub (documented default)', () => {
+    expect(parseRuntimeMode(undefined)).toBe('stub');
+    expect(parseRuntimeMode('')).toBe('stub');
+  });
+  it('canonical values honored', () => {
+    expect(parseRuntimeMode('stub')).toBe('stub');
+    expect(parseRuntimeMode('pot-cli')).toBe('pot-cli');
+    expect(parseRuntimeMode('potcli')).toBe('pot-cli');
+    expect(parseRuntimeMode('live')).toBe('pot-cli');
+    expect(parseRuntimeMode('POT-CLI')).toBe('pot-cli'); // case-insensitive
+  });
+  it('unknown value throws ConfigError with code CONFIG_INVALID', () => {
     let caught: unknown = null;
     try {
-      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+      parseRuntimeMode('pot-clii');
     } catch (e) {
       caught = e;
     }
     expect(caught).toBeInstanceOf(ProductionConfigError);
     const err = caught as ProductionConfigError;
-    expect(err.mode).toBe('pot-cli');
-    expect(err.reasons.some((r) => r.includes('DQL_CAPITAL_PATH_MODE'))).toBe(true);
-  });
-
-  it('pot-cli: missing SERV_API_KEY → throws with precise reason', () => {
-    const env = cast({ DQL_CAPITAL_PATH_MODE: '1' });
-    let caught: unknown = null;
-    try {
-      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).toBeInstanceOf(ProductionConfigError);
-    const err = caught as ProductionConfigError;
-    expect(err.reasons.some((r) => r.includes('SERV_API_KEY'))).toBe(true);
-  });
-
-  it('pot-cli: invalid DQL_CAPITAL_PATH_MODE literal → throws with precise reason', () => {
-    const env = cast({ SERV_API_KEY: 'sk-test', DQL_CAPITAL_PATH_MODE: 'sometimes' });
-    let caught: unknown = null;
-    try {
-      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).toBeInstanceOf(ProductionConfigError);
-    const err = caught as ProductionConfigError;
-    expect(err.reasons.some((r) => r.includes('DQL_CAPITAL_PATH_MODE'))).toBe(true);
-  });
-
-  it('pot-cli: both provided → returns config with capital_path_mode=true and key bound', () => {
-    const env = cast({
-      SERV_API_KEY: 'sk-test',
-      DQL_CAPITAL_PATH_MODE: '1',
-    });
-    const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
-    expect(c.runtime_mode).toBe('pot-cli');
-    expect(c.capital_path_mode).toBe(true);
-    expect(c.serv_api_key_bound).toBe(true);
-    expect(c.serv_base_url).toBe('https://inference-api.openserv.ai/v1');
-    expect(c.confirm_fail).toBe(false);
-    expect(c.diagnostics_on).toBe(false);
-  });
-
-  it('pot-cli: explicit CPM=false honored (no silent flip)', () => {
-    const env = cast({
-      SERV_API_KEY: 'sk-test',
-      DQL_CAPITAL_PATH_MODE: 'false',
-    });
-    const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
-    expect(c.capital_path_mode).toBe(false);
-  });
-
-  it('stub: missing SERV_API_KEY is OK, capital_path_mode defaults to false', () => {
-    const env = cast({});
-    const c = resolveProductionConfig(env, { requiredMode: 'stub' });
-    expect(c.runtime_mode).toBe('stub');
-    expect(c.capital_path_mode).toBe(false);
-    expect(c.serv_api_key_bound).toBe(false);
-    expect(c.serv_base_url).toBeNull();
-  });
-
-  it('stub: explicit DQL_CAPITAL_PATH_MODE=true honored', () => {
-    const env = cast({ DQL_CAPITAL_PATH_MODE: 'true' });
-    const c = resolveProductionConfig(env, { requiredMode: 'stub' });
-    expect(c.capital_path_mode).toBe(true);
-  });
-
-  it('stub: invalid DQL_CAPITAL_PATH_MODE literal still throws (safety-relevant across modes)', () => {
-    const env = cast({ DQL_CAPITAL_PATH_MODE: 'kinda' });
-    let caught: unknown = null;
-    try {
-      resolveProductionConfig(env, { requiredMode: 'stub' });
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).toBeInstanceOf(ProductionConfigError);
-  });
-
-  it('accumulates all missing keys in a single error (not first-fail)', () => {
-    const env = cast({});
-    let caught: unknown = null;
-    try {
-      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
-    } catch (e) {
-      caught = e;
-    }
-    const err = caught as ProductionConfigError;
-    // Both missing keys must be reported at once.
-    const joined = err.reasons.join(' | ');
-    expect(joined).toContain('DQL_CAPITAL_PATH_MODE');
-    expect(joined).toContain('SERV_API_KEY');
+    expect(err.code).toBe('CONFIG_INVALID');
+    expect(err.reasons[0]).toContain('DQL_CASCADE');
   });
 });
 
-describe('PR #12 §D — computeConfigHash canonicalisation', () => {
-  it('deterministic: same config → same hash across two resolutions', () => {
-    const env = cast({ SERV_API_KEY: 'sk-test', DQL_CAPITAL_PATH_MODE: '1' });
+// ---------------------------------------------------------------------------
+// B4 — Strict bool
+// ---------------------------------------------------------------------------
+describe('B4 — Strict boolean parsing', () => {
+  it('parseBool returns "invalid" for set-but-unknown literal', () => {
+    expect(parseBool('tru')).toBe('invalid');
+    expect(parseBool('maybe')).toBe('invalid');
+  });
+  it('invalid DQL_RUNTIME_DIAGNOSTICS literal → ConfigError (not silent OFF)', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_RUNTIME_DIAGNOSTICS: 'tru',
+    });
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProductionConfigError);
+    expect((caught as ProductionConfigError).reasons.some((r) =>
+      r.includes('DQL_RUNTIME_DIAGNOSTICS'),
+    )).toBe(true);
+  });
+  it('invalid DQL_CONFIRM_FAIL literal → ConfigError', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CONFIRM_FAIL: 'nope',
+    });
+    expect(() =>
+      resolveProductionConfig(env, { requiredMode: 'pot-cli' }),
+    ).toThrow(ProductionConfigError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B3 — SERV_BASE_URL validator
+// ---------------------------------------------------------------------------
+describe('B3 — SERV_BASE_URL validation + endpoint_id redaction', () => {
+  it('accepts a plain https URL and strips trailing slash', () => {
+    const reasons: string[] = [];
+    const out = normaliseServBaseUrl('https://api.example.com/v1/', 'pot-cli', reasons);
+    expect(out).toBe('https://api.example.com/v1');
+    expect(reasons).toEqual([]);
+  });
+  it('rejects userinfo (credential-laden URL)', () => {
+    const reasons: string[] = [];
+    const out = normaliseServBaseUrl(
+      'https://user:pw@api.example.com/v1',
+      'pot-cli',
+      reasons,
+    );
+    expect(out).toBeNull();
+    expect(reasons[0]).toContain('userinfo');
+  });
+  it('rejects querystring', () => {
+    const reasons: string[] = [];
+    const out = normaliseServBaseUrl(
+      'https://api.example.com/v1?token=x',
+      'pot-cli',
+      reasons,
+    );
+    expect(out).toBeNull();
+    expect(reasons[0]).toContain('query');
+  });
+  it('rejects fragment', () => {
+    const reasons: string[] = [];
+    const out = normaliseServBaseUrl(
+      'https://api.example.com/v1#s',
+      'pot-cli',
+      reasons,
+    );
+    expect(out).toBeNull();
+    expect(reasons[0]).toContain('fragment');
+  });
+  it('rejects non-https in pot-cli mode', () => {
+    const reasons: string[] = [];
+    const out = normaliseServBaseUrl('http://api.example.com/v1', 'pot-cli', reasons);
+    expect(out).toBeNull();
+    expect(reasons[0]).toContain('https');
+  });
+  it('permits http://localhost only in stub mode', () => {
+    const r1: string[] = [];
+    expect(normaliseServBaseUrl('http://localhost:8080/v1', 'stub', r1)).toBe(
+      'http://localhost:8080/v1',
+    );
+    expect(r1).toEqual([]);
+    const r2: string[] = [];
+    expect(normaliseServBaseUrl('http://localhost:8080/v1', 'pot-cli', r2)).toBeNull();
+  });
+  it('endpointIdFor: default → openserv-default, custom → custom, null → unset', () => {
+    expect(endpointIdFor('https://inference-api.openserv.ai/v1')).toBe(
+      'openserv-default',
+    );
+    expect(endpointIdFor('https://api.example.com/v1')).toBe('custom');
+    expect(endpointIdFor(null)).toBe('unset');
+  });
+  it('resolveProductionConfig surfaces URL errors as ConfigError with reasons', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      SERV_BASE_URL: 'https://user:pw@api.example.com/v1',
+    });
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProductionConfigError);
+    expect((caught as ProductionConfigError).reasons.some((r) =>
+      r.includes('userinfo'),
+    )).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B6 — Full schema + canary rule
+// ---------------------------------------------------------------------------
+describe('B6 — Full v0.4.3.1 schema', () => {
+  it('resolves all required fields with defaults', () => {
+    const c = resolveProductionConfig(potCliMinimum(), { requiredMode: 'pot-cli' });
+    expect(c.runtime_mode).toBe('pot-cli');
+    expect(c.v0431_active).toBe(false);
+    expect(c.capital_path_mode).toBe(false);
+    expect(c.disable_circuit_breaker).toBe(false);
+    expect(c.serv_base_url).toBe('https://inference-api.openserv.ai/v1');
+    expect(c.serv_api_key_bound).toBe(true);
+    expect(c.confirm_fail).toBe(false);
+    expect(c.diagnostics_on).toBe(false);
+    expect(c.required_healthy_headroom).toBe(0.5);
+    // per-alias present for both known aliases
+    expect(c.circuit_breaker_config_by_alias['serv-nano'].tripP90LatencyMs).toBeGreaterThan(0);
+    expect(c.circuit_breaker_config_by_alias['serv-swift'].tripP90LatencyMs).toBeGreaterThan(0);
+    expect(c.product_latency_ceiling_by_alias['serv-nano'].p90CeilingMs).toBeGreaterThan(0);
+  });
+
+  it('canary rule: v0431_active + pot-cli + diagnostics_on=false → ConfigError', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '1',
+      DQL_V0431_ACTIVE: '1',
+      DQL_RUNTIME_DIAGNOSTICS: '0',
+    });
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProductionConfigError);
+    expect((caught as ProductionConfigError).reasons.some((r) =>
+      r.includes('DQL_V0431_ACTIVE') && r.includes('DQL_RUNTIME_DIAGNOSTICS'),
+    )).toBe(true);
+  });
+
+  it('canary rule: v0431_active + pot-cli + diagnostics ON → resolves', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '1',
+      DQL_V0431_ACTIVE: '1',
+      DQL_RUNTIME_DIAGNOSTICS: '1',
+    });
+    const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    expect(c.v0431_active).toBe(true);
+    expect(c.diagnostics_on).toBe(true);
+  });
+
+  it('canary rule: v0431_active + stub is permitted without diagnostics', () => {
+    const env = cast({
+      DQL_V0431_ACTIVE: '1',
+      DQL_RUNTIME_DIAGNOSTICS: '0',
+    });
+    const c = resolveProductionConfig(env, { requiredMode: 'stub' });
+    expect(c.v0431_active).toBe(true);
+    expect(c.diagnostics_on).toBe(false);
+  });
+
+  it('per-alias overrides via DQL_CB_CONFIG_BY_ALIAS respected; unknown alias → error', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
+        'serv-nano': { tripP90LatencyMs: 9999 },
+      }),
+    });
+    const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    expect(c.circuit_breaker_config_by_alias['serv-nano'].tripP90LatencyMs).toBe(9999);
+    // swift kept default
+    expect(c.circuit_breaker_config_by_alias['serv-swift'].tripP90LatencyMs).toBeGreaterThan(0);
+
+    const badEnv = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({ 'serv-mystery': { tripP90LatencyMs: 100 } }),
+    });
+    expect(() => resolveProductionConfig(badEnv, { requiredMode: 'pot-cli' })).toThrow(
+      ProductionConfigError,
+    );
+  });
+
+  it('required_healthy_headroom out-of-range → error', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_REQUIRED_HEALTHY_HEADROOM: '1.5',
+    });
+    expect(() => resolveProductionConfig(env, { requiredMode: 'pot-cli' })).toThrow(
+      ProductionConfigError,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pot-cli / stub explicit-required behaviour
+// ---------------------------------------------------------------------------
+describe('resolveProductionConfig — mode contracts', () => {
+  it('pot-cli: missing CPM → ConfigError CONFIG_INVALID', () => {
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(
+        cast({ SERV_API_KEY: 'sk' }),
+        { requiredMode: 'pot-cli' },
+      );
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProductionConfigError);
+    expect((caught as ProductionConfigError).code).toBe('CONFIG_INVALID');
+    expect((caught as ProductionConfigError).reasons.some((r) =>
+      r.includes('DQL_CAPITAL_PATH_MODE'),
+    )).toBe(true);
+  });
+
+  it('pot-cli: missing SERV_API_KEY → ConfigError', () => {
+    expect(() =>
+      resolveProductionConfig(
+        cast({ DQL_CAPITAL_PATH_MODE: '1' }),
+        { requiredMode: 'pot-cli' },
+      ),
+    ).toThrow(ProductionConfigError);
+  });
+
+  it('pot-cli: accumulates ALL missing reasons in a single error (not first-fail)', () => {
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(cast({}), { requiredMode: 'pot-cli' });
+    } catch (e) {
+      caught = e;
+    }
+    const joined = (caught as ProductionConfigError).reasons.join(' | ');
+    expect(joined).toContain('DQL_CAPITAL_PATH_MODE');
+    expect(joined).toContain('SERV_API_KEY');
+  });
+
+  it('stub: empty env OK, defaults populated', () => {
+    const c = resolveProductionConfig(cast({}), { requiredMode: 'stub' });
+    expect(c.runtime_mode).toBe('stub');
+    expect(c.capital_path_mode).toBe(false);
+    expect(c.serv_base_url).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B7 — Recursive canonicalisation + hash
+// ---------------------------------------------------------------------------
+describe('B7 — computeConfigHash + canonicaliseJson', () => {
+  it('canonicaliseJson: nested key order irrelevant', () => {
+    const a = { z: 1, a: { y: 2, b: [1, 2, 3] } };
+    const b = { a: { b: [1, 2, 3], y: 2 }, z: 1 };
+    expect(canonicaliseJson(a)).toBe(canonicaliseJson(b));
+  });
+
+  it('canonicaliseJson: array order IS preserved', () => {
+    expect(canonicaliseJson([1, 2, 3])).not.toBe(canonicaliseJson([3, 2, 1]));
+  });
+
+  it('same env → identical hash across two resolutions', () => {
+    const env = potCliMinimum();
     const h1 = computeConfigHash(resolveProductionConfig(env, { requiredMode: 'pot-cli' }));
     const h2 = computeConfigHash(resolveProductionConfig(env, { requiredMode: 'pot-cli' }));
     expect(h1).toBe(h2);
     expect(h1).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('changing capital_path_mode changes the hash', () => {
-    const envOn = cast({ SERV_API_KEY: 'sk-test', DQL_CAPITAL_PATH_MODE: '1' });
-    const envOff = cast({ SERV_API_KEY: 'sk-test', DQL_CAPITAL_PATH_MODE: '0' });
-    const h1 = computeConfigHash(resolveProductionConfig(envOn, { requiredMode: 'pot-cli' }));
-    const h2 = computeConfigHash(resolveProductionConfig(envOff, { requiredMode: 'pot-cli' }));
-    expect(h1).not.toBe(h2);
+  it('changing CPM changes the hash', () => {
+    const on = cast({ SERV_API_KEY: 'sk', DQL_CAPITAL_PATH_MODE: '1' });
+    const off = cast({ SERV_API_KEY: 'sk', DQL_CAPITAL_PATH_MODE: '0' });
+    expect(
+      computeConfigHash(resolveProductionConfig(on, { requiredMode: 'pot-cli' })),
+    ).not.toBe(
+      computeConfigHash(resolveProductionConfig(off, { requiredMode: 'pot-cli' })),
+    );
   });
 
-  it('SECRET rotation with same key-bound state does NOT change the hash', () => {
-    const envA = cast({ SERV_API_KEY: 'sk-old-key', DQL_CAPITAL_PATH_MODE: '1' });
-    const envB = cast({ SERV_API_KEY: 'sk-new-key-completely-different', DQL_CAPITAL_PATH_MODE: '1' });
-    const h1 = computeConfigHash(resolveProductionConfig(envA, { requiredMode: 'pot-cli' }));
-    const h2 = computeConfigHash(resolveProductionConfig(envB, { requiredMode: 'pot-cli' }));
-    // Secret VALUE must never enter the hash.
-    expect(h1).toBe(h2);
+  it('rotating SERV_API_KEY VALUE (same bound state) → hash unchanged (secret isolation)', () => {
+    const a = cast({ SERV_API_KEY: 'old', DQL_CAPITAL_PATH_MODE: '1' });
+    const b = cast({ SERV_API_KEY: 'new-different', DQL_CAPITAL_PATH_MODE: '1' });
+    expect(
+      computeConfigHash(resolveProductionConfig(a, { requiredMode: 'pot-cli' })),
+    ).toBe(
+      computeConfigHash(resolveProductionConfig(b, { requiredMode: 'pot-cli' })),
+    );
   });
 
-  it('changing SERV_BASE_URL changes the hash (it is part of the runtime fingerprint)', () => {
-    const envA = cast({
-      SERV_API_KEY: 'sk-test',
-      DQL_CAPITAL_PATH_MODE: '1',
+  it('changing a NESTED alias CB knob changes the hash', () => {
+    const a = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({ 'serv-nano': { tripP90LatencyMs: 5000 } }),
+    });
+    const b = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({ 'serv-nano': { tripP90LatencyMs: 6000 } }),
+    });
+    expect(
+      computeConfigHash(resolveProductionConfig(a, { requiredMode: 'pot-cli' })),
+    ).not.toBe(
+      computeConfigHash(resolveProductionConfig(b, { requiredMode: 'pot-cli' })),
+    );
+  });
+
+  it('nested alias key order irrelevant (same knobs, different alias JSON key order → same hash)', () => {
+    const a = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
+        'serv-nano': { tripP90LatencyMs: 5000 },
+        'serv-swift': { tripP90LatencyMs: 12000 },
+      }),
+    });
+    const b = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
+        'serv-swift': { tripP90LatencyMs: 12000 },
+        'serv-nano': { tripP90LatencyMs: 5000 },
+      }),
+    });
+    expect(
+      computeConfigHash(resolveProductionConfig(a, { requiredMode: 'pot-cli' })),
+    ).toBe(
+      computeConfigHash(resolveProductionConfig(b, { requiredMode: 'pot-cli' })),
+    );
+  });
+
+  it('SERV_BASE_URL change changes the hash (normalised value participates)', () => {
+    const a = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
       SERV_BASE_URL: 'https://a.example/v1',
     });
-    const envB = cast({
-      SERV_API_KEY: 'sk-test',
-      DQL_CAPITAL_PATH_MODE: '1',
+    const b = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
       SERV_BASE_URL: 'https://b.example/v1',
     });
-    const h1 = computeConfigHash(resolveProductionConfig(envA, { requiredMode: 'pot-cli' }));
-    const h2 = computeConfigHash(resolveProductionConfig(envB, { requiredMode: 'pot-cli' }));
-    expect(h1).not.toBe(h2);
+    expect(
+      computeConfigHash(resolveProductionConfig(a, { requiredMode: 'pot-cli' })),
+    ).not.toBe(
+      computeConfigHash(resolveProductionConfig(b, { requiredMode: 'pot-cli' })),
+    );
   });
 
-  it('changing diagnostics_on changes the hash', () => {
-    const envA = cast({
-      SERV_API_KEY: 'sk-test',
-      DQL_CAPITAL_PATH_MODE: '1',
-      DQL_DIAGNOSTICS_ON: '0',
+  it('trailing slash on SERV_BASE_URL is normalised → hash equal to no-slash form', () => {
+    const a = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
+      SERV_BASE_URL: 'https://a.example/v1/',
     });
-    const envB = cast({
-      SERV_API_KEY: 'sk-test',
-      DQL_CAPITAL_PATH_MODE: '1',
-      DQL_DIAGNOSTICS_ON: '1',
+    const b = cast({
+      SERV_API_KEY: 'sk',
+      DQL_CAPITAL_PATH_MODE: '0',
+      SERV_BASE_URL: 'https://a.example/v1',
     });
-    const h1 = computeConfigHash(resolveProductionConfig(envA, { requiredMode: 'pot-cli' }));
-    const h2 = computeConfigHash(resolveProductionConfig(envB, { requiredMode: 'pot-cli' }));
-    expect(h1).not.toBe(h2);
+    expect(
+      computeConfigHash(resolveProductionConfig(a, { requiredMode: 'pot-cli' })),
+    ).toBe(
+      computeConfigHash(resolveProductionConfig(b, { requiredMode: 'pot-cli' })),
+    );
   });
 
-  it('object-key order does NOT change the hash (canonical sort)', () => {
-    // Two runs across two resolutions with the same env must produce
-    // identical hash regardless of how the underlying resolver populates
-    // its result object internally.
-    const env = cast({ SERV_API_KEY: 'sk-test', DQL_CAPITAL_PATH_MODE: '1' });
-    const a = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
-    // Manually rebuild an object with keys in a different insertion order.
-    const b = {
-      serv_base_url: a.serv_base_url,
-      runtime_mode: a.runtime_mode,
-      diagnostics_on: a.diagnostics_on,
-      confirm_fail: a.confirm_fail,
-      capital_path_mode: a.capital_path_mode,
-      serv_api_key_bound: a.serv_api_key_bound,
-    };
-    expect(computeConfigHash(a)).toBe(computeConfigHash(b as typeof a));
+  it('schema version constant is exported and matches expected form', () => {
+    expect(CONFIG_SCHEMA_VERSION).toMatch(/^0\.4\.3\.1/);
   });
 });

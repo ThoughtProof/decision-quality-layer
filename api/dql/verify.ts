@@ -37,24 +37,33 @@ import {
   createProductionRuntime,
   type ProductionRuntime,
 } from '../../src/engine/production-runtime.js';
-import { ProductionConfigError } from '../../src/engine/production-config.js';
+import {
+  parseRuntimeMode,
+  ProductionConfigError,
+} from '../../src/engine/production-config.js';
 
 const VERSION = '0.2.0';
 const MAX_BODY_SIZE = 1_000_000; // 1 MB
 
-// v0.4.3.1 §C.2 + §D: production runtime bundle is constructed at cold-start.
-// If resolveProductionConfig throws, we cache the error and surface 503 to
-// every /dql/verify request until the next cold-start. This mirrors what
-// /dql/health reports and prevents a partially-initialised runtime from
-// serving traffic.
+// v0.4.3.1 hardening: production runtime bundle is constructed at cold-start.
+// If resolveProductionConfig (or parseRuntimeMode itself) throws, we cache
+// the error as kind='error' and surface 503 CONFIG_INVALID to EVERY POST
+// request — including sandbox. Sandbox bypasses provider I/O and billing,
+// NOT the deployment-health invariant (Hermes Blocker 1).
 type RuntimeInit =
   | { kind: 'stub'; cascade: Cascade }
   | { kind: 'production'; production: ProductionRuntime; cascade: Cascade }
   | { kind: 'error'; reason: ProductionConfigError };
 
 function pickRuntime(): RuntimeInit {
-  const mode = (process.env.DQL_CASCADE ?? 'stub').trim().toLowerCase();
-  if (mode === 'pot-cli' || mode === 'potcli' || mode === 'live') {
+  let mode;
+  try {
+    mode = parseRuntimeMode(process.env.DQL_CASCADE);
+  } catch (e) {
+    if (e instanceof ProductionConfigError) return { kind: 'error', reason: e };
+    throw e;
+  }
+  if (mode === 'pot-cli') {
     try {
       const production = createProductionRuntime(process.env);
       return { kind: 'production', production, cascade: production.cascade };
@@ -124,20 +133,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     //   - Sandbox request                        → skip charge (free)
     //   - Otherwise                              → 402 Payment Required with both options
 
-    // v0.4.3.1 §D: if cold-start resolver failed, /dql/verify surfaces 503
-    // for real (non-sandbox) requests. Sandbox mode remains available so
-    // integrators can still exercise the API contract during outages.
-    if (RUNTIME.kind === 'error' && !validation.request.sandbox) {
+    // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start resolver
+    // failed for a Live-configured deploy, EVERY POST returns 503, including
+    // sandbox=true. A mis-configured DQL_CASCADE=pot-cli process must not be
+    // able to answer 200 via the sandbox path — that would let a broken
+    // deploy appear healthy to callers who probe with sandbox first.
+    if (RUNTIME.kind === 'error') {
       return res.status(503).json({
         error: 'Runtime not initialised',
-        code: 'RUNTIME_UNHEALTHY',
+        code: 'CONFIG_INVALID',
         reasons: RUNTIME.reason.reasons,
       });
     }
 
     const response = await runVerification({
       request: validation.request,
-      cascade: RUNTIME.kind === 'error' ? new StubCascade() : RUNTIME.cascade,
+      cascade: RUNTIME.cascade,
       sandboxCascade,
       requestId,
       version: VERSION,

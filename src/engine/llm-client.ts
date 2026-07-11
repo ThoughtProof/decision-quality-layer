@@ -234,8 +234,21 @@ export interface HttpLlmClientConfig {
   /**
    * Config passed to every CircuitBreaker instance the client creates.
    * Leave undefined to accept CircuitBreaker defaults.
+   *
+   * v0.4.3.1 hardening: prefer `circuitBreakerConfigByAlias` for per-alias
+   * knobs. When both are set, per-alias overrides win for the aliases they
+   * name; the global config applies to any unnamed alias.
    */
   circuitBreakerConfig?: CircuitBreakerConfig;
+  /**
+   * Per-alias CircuitBreaker knobs. When an alias appears here, its
+   * breaker is instantiated with the merged (perAlias over global)
+   * config. When absent, the global config (or CB defaults) applies.
+   *
+   * v0.4.3.1 §D-hardening: required for capital-path deploys because
+   * nano and swift target different SLA envelopes.
+   */
+  circuitBreakerConfigByAlias?: Record<string, CircuitBreakerConfig>;
   /**
    * Disable circuit-breaker routing entirely. Every call goes straight to
    * its requested alias; no failover, no fail-closed. Intended for tests
@@ -264,7 +277,7 @@ export interface HttpLlmClientConfig {
   capitalPathMode?: boolean;
 }
 
-const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'disableCircuitBreaker' | 'capitalPathMode'>> = {
+const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode'>> = {
   timeoutMs: 60_000,
   maxAttempts: 6,
   backoffBaseMs: 800,
@@ -285,11 +298,14 @@ const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
 // -----------------------------------------------------------------------------
 
 export class HttpLlmClient implements LlmClient {
-  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'disableCircuitBreaker' | 'capitalPathMode'>>;
+  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode'>>;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
   private readonly circuitBreakers: Map<string, CircuitBreaker> = new Map();
   private readonly circuitBreakerConfig: CircuitBreakerConfig | undefined;
+  private readonly circuitBreakerConfigByAlias:
+    | Record<string, CircuitBreakerConfig>
+    | undefined;
   private readonly disableCircuitBreaker: boolean;
   private readonly capitalPathMode: boolean;
 
@@ -307,6 +323,7 @@ export class HttpLlmClient implements LlmClient {
     this.sleep = config.sleep ?? defaultSleep;
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.circuitBreakerConfig = config.circuitBreakerConfig;
+    this.circuitBreakerConfigByAlias = config.circuitBreakerConfigByAlias;
     this.disableCircuitBreaker = config.disableCircuitBreaker ?? false;
     this.capitalPathMode = config.capitalPathMode ?? false;
   }
@@ -318,7 +335,14 @@ export class HttpLlmClient implements LlmClient {
   private getBreaker(alias: string): CircuitBreaker {
     let cb = this.circuitBreakers.get(alias);
     if (!cb) {
-      cb = new CircuitBreaker(alias, this.circuitBreakerConfig);
+      // v0.4.3.1 hardening: per-alias config wins over global. Shallow
+      // merge so unspecified per-alias fields fall back to global then
+      // CB defaults. This is the wiring point Hermes Blocker 6 requires.
+      const perAlias = this.circuitBreakerConfigByAlias?.[alias];
+      const merged: CircuitBreakerConfig | undefined = perAlias
+        ? { ...(this.circuitBreakerConfig ?? {}), ...perAlias }
+        : this.circuitBreakerConfig;
+      cb = new CircuitBreaker(alias, merged);
       this.circuitBreakers.set(alias, cb);
     }
     return cb;
