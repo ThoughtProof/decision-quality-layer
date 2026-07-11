@@ -33,13 +33,24 @@ const req: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> =
 };
 
 describe('PR #12 §C.2 — ProductionRuntime bundle', () => {
-  it('createProductionRuntime returns cascade + client wired together', () => {
+  it('createProductionRuntime returns cascade + client with correct concrete types', () => {
     const env = { SERV_API_KEY: 'sk-test' } as unknown as NodeJS.ProcessEnv;
     const runtime = createProductionRuntime(env);
 
-    // Both fields are present and typed correctly.
+    // Both fields are present and typed correctly. This is a shape check
+    // — it does NOT prove `cascade` uses THIS specific client instance.
+    // A true injection identity test needs a hook the factory does not
+    // currently expose. Once resolveProductionConfig lands, this test will
+    // be replaced by a discriminating identity assertion that observes the
+    // client via a scripted response (see engine-provider-outcome tests
+    // for the pattern).
     expect(runtime.cascade).toBeInstanceOf(PotCliCascade);
     expect(runtime.client).toBeInstanceOf(HttpLlmClient);
+
+    // v0.4.3.1 §C.2-note (Hermes 2026-07-11): the `_env` argument is
+    // currently ignored by createProductionRuntime. Do not rely on this
+    // test as evidence of controlled env wiring — that will land with
+    // resolveProductionConfig / computeConfigHash in the next commit.
   });
 
   it('engine runs against StubCascade with no production runtime at all', async () => {

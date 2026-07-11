@@ -204,7 +204,14 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
   // were served (they must have been — combineVerdicts is called with two
   // served AxisResults from the cascade). If either lacks 'served', the
   // merged result carries the more-informative label from primary.
-  const mergedOutcome: 'served' | 'circuit_rejected' | undefined =
+  // v0.4.3.1 §C.3-fix: the union now includes 'provider_error'. The merge
+  // rule stays: 'served' iff BOTH draws are 'served', else the primary's
+  // outcome (or the secondary's when primary omits one).
+  const mergedOutcome:
+    | 'served'
+    | 'circuit_rejected'
+    | 'provider_error'
+    | undefined =
     primary.provider_outcome === 'served' && secondary.provider_outcome === 'served'
       ? 'served'
       : primary.provider_outcome ?? secondary.provider_outcome;

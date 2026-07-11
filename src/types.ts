@@ -118,15 +118,24 @@ export interface AxisResult {
    *
    *   'served'           — some route (primary or fallback) returned a response.
    *                        `provider_route` names which one.
-   *   'circuit_rejected' — no provider was called because the circuit-breaker
-   *                        rejected the call (CPM=true, or both circuits open).
+   *   'circuit_rejected' — NO provider fetch was started for this call. The
+   *                        circuit-breaker rejected before any network I/O.
+   *                        `provider_route` is absent.
+   *   'provider_error'   — AT LEAST ONE provider fetch was started for this
+   *                        call but no route ultimately served a response.
    *                        `provider_route` is absent.
    *
+   * v0.4.3.1 §C.3-fix (Hermes 2026-07-11): the third value disambiguates
+   * fail-closed-with-fetch from fail-closed-without-fetch. Report aggregators
+   * MUST use the structured field, never derive from an error-message string.
+   *
    * Optional. Omitted when the field is not applicable (e.g. sandbox path,
-   * legacy responses). Report aggregators should count fallback fetches ONLY
-   * from (`provider_route === 'fallback' && provider_outcome === 'served'`).
+   * legacy responses). Report aggregators should count:
+   *   • served fallback:               route='fallback' && outcome='served'
+   *   • fail-closed due to rejection:  outcome='circuit_rejected'
+   *   • fail-closed after fetch:       outcome='provider_error'
    */
-  provider_outcome?: 'served' | 'circuit_rejected';
+  provider_outcome?: 'served' | 'circuit_rejected' | 'provider_error';
 }
 
 // -----------------------------------------------------------------------------

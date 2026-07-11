@@ -135,12 +135,21 @@ describe('PR #12 §C.3 — provider_route names ONLY served routes', () => {
     // Fourth call: primary is now OPEN. Under CPM=true, must throw
     // CircuitAllOpenError WITHOUT attempting fallback.
     const fetchesBefore = fetchImpl.mock.calls.length;
-    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
-      CircuitAllOpenError
-    );
+    // v0.4.3.1 §C.3-fix: capture the error to assert structured provenance.
+    let caught: unknown = null;
+    try {
+      await client.call('serv-nano', { system: 's', user: 'u' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CircuitAllOpenError);
+    const err = caught as CircuitAllOpenError;
     const fetchesAfter = fetchImpl.mock.calls.length;
     // No fallback fetch happened between throw-decision and rejection.
     expect(fetchesAfter - fetchesBefore).toBe(0);
+    // Structured provenance: primary breaker was ALREADY OPEN when this
+    // call entered, so no provider fetch was started on this call.
+    expect(err.attemptedRoutes).toEqual([]);
   });
 
   it('Case 2 (CPM=false, both circuits OPEN): CircuitAllOpenError, no phantom "fallback served"', async () => {
@@ -179,10 +188,18 @@ describe('PR #12 §C.3 — provider_route names ONLY served routes', () => {
     }
     const fetchesBefore = fetchImpl.mock.calls.length;
     // Next call: BOTH circuits OPEN → CircuitAllOpenError, no fetches at all.
-    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
-      CircuitAllOpenError
-    );
+    let caught: unknown = null;
+    try {
+      await client.call('serv-nano', { system: 's', user: 'u' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CircuitAllOpenError);
+    const err = caught as CircuitAllOpenError;
     const fetchesAfter = fetchImpl.mock.calls.length;
     expect(fetchesAfter - fetchesBefore).toBe(0);
+    // v0.4.3.1 §C.3-fix: BOTH breakers were already OPEN when this call
+    // entered, so no provider fetch was started — attemptedRoutes MUST be [].
+    expect(err.attemptedRoutes).toEqual([]);
   });
 });

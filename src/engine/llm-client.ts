@@ -122,13 +122,30 @@ export interface LlmClient {
  * are OPEN. The engine (src/engine/index.ts) maps this to a fail-closed
  * UNCERTAIN@0 verdict with an explicit objection — for a safety product,
  * "escalate to human" is the correct default under provider outage.
+ *
+ * v0.4.3.1 §C.3-fix (Hermes 2026-07-11): the error carries structured
+ * provenance of which routes (if any) were actually attempted against the
+ * upstream provider in the current axis call. The engine uses this to
+ * distinguish `circuit_rejected` (no fetch was made) from `provider_error`
+ * (at least one fetch was attempted but failed). This must NEVER be derived
+ * from Error.message string parsing.
+ *
+ * Contract:
+ *   attemptedRoutes = []                    → no provider fetch was started
+ *   attemptedRoutes = ['primary']           → primary was fetched (and failed)
+ *   attemptedRoutes = ['primary','fallback']→ both fetched (both failed)
+ *   attemptedRoutes = ['fallback']          → primary skipped (already OPEN),
+ *                                              fallback was fetched (failed)
  */
+export type AttemptedRoute = 'primary' | 'fallback';
 export class CircuitAllOpenError extends Error {
+  public readonly attemptedRoutes: readonly AttemptedRoute[];
   constructor(
     public readonly primaryAlias: string,
     public readonly fallbackAlias: string | null,
     public readonly primaryReason: string,
-    public readonly fallbackReason: string | null
+    public readonly fallbackReason: string | null,
+    attemptedRoutes: readonly AttemptedRoute[] = []
   ) {
     super(
       fallbackAlias
@@ -138,6 +155,9 @@ export class CircuitAllOpenError extends Error {
           : `[llm-client] circuit open and no fallback configured: ${primaryAlias} (${primaryReason})`
     );
     this.name = 'CircuitAllOpenError';
+    // Defensive copy — callers must not be able to mutate provenance after
+    // the error is thrown.
+    this.attemptedRoutes = Object.freeze([...attemptedRoutes]);
   }
 }
 
@@ -340,9 +360,16 @@ export class HttpLlmClient implements LlmClient {
     } catch (err) {
       if (err instanceof CircuitOpenError) {
         if (this.capitalPathMode) {
-          throw new CircuitAllOpenError(modelAlias, null, err.reason, 'capital-path-mode: fallback disabled until v0.4.3 recertification');
+          // Primary was already OPEN, CPM=true → no fetch attempted at all.
+          throw new CircuitAllOpenError(
+            modelAlias, null, err.reason,
+            'capital-path-mode: fallback disabled until v0.4.3 recertification',
+            [] // attemptedRoutes: no provider fetch was started
+          );
         }
-        return await this.callViaFallback(modelAlias, binding, input, err.reason);
+        // Primary was already OPEN; hand off to fallback without a primary
+        // fetch. `primaryAttempted=false` propagates through callViaFallback.
+        return await this.callViaFallback(modelAlias, binding, input, err.reason, false);
       }
       throw err;
     }
@@ -372,18 +399,23 @@ export class HttpLlmClient implements LlmClient {
       // In capital-path mode, fail-closed instead of routing to fallback.
       if (primaryBreaker.snapshot().state === 'OPEN') {
         if (this.capitalPathMode) {
+          // Primary fetch was actually attempted (and failed), which is what
+          // just tripped the breaker. CPM disables fallback → fail-closed,
+          // but attemptedRoutes MUST record the primary fetch attempt.
           throw new CircuitAllOpenError(
             modelAlias,
             null,
             primaryBreaker.snapshot().lastTripReason,
-            'capital-path-mode: fallback disabled until v0.4.3 recertification'
+            'capital-path-mode: fallback disabled until v0.4.3 recertification',
+            ['primary'] // attemptedRoutes
           );
         }
         return await this.callViaFallback(
           modelAlias,
           binding,
           input,
-          primaryBreaker.snapshot().lastTripReason
+          primaryBreaker.snapshot().lastTripReason,
+          true // primaryAttempted
         );
       }
       throw err;
@@ -399,11 +431,18 @@ export class HttpLlmClient implements LlmClient {
     primaryAlias: string,
     primaryBinding: ModelBinding,
     input: LlmCallInput,
-    primaryReason: string
+    primaryReason: string,
+    primaryAttempted: boolean
   ): Promise<LlmCallOutput> {
     const fallbackAlias = primaryBinding.fallbackAlias ?? null;
     if (!fallbackAlias) {
-      throw new CircuitAllOpenError(primaryAlias, null, primaryReason, null);
+      // No fallback configured → fail-closed. Provenance mirrors whether
+      // the primary was actually attempted or the primary breaker was
+      // already OPEN.
+      throw new CircuitAllOpenError(
+        primaryAlias, null, primaryReason, null,
+        primaryAttempted ? ['primary'] : []
+      );
     }
     const fallbackBinding = this.modelMap[fallbackAlias];
     if (!fallbackBinding) {
@@ -416,11 +455,14 @@ export class HttpLlmClient implements LlmClient {
       fallbackBreaker.canProceed();
     } catch (err) {
       if (err instanceof CircuitOpenError) {
+        // Fallback breaker was already OPEN → no fallback fetch attempted.
+        // attemptedRoutes reflects only the primary fetch (if any).
         throw new CircuitAllOpenError(
           primaryAlias,
           fallbackAlias,
           primaryReason,
-          err.reason
+          err.reason,
+          primaryAttempted ? ['primary'] : []
         );
       }
       throw err;

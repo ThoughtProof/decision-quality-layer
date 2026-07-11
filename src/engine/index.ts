@@ -73,18 +73,30 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
         const reasoning = isCircuitAllOpen
           ? `Axis evaluation could not be performed — SERV provider is unavailable on both primary and fallback aliases. Fail-closed: verdict is UNCERTAIN, escalate to human review.`
           : `Axis evaluation failed with an error — treated as UNCERTAIN.`;
+        // v0.4.3.1 §C.3-fix (Hermes 2026-07-11): distinguish the two
+        // fail-closed sub-cases from the error's STRUCTURED provenance,
+        // never from Error.message string parsing.
+        //   attemptedRoutes.length === 0 → no provider fetch was made
+        //   attemptedRoutes.length ≥  1 → at least one provider fetch was made
+        let providerOutcome:
+          | 'circuit_rejected'
+          | 'provider_error'
+          | undefined = undefined;
+        if (isCircuitAllOpen) {
+          providerOutcome =
+            (err as CircuitAllOpenError).attemptedRoutes.length === 0
+              ? 'circuit_rejected'
+              : 'provider_error';
+        }
         const result: AxisResult = {
           axis,
           verdict: 'UNCERTAIN',
           confidence: 0,
           reasoning,
           objection,
-          // v0.4.3.1 (§C.3): `provider_route` names ONLY a route that actually
-          // served a response. A CircuitAllOpenError means no provider was
-          // called — tag `provider_outcome='circuit_rejected'` instead and
-          // leave `provider_route` absent so report aggregators do not count
-          // this axis as a fallback-served draw.
-          ...(isCircuitAllOpen ? { provider_outcome: 'circuit_rejected' as const } : {}),
+          // `provider_route` remains absent on any fail-closed path: no
+          // route ultimately SERVED a response, so no route may be named.
+          ...(providerOutcome ? { provider_outcome: providerOutcome } : {}),
         };
         return { result, modelsUsed: [] };
       }
