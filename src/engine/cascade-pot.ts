@@ -139,15 +139,23 @@ export class PotCliCascade implements Cascade {
       user: prompt.user,
       maxTokens: this.config.maxTokens,
     });
+    const parsed = parseAxisResponse(axis, out.raw);
+    // Attach provider_route from the llm-client output. When the client
+    // doesn't provide it (e.g. Mock/Stub cascade in tests), leave undefined.
+    if (out.providerRoute) {
+      parsed.provider_route = out.providerRoute;
+    }
     return {
       modelId: out.modelUsed,
-      result: parseAxisResponse(axis, out.raw),
+      route: out.providerRoute,
+      result: parsed,
     };
   }
 }
 
 interface AxisCall {
   modelId: string;
+  route: 'primary' | 'fallback' | undefined;
   result: AxisResult;
 }
 
@@ -169,6 +177,14 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
   const p = primary.verdict;
   const s = secondary.verdict;
 
+  // If EITHER draw was served via the SERV-internal fallback route, the
+  // merged axis-result inherits 'fallback'. Rationale: an aggregated axis
+  // verdict where any part was rerouted must carry that provenance.
+  const mergedRoute: 'primary' | 'fallback' | undefined =
+    primary.provider_route === 'fallback' || secondary.provider_route === 'fallback'
+      ? 'fallback'
+      : primary.provider_route ?? secondary.provider_route;
+
   const merged = (verdict: AxisVerdict, confidence: number, note: string): AxisResult => ({
     axis: primary.axis,
     verdict,
@@ -179,6 +195,7 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
         ? ''
         : [primary.objection, secondary.objection].filter(Boolean).join(' | ') ||
           (secondary.objection || primary.objection),
+    ...(mergedRoute ? { provider_route: mergedRoute } : {}),
   });
 
   if (p === 'PASS' && s === 'PASS') {
