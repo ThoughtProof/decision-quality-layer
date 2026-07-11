@@ -62,13 +62,21 @@ export interface ProductionRuntime {
 /**
  * Optional overrides for tests: injecting a controlled client lets a test
  * prove that the exact instance the factory returns is the SAME instance
- * that ends up serving cascade calls. Production callers omit both fields.
+ * that ends up serving cascade calls. Production callers omit all fields.
  */
 export interface CreateProductionRuntimeOptions {
   /** Test override for the LlmClient. */
   clientOverride?: LlmClient;
   /** Test override for identity clock/randomness. */
   identityOverride?: { instanceId: string; coldStartAt: number };
+  /**
+   * Test-only extra options merged into the HttpLlmClientConfig the factory
+   * uses. Enables tests to inject `fetchImpl` / `now` / etc. WITHOUT
+   * bypassing the factory's own wiring of `serv_base_url`, per-alias CB,
+   * `capital_path_mode`, and `disable_circuit_breaker`. Production callers
+   * omit this field.
+   */
+  clientOptionsOverride?: Record<string, unknown>;
 }
 
 /**
@@ -95,18 +103,38 @@ export function createProductionRuntime(
   const config = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
   const configHash = computeConfigHash(config);
   const bindings = resolveModelBindings(config);
-  const cbByAlias = resolveCbByAlias(config);
+
+  // B2 (Hermes 2026-07-11): per-alias CB knobs are ONLY wired into the
+  // client when v0431_active=true. With the canary flag OFF the client
+  // uses the PR #10 global default (baseline behaviour), preserving the
+  // shadow-mode contract byte-identically. With v0431_active=true the
+  // resolver has already required an explicit DQL_CB_CONFIG_BY_ALIAS for
+  // every known alias — no unkalibrated per-alias values slip through.
+  const cbByAliasForClient: Record<string, CircuitBreakerConfig> | undefined =
+    config.v0431_active ? resolveCbByAlias(config) : undefined;
+
   // v0.4.3.1 hardening: capital_path_mode, per-alias CB config and the
   // validated ModelBindings all flow through EXPLICITLY. No silent default
   // and no reliance on the ambient DEFAULT_MODEL_MAP anywhere below.
+  const baseClientOptions = {
+    capitalPathMode: config.capital_path_mode,
+    circuitBreakerConfigByAlias: cbByAliasForClient,
+    disableCircuitBreaker: config.disable_circuit_breaker,
+  };
+  const mergedClientOptions = opts.clientOptionsOverride
+    ? { ...baseClientOptions, ...opts.clientOptionsOverride }
+    : baseClientOptions;
+
   const client =
     opts.clientOverride ??
-    new HttpLlmClient(bindings, env, {
-      capitalPathMode: config.capital_path_mode,
-      circuitBreakerConfigByAlias: cbByAlias,
-      disableCircuitBreaker: config.disable_circuit_breaker,
-    });
-  const cascade = new PotCliCascade(client);
+    new HttpLlmClient(bindings, env, mergedClientOptions);
+
+  // B1 (Hermes 2026-07-11): confirm_fail is now REALLY wired into the
+  // cascade. Previously the resolver hashed it but the cascade fell back
+  // to its own env read; this closes that invariant gap.
+  const cascade = new PotCliCascade(client, {
+    confirmFail: config.confirm_fail,
+  });
   const identity = opts.identityOverride ?? {
     instanceId: crypto.randomBytes(8).toString('hex'),
     coldStartAt: Date.now(),

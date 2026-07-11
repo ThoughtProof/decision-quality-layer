@@ -191,7 +191,7 @@ describe('B6 — Full v0.4.3.1 schema', () => {
     expect(c.serv_api_key_bound).toBe(true);
     expect(c.confirm_fail).toBe(false);
     expect(c.diagnostics_on).toBe(false);
-    expect(c.required_healthy_headroom).toBe(0.5);
+    expect(c.required_healthy_alias_fraction).toBe(0.5);
     // per-alias present for both known aliases
     expect(c.circuit_breaker_config_by_alias['serv-nano'].tripP90LatencyMs).toBeGreaterThan(0);
     expect(c.circuit_breaker_config_by_alias['serv-swift'].tripP90LatencyMs).toBeGreaterThan(0);
@@ -217,12 +217,16 @@ describe('B6 — Full v0.4.3.1 schema', () => {
     )).toBe(true);
   });
 
-  it('canary rule: v0431_active + pot-cli + diagnostics ON → resolves', () => {
+  it('canary rule: v0431_active + pot-cli + diagnostics ON + explicit per-alias CB → resolves', () => {
     const env = cast({
       SERV_API_KEY: 'sk-test',
       DQL_CAPITAL_PATH_MODE: '1',
       DQL_V0431_ACTIVE: '1',
       DQL_RUNTIME_DIAGNOSTICS: '1',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
+        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+        'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      }),
     });
     const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
     expect(c.v0431_active).toBe(true);
@@ -262,15 +266,195 @@ describe('B6 — Full v0.4.3.1 schema', () => {
     );
   });
 
-  it('required_healthy_headroom out-of-range → error', () => {
+  it('required_healthy_alias_fraction out-of-range → error (new name)', () => {
     const env = cast({
       SERV_API_KEY: 'sk-test',
       DQL_CAPITAL_PATH_MODE: '0',
-      DQL_REQUIRED_HEALTHY_HEADROOM: '1.5',
+      DQL_REQUIRED_HEALTHY_ALIAS_FRACTION: '1.5',
     });
     expect(() => resolveProductionConfig(env, { requiredMode: 'pot-cli' })).toThrow(
       ProductionConfigError,
     );
+  });
+
+  it('legacy required_healthy_headroom env still accepted for one release', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_REQUIRED_HEALTHY_HEADROOM: '0.7',
+    });
+    const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    expect(c.required_healthy_alias_fraction).toBe(0.7);
+  });
+
+  it('setting both new + legacy fraction env vars → error', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_REQUIRED_HEALTHY_ALIAS_FRACTION: '0.6',
+      DQL_REQUIRED_HEALTHY_HEADROOM: '0.7',
+    });
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProductionConfigError);
+    expect((caught as ProductionConfigError).reasons.some((r) =>
+      r.includes('both set'),
+    )).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B4 (Hermes 2026-07-11) — per-alias numeric bounds + unknown-key rejection
+// ---------------------------------------------------------------------------
+describe('B4 — per-alias config bounds', () => {
+  function withCb(cb: Record<string, unknown>): NodeJS.ProcessEnv {
+    return cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify(cb),
+    });
+  }
+
+  it('rejects tripP90LatencyMs ≤ 0', () => {
+    expect(() =>
+      resolveProductionConfig(withCb({ 'serv-nano': { tripP90LatencyMs: 0 } }), {
+        requiredMode: 'pot-cli',
+      }),
+    ).toThrow(ProductionConfigError);
+    expect(() =>
+      resolveProductionConfig(withCb({ 'serv-nano': { tripP90LatencyMs: -100 } }), {
+        requiredMode: 'pot-cli',
+      }),
+    ).toThrow(ProductionConfigError);
+  });
+
+  it('rejects tripFailureRate outside [0,1]', () => {
+    expect(() =>
+      resolveProductionConfig(withCb({ 'serv-nano': { tripFailureRate: 7 } }), {
+        requiredMode: 'pot-cli',
+      }),
+    ).toThrow(ProductionConfigError);
+    expect(() =>
+      resolveProductionConfig(withCb({ 'serv-nano': { tripFailureRate: -0.1 } }), {
+        requiredMode: 'pot-cli',
+      }),
+    ).toThrow(ProductionConfigError);
+  });
+
+  it('rejects negative cooldownMs', () => {
+    expect(() =>
+      resolveProductionConfig(withCb({ 'serv-nano': { cooldownMs: -1 } }), {
+        requiredMode: 'pot-cli',
+      }),
+    ).toThrow(ProductionConfigError);
+  });
+
+  it('rejects unknown keys inside a per-alias CB object (no silent default)', () => {
+    expect(() =>
+      resolveProductionConfig(
+        withCb({ 'serv-nano': { tripP90LatencyMs: 5_000, mystery: 42 } }),
+        { requiredMode: 'pot-cli' },
+      ),
+    ).toThrow(ProductionConfigError);
+  });
+
+  it('rejects p90CeilingMs ≤ 0 in latency-ceiling override', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_LATENCY_CEILING_BY_ALIAS: JSON.stringify({
+        'serv-nano': { p90CeilingMs: 0 },
+      }),
+    });
+    expect(() => resolveProductionConfig(env, { requiredMode: 'pot-cli' })).toThrow(
+      ProductionConfigError,
+    );
+  });
+
+  it('rejects unknown keys inside a per-alias latency-ceiling object', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '0',
+      DQL_LATENCY_CEILING_BY_ALIAS: JSON.stringify({
+        'serv-nano': { p90CeilingMs: 10_000, mystery: 1 },
+      }),
+    });
+    expect(() => resolveProductionConfig(env, { requiredMode: 'pot-cli' })).toThrow(
+      ProductionConfigError,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B2 (Hermes 2026-07-11) — v0431_active shadow-mode invariant
+// ---------------------------------------------------------------------------
+describe('B2 — v0431_active requires explicit per-alias CB config', () => {
+  it('v0431_active=true without DQL_CB_CONFIG_BY_ALIAS → ConfigError', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '1',
+      DQL_V0431_ACTIVE: '1',
+      DQL_RUNTIME_DIAGNOSTICS: '1',
+    });
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProductionConfigError);
+    expect((caught as ProductionConfigError).reasons.some((r) =>
+      r.includes('DQL_CB_CONFIG_BY_ALIAS') && r.includes('every known alias'),
+    )).toBe(true);
+  });
+
+  it('v0431_active=true with only one alias entry → ConfigError', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '1',
+      DQL_V0431_ACTIVE: '1',
+      DQL_RUNTIME_DIAGNOSTICS: '1',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
+        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      }),
+    });
+    let caught: unknown = null;
+    try {
+      resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProductionConfigError);
+    expect((caught as ProductionConfigError).reasons.some((r) =>
+      r.includes('serv-swift'),
+    )).toBe(true);
+  });
+
+  it('v0431_active=true with entries for all known aliases → resolves', () => {
+    const env = cast({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '1',
+      DQL_V0431_ACTIVE: '1',
+      DQL_RUNTIME_DIAGNOSTICS: '1',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
+        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+        'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      }),
+    });
+    const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+    expect(c.v0431_active).toBe(true);
+    expect(c.circuit_breaker_config_by_alias['serv-nano'].tripP90LatencyMs).toBe(10_000);
+  });
+
+  it('v0431_active=false: baseline defaults for BOTH aliases are the SAME (15s)', () => {
+    const c = resolveProductionConfig(potCliMinimum(), { requiredMode: 'pot-cli' });
+    expect(c.v0431_active).toBe(false);
+    expect(c.circuit_breaker_config_by_alias['serv-nano'].tripP90LatencyMs).toBe(15_000);
+    expect(c.circuit_breaker_config_by_alias['serv-swift'].tripP90LatencyMs).toBe(15_000);
   });
 });
 

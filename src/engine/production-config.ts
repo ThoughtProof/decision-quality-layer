@@ -88,8 +88,17 @@ export interface ProductionConfig {
   circuit_breaker_config_by_alias: Record<KnownAlias, AliasCircuitBreakerConfig>;
   /** Per-alias product latency ceiling — validated, complete. */
   product_latency_ceiling_by_alias: Record<KnownAlias, AliasLatencyCeiling>;
-  /** Fraction (0..1) of aliases that must remain healthy under Gate 2. */
-  required_healthy_headroom: number;
+  /**
+   * Fraction of KNOWN_ALIASES that must remain healthy for Gate 2 to admit
+   * a request. Range: [0,1]. Renamed per Hermes 2026-07-11 review — the
+   * previous name `required_healthy_headroom` was ambiguous (latency
+   * headroom vs. alias fraction). Semantic here is EXPLICITLY:
+   *   #healthy_aliases / |KNOWN_ALIASES| >= required_healthy_alias_fraction
+   * With two aliases and default 0.5, this means "at least one of two
+   * must be healthy". This must NOT be confused with a latency-ceiling
+   * safety margin — see product_latency_ceiling_by_alias for that.
+   */
+  required_healthy_alias_fraction: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,12 +263,19 @@ export function endpointIdFor(url: string | null): 'openserv-default' | 'custom'
 // ---------------------------------------------------------------------------
 
 /**
- * Default per-alias CB knobs. Chosen from PR #10/#11 defaults; each alias
- * currently gets the same trip thresholds. The resolver still emits them
- * PER-ALIAS so subsequent tuning does not require a config-schema change.
+ * v0.4.3-baseline CB knobs. Kept per-alias for schema uniformity, but
+ * EVERY alias gets the same PR #10 global default (15s / 0.5 / 30s) so
+ * that `v0431_active=false` reproduces baseline behaviour byte-identically
+ * — no new unkalibrated per-alias trip thresholds are introduced by this
+ * schema alone. Explicit per-alias tuning requires `v0431_active=true` +
+ * `DQL_CB_CONFIG_BY_ALIAS` for both known aliases.
+ *
+ * Rationale (Hermes 2026-07-11 review): the previous defaults (nano=8s /
+ * swift=15s) silently changed nano behaviour before calibration — even
+ * with the canary flag OFF. That violated the shadow-mode principle.
  */
 const DEFAULT_CB_BY_ALIAS: Record<KnownAlias, AliasCircuitBreakerConfig> = {
-  'serv-nano': { tripP90LatencyMs: 8_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+  'serv-nano': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
   'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
 };
 
@@ -269,9 +285,34 @@ const DEFAULT_LATENCY_CEILING_BY_ALIAS: Record<KnownAlias, AliasLatencyCeiling> 
 };
 
 /**
+ * Known keys accepted per alias in DQL_CB_CONFIG_BY_ALIAS. Any other key
+ * within a known-alias object is a hard error (typo protection). Bounds:
+ *   tripP90LatencyMs > 0
+ *   tripFailureRate  in [0,1]
+ *   cooldownMs      >= 0
+ */
+const CB_ALIAS_KEYS = ['tripP90LatencyMs', 'tripFailureRate', 'cooldownMs'] as const;
+type CbAliasKey = (typeof CB_ALIAS_KEYS)[number];
+
+function validateCbNumber(key: CbAliasKey, value: number): string | null {
+  if (key === 'tripP90LatencyMs' && !(value > 0)) {
+    return `must be > 0 (got ${value})`;
+  }
+  if (key === 'tripFailureRate' && !(value >= 0 && value <= 1)) {
+    return `must be in [0,1] (got ${value})`;
+  }
+  if (key === 'cooldownMs' && !(value >= 0)) {
+    return `must be >= 0 (got ${value})`;
+  }
+  return null;
+}
+
+/**
  * Optional overrides via a single JSON env: DQL_CB_CONFIG_BY_ALIAS.
  * If present, must parse to a partial map keyed by KnownAlias with
- * numeric fields; unknown aliases or non-numeric fields → error.
+ * numeric fields in valid ranges (see validateCbNumber). Unknown aliases,
+ * unknown per-alias keys, non-numeric values, or out-of-range numbers
+ * all produce ConfigError — nothing is silently defaulted.
  */
 function readCbByAlias(
   raw: string | undefined,
@@ -310,7 +351,15 @@ function readCbByAlias(
     }
     const cur = out[alias as KnownAlias];
     const spec = v as Record<string, unknown>;
-    for (const key of ['tripP90LatencyMs', 'tripFailureRate', 'cooldownMs'] as const) {
+    // Reject typos and unknown fields BEFORE reading known ones.
+    for (const k of Object.keys(spec)) {
+      if (!(CB_ALIAS_KEYS as readonly string[]).includes(k)) {
+        reasons.push(
+          `DQL_CB_CONFIG_BY_ALIAS[${alias}] has unknown key ${JSON.stringify(k)}; allowed keys: ${CB_ALIAS_KEYS.join(', ')}`,
+        );
+      }
+    }
+    for (const key of CB_ALIAS_KEYS) {
       if (spec[key] === undefined) continue;
       if (typeof spec[key] !== 'number' || !Number.isFinite(spec[key])) {
         reasons.push(
@@ -318,11 +367,19 @@ function readCbByAlias(
         );
         continue;
       }
-      cur[key] = spec[key] as number;
+      const n = spec[key] as number;
+      const boundErr = validateCbNumber(key, n);
+      if (boundErr) {
+        reasons.push(`DQL_CB_CONFIG_BY_ALIAS[${alias}].${key} ${boundErr}`);
+        continue;
+      }
+      cur[key] = n;
     }
   }
   return out;
 }
+
+const LATENCY_CEILING_KEYS = ['p90CeilingMs'] as const;
 
 function readLatencyCeilingByAlias(
   raw: string | undefined,
@@ -360,10 +417,22 @@ function readLatencyCeilingByAlias(
       continue;
     }
     const spec = v as Record<string, unknown>;
+    // Reject typos and unknown fields.
+    for (const k of Object.keys(spec)) {
+      if (!(LATENCY_CEILING_KEYS as readonly string[]).includes(k)) {
+        reasons.push(
+          `DQL_LATENCY_CEILING_BY_ALIAS[${alias}] has unknown key ${JSON.stringify(k)}; allowed keys: ${LATENCY_CEILING_KEYS.join(', ')}`,
+        );
+      }
+    }
     if (spec.p90CeilingMs !== undefined) {
       if (typeof spec.p90CeilingMs !== 'number' || !Number.isFinite(spec.p90CeilingMs)) {
         reasons.push(
           `DQL_LATENCY_CEILING_BY_ALIAS[${alias}].p90CeilingMs must be a finite number`,
+        );
+      } else if (!(spec.p90CeilingMs > 0)) {
+        reasons.push(
+          `DQL_LATENCY_CEILING_BY_ALIAS[${alias}].p90CeilingMs must be > 0 (got ${spec.p90CeilingMs})`,
         );
       } else {
         out[alias as KnownAlias].p90CeilingMs = spec.p90CeilingMs;
@@ -464,16 +533,60 @@ export function resolveProductionConfig(
     reasons,
   );
 
-  // --- required_healthy_headroom ----------------------------------------
-  let requiredHealthyHeadroom = 0.5;
-  if (env.DQL_REQUIRED_HEALTHY_HEADROOM !== undefined && env.DQL_REQUIRED_HEALTHY_HEADROOM !== '') {
-    const n = Number(env.DQL_REQUIRED_HEALTHY_HEADROOM);
-    if (!Number.isFinite(n) || n < 0 || n > 1) {
+  // --- v0431-active shadow-mode invariant (B2) --------------------------
+  // If v0431_active=true in pot-cli, per-alias CB overrides MUST be
+  // provided explicitly for EVERY known alias. This forbids the "canary
+  // ON but relying on baseline defaults" configuration — which would
+  // silently apply v0.4.3 knobs while looking calibrated.
+  if (v0431Active && mode === 'pot-cli') {
+    const raw = env.DQL_CB_CONFIG_BY_ALIAS;
+    if (raw === undefined || raw === '') {
       reasons.push(
-        `DQL_REQUIRED_HEALTHY_HEADROOM must be a number in [0,1]; got ${JSON.stringify(env.DQL_REQUIRED_HEALTHY_HEADROOM)}`,
+        'DQL_V0431_ACTIVE=true in pot-cli mode requires DQL_CB_CONFIG_BY_ALIAS with an explicit entry for every known alias',
       );
     } else {
-      requiredHealthyHeadroom = n;
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const missing = (KNOWN_ALIASES as readonly string[]).filter(
+          (a) => !(a in parsed),
+        );
+        if (missing.length > 0) {
+          reasons.push(
+            `DQL_V0431_ACTIVE=true requires DQL_CB_CONFIG_BY_ALIAS entries for [${missing.join(', ')}]; got ${JSON.stringify(Object.keys(parsed))}`,
+          );
+        }
+      } catch {
+        // JSON parse error already reported by readCbByAlias.
+      }
+    }
+  }
+
+  // --- required_healthy_alias_fraction ----------------------------------
+  // Env var name kept STABLE for operator continuity: DQL_REQUIRED_HEALTHY_
+  // ALIAS_FRACTION. Legacy DQL_REQUIRED_HEALTHY_HEADROOM env is still
+  // accepted for one release with an explicit deprecation reason if it is
+  // used alongside the new one (conflict → error).
+  const newRaw = env.DQL_REQUIRED_HEALTHY_ALIAS_FRACTION;
+  const legacyRaw = env.DQL_REQUIRED_HEALTHY_HEADROOM;
+  let requiredHealthyAliasFraction = 0.5;
+  const pickedRaw =
+    newRaw !== undefined && newRaw !== ''
+      ? { source: 'DQL_REQUIRED_HEALTHY_ALIAS_FRACTION', value: newRaw }
+      : legacyRaw !== undefined && legacyRaw !== ''
+        ? { source: 'DQL_REQUIRED_HEALTHY_HEADROOM', value: legacyRaw }
+        : null;
+  if (newRaw !== undefined && newRaw !== '' && legacyRaw !== undefined && legacyRaw !== '') {
+    reasons.push(
+      'DQL_REQUIRED_HEALTHY_ALIAS_FRACTION and legacy DQL_REQUIRED_HEALTHY_HEADROOM both set; pick exactly one (prefer the new name).',
+    );
+  } else if (pickedRaw) {
+    const n = Number(pickedRaw.value);
+    if (!Number.isFinite(n) || n < 0 || n > 1) {
+      reasons.push(
+        `${pickedRaw.source} must be a number in [0,1]; got ${JSON.stringify(pickedRaw.value)}`,
+      );
+    } else {
+      requiredHealthyAliasFraction = n;
     }
   }
 
@@ -492,7 +605,7 @@ export function resolveProductionConfig(
     diagnostics_on: diagnosticsOn,
     circuit_breaker_config_by_alias: cbByAlias,
     product_latency_ceiling_by_alias: latencyByAlias,
-    required_healthy_headroom: requiredHealthyHeadroom,
+    required_healthy_alias_fraction: requiredHealthyAliasFraction,
   };
 }
 
@@ -563,7 +676,7 @@ export function computeConfigHash(config: ProductionConfig): string {
     diagnostics_on: config.diagnostics_on,
     disable_circuit_breaker: config.disable_circuit_breaker,
     product_latency_ceiling_by_alias: config.product_latency_ceiling_by_alias,
-    required_healthy_headroom: config.required_healthy_headroom,
+    required_healthy_alias_fraction: config.required_healthy_alias_fraction,
     runtime_mode: config.runtime_mode,
     serv_api_key_bound: config.serv_api_key_bound,
     serv_base_url: config.serv_base_url,
