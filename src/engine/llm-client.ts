@@ -339,12 +339,23 @@ export class HttpLlmClient implements LlmClient {
     const started = Date.now();
     try {
       const out = await this.callWithRetry(binding, input);
-      primaryBreaker.recordSuccess(Date.now() - started);
+      // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
+      // circuit-breaker, not wall-clock. Backoff waits between failed
+      // attempts are our reaction to transient errors, not provider
+      // response time — reporting them to the p90 trip metric would
+      // double-penalize retries (once in failure_rate signal, once in
+      // latency signal) and cause spurious trips on ordinary retry
+      // clusters that eventually succeed. Failed attempts are already
+      // captured via the per-alias failure_rate window when the retry
+      // loop exhausts (throw path below).
+      const wallClock = Date.now() - started;
+      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+      primaryBreaker.recordSuccess(netLatency);
       return { ...out, providerRoute: 'primary' };
     } catch (err) {
-      // Use wall-clock elapsed since the primary attempt began. Retries and
-      // backoff waits inside callWithRetry are legitimately part of the
-      // observed latency — that IS what "this call took N ms" means.
+      // Wall-clock elapsed for failures — the retry loop exhausted, so the
+      // TOTAL time is the meaningful signal for the failure_rate window.
+      // (There is no LlmCallOutput to read backoffWaitedMs from on this path.)
       primaryBreaker.recordFailure(Date.now() - started);
       // If the circuit just tripped from this failure, try fallback for the
       // very SAME call — the caller shouldn't eat one "cold" failure per trip.
@@ -408,7 +419,10 @@ export class HttpLlmClient implements LlmClient {
     const started = Date.now();
     try {
       const out = await this.callWithRetry(fallbackBinding, input);
-      fallbackBreaker.recordSuccess(Date.now() - started);
+      // v0.4.3 CB-latency-fix (PR #11): see primary path for rationale.
+      const wallClock = Date.now() - started;
+      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+      fallbackBreaker.recordSuccess(netLatency);
       return { ...out, providerRoute: 'fallback' };
     } catch (err) {
       fallbackBreaker.recordFailure(Date.now() - started);
