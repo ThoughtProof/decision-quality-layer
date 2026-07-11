@@ -591,3 +591,301 @@ Production activation criteria = Merge + Gate 1 + 48h Canary + Gold
 Prozess-Regel unverändert: „Fertig" = Code committed + gepusht + Rohdaten + Report + Manifest gepusht.
 
 Kein neuer Rewrite, kein Shared Store, kein Prozent-Router.
+
+---
+
+# v5.2.1 §C/§D Amendment (Hermes final review 2026-07-11, fdaa5e75)
+
+Kein weiteres Design-Dokument, sondern verbindliche Ergänzungen zum Korrekturblatt selbst. Die folgenden Punkte werden **direkt in Draft-PR #12 implementiert und diskriminierend getestet** — kein v5.2.2, kein Rewrite.
+
+---
+
+## Amendment 1 — Request-ID + Diagnostics-Lifecycle gehören dem Handler
+
+### Verifizierter Ist-Zustand
+
+`api/dql/verify.ts` erzeugt bereits die kanonische Request-ID (siehe `X-Request-Id`-Header und `DqlResponse.id`). Die v5.2.1-Engine-Skizze (`generateRequestId()` in `runVerification`) würde eine zweite Quelle erzeugen und `X-Request-Id`, `DqlResponse.id`, Transition-Attribution und Consumer-Record divergieren lassen.
+
+### Verbindliches Design
+
+Handler erzeugt **genau einmal**:
+
+```typescript
+// api/dql/verify.ts
+const requestId = generateRequestId();
+res.setHeader('X-Request-Id', requestId);
+const collector = diagnosticsEnabled
+  ? new RuntimeDiagnosticsCollector(requestId)
+  : undefined;
+```
+
+Handler übergibt beides an Engine:
+
+```typescript
+const dqlResponse = await runVerification({
+  ...engineInput,
+  requestId,
+  callContext: { requestId, collector },
+});
+```
+
+Engine erzeugt **nur Child-Kontext pro Achse**:
+
+```typescript
+// src/engine/index.ts
+export interface EngineInput {
+  // ... existing
+  requestId: string;
+  callContext: CallContext;
+}
+
+const axisResults = await Promise.all(
+  axes.map(async (axis) => {
+    const ctx: CallContext = {
+      ...input.callContext,
+      axis,
+      callId: generateCallId(),
+    };
+    return cascade.run({ axis, prompt, ctx });
+  })
+);
+
+return {
+  id: input.requestId,                      // vom Handler, nicht neu erzeugt
+  ...,
+};
+```
+
+`CallContext` bekommt kein `generateRequestId()`-Ownership mehr; die Engine kennt keine Request-ID-Quelle.
+
+### Pflichttest
+
+`src/engine/engine-request-id-propagation.test.ts`:
+
+```text
+X-Request-Id  ==  response.id  ==  every transition.requestId  ==  every event in collector
+```
+
+Der Test durchbricht bewusst jede Doppel-Quelle:
+
+- Handler-Input `requestId = 'dql_test_ABC'` fest gesetzt
+- Nach `runVerification`: `response.id === 'dql_test_ABC'`
+- Alle im Collector gesammelten Events haben `requestId === 'dql_test_ABC'`
+- Kein Event hat eine andere Quelle (z. B. autogenerierte UUID)
+
+---
+
+## Amendment 2 — Generische Engine kennt keinen `HttpLlmClient`
+
+### Verifiziertes Problem
+
+`src/engine/cascade.ts:26-28` — `Cascade` ist ein generisches Interface. Engine sieht nur `cascade.run(input)`, kein `client`-Feld. `StubCascade` und `SandboxCascade` haben überhaupt keinen CB-Client. Die v5.2.1-Skizze `buildRuntimeDiagnostics(collector, client)` innerhalb `runVerification` würde einen Downcast auf `PotCliCascade` oder ein optionales `cascade.client`-Feld erzwingen — beide Wege werden verworfen.
+
+### Verbindliches Runtime-Bundle
+
+```typescript
+// src/engine/production-runtime.ts (neu, PR #12)
+export interface ProductionRuntime {
+  cascade: PotCliCascade;
+  client: HttpLlmClient;
+  resolvedConfig: ResolvedProductionConfig;
+  configHash: string;
+  instanceId: string;
+  coldStartAt: number;
+}
+
+export function createProductionRuntime(env: NodeJS.ProcessEnv): ProductionRuntime {
+  const resolvedConfig = resolveProductionConfig(env);
+  const client = new HttpLlmClient(
+    resolvedConfig.bindings,
+    env,
+    resolvedConfig.clientOptions,
+  );
+  const cascade = new PotCliCascade({ client, ... });
+  return {
+    cascade,
+    client,
+    resolvedConfig,
+    configHash: computeConfigHash(resolvedConfig),
+    instanceId: MODULE_INSTANCE_ID,     // module-scope, aus §7.6
+    coldStartAt: MODULE_COLD_START_AT,
+  };
+}
+```
+
+`api/dql/verify.ts`:
+
+```typescript
+// module scope (cold-start once per isolate)
+const RUNTIME = createProductionRuntime(process.env);
+
+// handler
+export default async function handler(req, res) {
+  const requestId = generateRequestId();
+  res.setHeader('X-Request-Id', requestId);
+  const collector = ENV.DQL_RUNTIME_DIAGNOSTICS === '1'
+    ? new RuntimeDiagnosticsCollector(requestId)
+    : undefined;
+
+  const dqlResponse = await runVerification({
+    ...engineInput,
+    cascade: RUNTIME.cascade,
+    requestId,
+    callContext: { requestId, collector },
+  });
+
+  if (collector) {
+    // Handler-owned diagnostics build — Engine kennt Client nie
+    dqlResponse.meta.runtime = buildRuntimeDiagnostics({
+      collector,
+      isolateSnapshot: RUNTIME.client.getBreakerSnapshots(),  // best-effort, benannt aus §3
+      instanceId: RUNTIME.instanceId,
+      coldStartAt: RUNTIME.coldStartAt,
+      configHash: RUNTIME.configHash,
+      commitSha: BUILD_COMMIT_SHA,
+    });
+  }
+
+  res.json(dqlResponse);
+}
+```
+
+`runVerification` erhält den Cascade als Parameter und weiß **nichts** über `HttpLlmClient`. Stub/Sandbox-Aufrufer geben `RUNTIME`-freies Cascade + keinen Collector.
+
+### Pflichttests
+
+1. `src/engine/production-runtime.test.ts` — `createProductionRuntime` liefert Cascade und Client, die aufeinander verweisen (`(runtime.cascade as any).client === runtime.client` per konstruierter Injection, nicht per Downcast).
+2. `src/engine/engine-with-stub.test.ts` — StubCascade ohne Client-Snapshot: `runVerification({ cascade: new StubCascade(), ... })` läuft und liefert korrekte `DqlResponse` ohne `meta.runtime`.
+3. `src/engine/response-shape-diagnostics-off.test.ts` — Diagnostics OFF (`DQL_RUNTIME_DIAGNOSTICS !== '1'`): Response-Shape ist byte-identisch zu v0.4.3-baseline (kein `meta.runtime`-Feld, keine `runtime`-Property, `JSON.stringify(response)`-Schema-Vergleich).
+
+---
+
+## Amendment 3 — `provider_route` ausschließlich für tatsächlich servierte Antworten
+
+### Verifiziertes Semantik-Problem
+
+`src/engine/index.ts` fängt `CircuitAllOpenError` und setzt aktuell `provider_route: 'fallback'` auf `UNCERTAIN@0`. Bei `capitalPathMode=true` wurde aber **kein** Fallback-Fetch ausgeführt. Die neuen Canary-Metriken (§4b: „CPM=true → 0 fallback fetches") würden lügen: sie zählen `provider_route='fallback'` als „Fallback served" und lesen aus dem Engine-Catch einen sachlich falschen Wert.
+
+### Verbindliches Schema (PR #12)
+
+`src/types.ts`:
+
+```typescript
+export interface AxisResult {
+  // ... existing fields
+  provider_route?: 'primary' | 'fallback';         // nur wenn tatsächlich serviert
+  provider_outcome?: 'served' | 'circuit_rejected'; // neu
+}
+```
+
+`CircuitAllOpenError`-Fall in `src/engine/index.ts`:
+
+```typescript
+} catch (err) {
+  if (err instanceof CircuitAllOpenError) {
+    return {
+      axis,
+      verdict: 'UNCERTAIN',
+      confidence: 0,
+      objections: [{ ... 'circuit_rejected' ... }],
+      // provider_route BLEIBT undefined
+      provider_outcome: 'circuit_rejected',
+    };
+  }
+  throw err;
+}
+```
+
+Erfolgreicher Primary:
+
+```typescript
+provider_route: 'primary',
+provider_outcome: 'served',
+```
+
+Erfolgreicher Fallback (CPM=false, Primary CB open):
+
+```typescript
+provider_route: 'fallback',
+provider_outcome: 'served',
+```
+
+Fallback-Attempt schlug ebenfalls fehl (Ausnahme, kein `CircuitAllOpenError`, sondern regulärer Throw des Fallback-Provider-Calls): behandelt wie regulärer Fehler, `provider_route` **nicht** gesetzt, `provider_outcome` optional weglassen (Feld hat keine Kanalattribution).
+
+Attempted-Provenance (falls je nötig): separat modellieren als `attempted_routes?: ('primary' | 'fallback')[]`, **niemals** das Served-Route-Feld überladen. Für v0.4.3.1 nicht vorgesehen — nur wenn ein späterer Report es explizit benötigt.
+
+### OpenAPI-Update
+
+`meta.axisResults[]` bekommt `provider_route` (weiterhin optional) und `provider_outcome` (neu, optional). Beide werden im OpenAPI-Spec-Update in PR #12 dokumentiert (§7.4).
+
+### Pflicht-Gegentests
+
+`src/engine/provider-route-semantics.test.ts` — vier Fälle:
+
+1. **CPM=true, beide Aliases nach Cooldown OPEN**: 5 Achsen, alle 5 → `provider_route === undefined`, `provider_outcome === 'circuit_rejected'`, `fetchImpl` wird **0-mal** aufgerufen (kein Fallback-Fetch).
+2. **CPM=false, beide Aliases OPEN** (extremer Failure-Path, sollte selten sein): ebenfalls `provider_route === undefined`, `provider_outcome === 'circuit_rejected'`. Kein „fallback served" für die eskalierte Fail-Closed-Achse.
+3. **Erfolgreicher echter Fallback** (CPM=false, Primary OPEN, Fallback OK): `provider_route === 'fallback'`, `provider_outcome === 'served'`. Genau ein Fallback-Fetch pro Achse.
+4. **Erfolgreicher Primary** (Happy Path): `provider_route === 'primary'`, `provider_outcome === 'served'`.
+
+Report-Layer:
+
+- Report-Aggregator zählt Fallback-Anteil **nur** aus `provider_route === 'fallback' && provider_outcome === 'served'`.
+- Report-Aggregator zählt Fail-Closed-Anteil **nur** aus `provider_outcome === 'circuit_rejected'`.
+- Der Live-Drill-Report (§4c) unterscheidet damit N_axes_primary / N_axes_fallback / N_axes_fail_closed korrekt.
+
+---
+
+## Amendment 4 (§D) — Live-Statuskorrektur: Prod ist derzeit CPM=false
+
+### Verifiziertes Ist-Bild (2026-07-11)
+
+Hermes hat live geprüft: Vercel-Production-Env für DQL-API enthält nur `DQL_CASCADE` und `SERV_API_KEY`. Kein CPM-Env-Feld. Der Produktions-Pfad erzeugt derzeit:
+
+```
+new PotCliCascade()
+  → new HttpLlmClient(...)      // ctor default capitalPathMode = false
+```
+
+Damit läuft die Production-API **derzeit mit `capitalPathMode = false`** und aktiviertem SERV-internem Fallback (nano ↔ swift). Der in v5.1/v5.2 verwendete Satz „Prod bleibt aktuell auf `capitalPathMode=true`" ist für DQL **nicht belegt und nach dem aktuellen Wiring falsch**.
+
+### Einordnung (verbatim aus Hermes-Review übernommen)
+
+- Kein automatischer Safety-Incident: Nano und Swift sind die bewusst kalibrierten SERV-Sibling-Aliases; PR #10 hat Fallback standardmäßig ermöglicht.
+- Widerspricht aber der dokumentierten „Capital-path fail-closed bis Rezert"-Posture.
+- Aus dem DQL-Repo allein ist **nicht belegt**, ob `dql.thoughtproof.ai` derzeit reale Kapitalentscheidungen autorisiert. Daher keine Behauptung, reales Kapital sei exponiert.
+- Ein Env-Flip allein kann es nicht beheben — die Factory-Wiring-Schicht fehlt noch.
+
+### Verbindliche Terminologie in allen v0.4.3.1-Reports
+
+```
+Current DQL production runtime         :  CPM=false (constructor default, DQL_CASCADE=pot-cli)
+Target pre-activation safe posture     :  CPM=true (via PR #12 factory wiring + explicit env)
+Canary target behavior                 :  CPM=false auf isoliertem paper/shadow endpoint
+Production activation after all gates  :  CPM=false auf reguläres Prod
+```
+
+Alle bisherigen Aussagen der Form „Prod steht auf CPM=true / capital-path fail-closed" werden aus den v5.x-Reports **retrospektiv als imprecise** markiert. Neu-Formulierung überall:
+
+> Prod stand vor PR #12-Wiring bereits im impliziten CPM=false-Modus. PR #12 führt das explizite Factory-Wiring ein, damit CPM=true auf ausdrückliche Env-Konfiguration möglich und verifizierbar ist.
+
+### PR #12 Preflight-Test
+
+```
+Production-Manifest sagt: capitalPathMode = true
+→ /dql/health.config_hash matches expected_config_hash from manifest
+→ Diagnostic-Request (mit DQL_RUNTIME_DIAGNOSTICS=1) returns meta.runtime.resolved_cpm === true
+```
+
+Ohne diese Preflight-Kette gilt: **kein Alias-Setzen**, kein Production-Wiring-Claim.
+
+Kein weiterer impliziter Default auf sicherheitsrelevanten Deployments — die Factory zwingt zur expliziten CPM-Wahl.
+
+---
+
+## Freigabestatus (nach v5.2.1 §C/§D Amendment)
+
+- **PR #11**: MERGE-GO nach zwei kleinen Fixes (Kommentar präzisiert, Cap-Test beweist Cap). Fixes eingespielt als Commit `7dc68ea`. Bereit für Squash-Merge.
+- **PR #12**: BEDINGTER CODE-GO. Draft-Implementation darf jetzt starten, muss die drei §C-Amendments + §D-Live-Statuskorrektur direkt implementieren und diskriminierend testen. Kein weiteres Design-Dokument, kein v5.2.2.
+- **Production-Aktivierung**: unverändert HOLD bis Gate 1 (Model-Quality) + Gate 2 (Runtime-Resilience) + 48h Canary + Gold-Safety.
+
+Prozess-Regel unverändert: „Fertig" = Code committed + gepusht + Rohdaten + Report + Manifest gepusht.
