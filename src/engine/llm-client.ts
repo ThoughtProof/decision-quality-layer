@@ -65,6 +65,7 @@
  */
 
 import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError } from './circuit-breaker.js';
+import type { CallContext } from './call-context.js';
 
 export interface LlmCallInput {
   system: string;
@@ -107,7 +108,13 @@ export interface LlmCallOutput {
 }
 
 export interface LlmClient {
-  call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput>;
+  /**
+   * `ctx` (v0.4.3.1 §C.1) is an optional forward-compatible slot for the
+   * handler-owned CallContext. Existing callers may omit it; future
+   * commits attach a RuntimeDiagnosticsCollector to it for state-transition
+   * events. This interface change is additive — no existing test breaks.
+   */
+  call(modelAlias: string, input: LlmCallInput, ctx?: CallContext): Promise<LlmCallOutput>;
 }
 
 /**
@@ -306,7 +313,12 @@ export class HttpLlmClient implements LlmClient {
     return out;
   }
 
-  async call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput> {
+  async call(
+    modelAlias: string,
+    input: LlmCallInput,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _ctx?: CallContext,
+  ): Promise<LlmCallOutput> {
     const binding = this.modelMap[modelAlias];
     if (!binding) {
       throw new Error(`[llm-client] unknown model alias: ${modelAlias}`);
@@ -554,7 +566,12 @@ export type MockResponder = (modelAlias: string, input: LlmCallInput) => LlmCall
 export class MockLlmClient implements LlmClient {
   constructor(private readonly responder: MockResponder) {}
 
-  async call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput> {
+  async call(
+    modelAlias: string,
+    input: LlmCallInput,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _ctx?: CallContext,
+  ): Promise<LlmCallOutput> {
     return await this.responder(modelAlias, input);
   }
 }

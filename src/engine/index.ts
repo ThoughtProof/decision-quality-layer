@@ -16,6 +16,7 @@ import { AXIS_PROMPT_BUILDERS } from './axes/index.js';
 import { aggregate } from '../aggregation.js';
 import type { Cascade } from './cascade.js';
 import { CircuitAllOpenError } from './llm-client.js';
+import { generateCallId, type CallContext } from './call-context.js';
 
 export interface EngineInput {
   request: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'>;
@@ -50,11 +51,18 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   // to a human, not to consult an unvetted model. The UNCERTAIN@0 result
   // below propagates that decision to the aggregator, which will emit a
   // REVIEW or worse — never ALLOW — because UNCERTAIN cannot upgrade to PASS.
+  // v0.4.3.1 §C.1: build a child CallContext per axis from the handler-owned
+  // requestId. The engine NEVER generates a requestId itself.
   const perAxis = await Promise.all(
     axes.map(async (axis) => {
       const prompt = AXIS_PROMPT_BUILDERS[axis](promptInput);
+      const ctx: CallContext = {
+        requestId: input.requestId,
+        axis,
+        callId: generateCallId(),
+      };
       try {
-        return await cascade.run({ axis, prompt });
+        return await cascade.run({ axis, prompt, ctx });
       } catch (err) {
         const isCircuitAllOpen = err instanceof CircuitAllOpenError;
         const objection = isCircuitAllOpen

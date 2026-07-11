@@ -39,6 +39,7 @@ import type { Cascade, CascadeInput, CascadeOutput } from './cascade.js';
 import { parseAxisResponse } from './cascade.js';
 import type { LlmClient } from './llm-client.js';
 import { HttpLlmClient } from './llm-client.js';
+import type { CallContext } from './call-context.js';
 
 export interface PotCliCascadeConfig {
   /** Primary model alias. Default: 'serv-nano'. */
@@ -86,11 +87,11 @@ export class PotCliCascade implements Cascade {
   }
 
   async run(input: CascadeInput): Promise<CascadeOutput> {
-    const { axis, prompt } = input;
+    const { axis, prompt, ctx } = input;
     const modelsUsed: string[] = [];
 
     // ---- Primary --------------------------------------------------------
-    const primary = await this.callAxis(this.config.primaryModel, axis, prompt);
+    const primary = await this.callAxis(this.config.primaryModel, axis, prompt, ctx);
     modelsUsed.push(primary.modelId);
 
     // Early-exit on high-confidence FAIL — conservative and cheap.
@@ -111,7 +112,7 @@ export class PotCliCascade implements Cascade {
     // ---- Secondary ------------------------------------------------------
     let secondary: AxisCall;
     try {
-      secondary = await this.callAxis(this.config.secondaryModel, axis, prompt);
+      secondary = await this.callAxis(this.config.secondaryModel, axis, prompt, ctx);
       modelsUsed.push(secondary.modelId);
     } catch (err) {
       // Degraded mode: secondary unavailable → be conservative.
@@ -133,12 +134,23 @@ export class PotCliCascade implements Cascade {
     };
   }
 
-  private async callAxis(modelAlias: string, axis: Axis, prompt: AxisPrompt): Promise<AxisCall> {
-    const out = await this.client.call(modelAlias, {
-      system: prompt.system,
-      user: prompt.user,
-      maxTokens: this.config.maxTokens,
-    });
+  private async callAxis(
+    modelAlias: string,
+    axis: Axis,
+    prompt: AxisPrompt,
+    ctx?: CallContext,
+  ): Promise<AxisCall> {
+    // v0.4.3.1 §C.1: ctx is threaded through cascade → llm-client for
+    // handler-owned requestId propagation.
+    const out = await this.client.call(
+      modelAlias,
+      {
+        system: prompt.system,
+        user: prompt.user,
+        maxTokens: this.config.maxTokens,
+      },
+      ctx,
+    );
     const parsed = parseAxisResponse(axis, out.raw);
     // Attach provider_route from the llm-client output. When the client
     // doesn't provide it (e.g. Mock/Stub cascade in tests), leave undefined.
