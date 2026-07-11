@@ -1,666 +1,399 @@
-# v0.4.3.1 CB Recovery Fix — Design Draft v4
+# v0.4.3.1 CB Recovery Fix — Design Draft v5
 
-**Status**: BLOCKING v0.4.3 Recert
-**Priority**: v0.4.3.1 blocking (was formerly v0.4.4 roadmap)
-**Author**: Perplexity (implementing Hermes' architectural decisions)
+**Status**: DECISION-DRIVEN. Hermes hat gewählt: P2-korrigiert, 2a, 3a+, 4b.
+**Priority**: v0.4.3.1 blocking
+**Author**: Perplexity (implementing Hermes' Gate-Architecture-Decision 2026-07-11)
 **Date**: 2026-07-11
-**Iteration**: v4 (v3 SUPERSEDED — Hermes-Review 2026-07-11)
-**Supersedes**: `docs/v0431-recovery-fix-design-v3-SUPERSEDED.md`, `docs/v0431-recovery-fix-design-v2-SUPERSEDED.md`
+**Iteration**: v5 (v4 SUPERSEDED — Hermes hat Router-Kadenz-Claim als Code-Fehldiagnose korrigiert)
+**Supersedes**: v4, v3, v2 (alle SUPERSEDED)
 
 ---
 
-## Vorwort — was in v3 falsch war
+## 0. Root-Cause-Korrektur — verifiziert
 
-Hermes hat im v3-Review zwei harte Blocker und drei weitere Semantik-Lücken benannt:
+Meine v4-Root-Cause-Hypothese („nach OPEN wird `canProceed()` nie wieder aufgerufen") war **falsch**.
 
-1. **Blocker `recoverFromOpen()` caller-kontrolliert**: Der Router lieferte `requiredConsecutiveSuccesses` und `maxLatencyMs` pro Aufruf. Damit konnte ein Caller effektiv K=1 + Bound=∞ übergeben. Der CB besitzt die Sicherheitsregeln, nicht der Router.
-2. **Blocker rohe Wall-Clock im Recovery-Probe**: `Date.now() - startedAt` inklusive Backoff-Waits — genau die Fehlklassifikation, die PR #11 gerade beseitigt.
-3. HALF_OPEN-Semantik falsch beschrieben: v3 behauptete "OPEN bleibt bis Prozess-Restart" — tatsächlich gibt es bereits cooldown → HALF_OPEN → Probe (siehe `circuit-breaker.ts:145-183`). Der Bug ist nicht "keine Recovery", sondern "HALF_OPEN-Probe scheitert am 15s-`probeMaxLatencyMs` bei swift".
-4. Bound-Kalibrierung wissentlich auf v0.4.3.2 verschoben — mit vorhandener Datenlage (swift p90 ≈ 24s, p95 ≈ 35s vs Bound 15s) ist Flapping vorhersehbar. Trip-/HALF_OPEN-/Recovery-Bound müssen konsistent sein.
-5. Weitere Punkte: `provider_route`-Enum-Erweiterung war API-Bruch; Sampling-Test und Recovery-Test vermischt; nur `probeEpoch !== state.epoch` reicht nicht — Trip-Generation muss dazu; `try/finally` für `probeInFlight` fehlte.
+**Verifizierter Kontrollfluss** auf `origin/v043-cb-latency-fix` (`src/engine/llm-client.ts:325-338`):
 
-v4 adressiert alle zehn v4-Anforderungen aus dem Review explizit.
+```
+Engine pro Achse
+  → PotCliCascade.callAxis(primaryAlias)
+    → HttpLlmClient.call(primaryAlias)
+      → primaryBreaker.canProceed()  ← wird bei JEDER Achsenanfrage aufgerufen
+```
+
+`canProceed()` implementiert bereits die Transition OPEN → HALF_OPEN nach Cooldown-Ablauf (`circuit-breaker.ts:157-160`). Ein `call()` nach Cooldown-Ablauf löst die HALF_OPEN-Probe aus, ohne dass irgendwo im Router etwas geändert werden muss.
+
+**Client-Level Regressionstest** in `src/engine/llm-client.recovery-regression.test.ts` beweist auf aktuellem Code (3/3 grün):
+
+1. Cooldown-Ablauf → nächster primary-Call = HALF_OPEN-Probe → schneller Erfolg → CB CLOSED
+2. Langsamer Probe (> `probeMaxLatencyMs`) → re-Trip mit frischem Cooldown
+3. `capitalPathMode=true`: vor Cooldown fail-closed; nach Cooldown → primary-Probe (nie fallback)
+
+**Konsequenz**: Der v4-Draft mit soft-OPEN, Router-Sampling, Recovery-Epochen, `recoverFromOpen()` ist **komplett überflüssig**. Bestehende cooldown → HALF_OPEN → CLOSED/OPEN-State-Machine ist funktional und ausreichend.
+
+**Erklärung für Segment B im Vollrun**: Nach dem Trip liefen 415 nano-Fallback-Draws mit ~0 ms Latenz. Bei 5 Achsen × 83 Cases (415 Draws) und ~0 ms pro Draw endete der Run vermutlich vor Ablauf der 30s-Cooldown → HALF_OPEN wurde nie erreicht. Report-Satz „HALF_OPEN probes trippen sofort wieder" war spekulativ; State-Transition-Timestamps fehlten, um das zu beweisen.
 
 ---
 
-## 1. Config-Trennung + korrekte Ist-Semantik von HALF_OPEN
+## 1. Was v5 tatsächlich baut
 
-Zwei orthogonale Config-Achsen, präziser als v3:
+**Kein neuer Recovery-Code.** Vier Arbeitspakete:
+
+1. **Client-Level Regressionstest**: Bereits committed als `llm-client.recovery-regression.test.ts`. Bleibt in der Suite und dokumentiert die verifizierte Recovery-Semantik.
+2. **Per-Alias-Bound-Konfiguration**: `circuitBreakerConfigByAlias` als Erweiterung von `HttpLlmClientConfig`, weil `tripP90LatencyMs=15s` bei swift-Realität ~24s p90 flapping erzeugen würde.
+3. **State-Transition-Telemetrie**: `circuit_opened`, `half_open_probe_started`, `half_open_probe_succeeded`, `half_open_probe_failed`, `half_open_probe_over_bound`, `circuit_closed` — heute nicht als strukturierte Events emittiert, für Live-Drill und Canary aber Pflicht.
+4. **Kalibrierungs-Run**: Instrumentierter workers=1-Run auf gesundem swift + nano zur Ableitung `tripP90LatencyMs` und `probeMaxLatencyMs` pro Alias — separat vor Gate 2, weil `ced1915`-Draw-Latenzen nicht per-axis netto sind.
+
+Danach: Gate 1 + Gate 2 + 48h-Canary.
+
+---
+
+## 2. Gate 1 — Model Quality (Hermes-Entscheidung 2a)
+
+**Ziel**: Trägt swift-primary 100 Cases ohne Recall-/Safety-Regression?
+
+**Konfiguration**:
+
+```
+primary alias         = serv-swift (ausschließlich, kein Fallback)
+disableCircuitBreaker = true
+workers               = 1
+N                     = 5 draws pro Case
+capitalPathMode       = irrelevant (CB nicht instanziiert)
+```
+
+**Gate-1-Invarianten** (Hermes verbindlich):
+
+- 100/100 Cases werden tatsächlich an swift adressiert
+- Kein stilles Fallback
+- `models_used`/`model_id` und Route pro Rohrecord zeigen, welcher Provider wirklich antwortete
+- Provider-/Transport-Fehler werden separat ausgewiesen und dürfen nicht als gültige Model-Verdicts in die Quality-Metrik eingehen
+- Vor Aggregation mindestens einen echten Roh-Call inspizieren
+
+**Erfolgs-Formel**:
+
+```
+swift_route_coverage                 == 100%
+AND successful_draw_completeness     == 100%  (oder vorab definierter harter Validity-Bound)
+AND recall_regressions_vs_v041d      == 0
+AND safety_regressions_BLOCK_to_ALLOW == 0
+```
+
+**Wichtig**: Wenn nicht alle Draws erfolgreich sind, darf der Run nicht still durch `UNCERTAIN@0` als „vollständig" gelten. Entweder vorab definierte Wiederholungsregel oder Gate invalid — **nicht nachträglich** die Regel ändern.
+
+**Kein neues `neutralizedForBenchmark`-Flag.** Wir nutzen die bestehende klare Trennung via `disableCircuitBreaker=true`.
+
+---
+
+## 3. Gate 2 — Runtime Resilience (Hermes-Entscheidung 3a+)
+
+**Ziel**: Recovert exakt die deployte Prod-Konfiguration nach einem realen CB-Trip sicher?
+
+**Deployte Prod-Konfiguration** (das ist P2-korrigiert):
+
+```
+capitalPathMode          = false
+disableCircuitBreaker    = false
+recoveryMode             = KEIN — bestehende cooldown → HALF_OPEN → CLOSED/OPEN-State-Machine
+circuitBreakerConfigByAlias = {
+  'serv-nano':  { tripP90LatencyMs, probeMaxLatencyMs, cooldownMs, minSamples, windowSize },
+  'serv-swift': { tripP90LatencyMs, probeMaxLatencyMs, cooldownMs, minSamples, windowSize },
+}
+```
+
+Kein `soft-open`. Kein Router-Sampling. Kein `recoverFromOpen()`.
+
+### 3a. Unit / Client-Integration Tests (12 Pflicht-Assertions)
+
+Test-Datei bereits vorhanden: `src/engine/llm-client.recovery-regression.test.ts` (3 initiale Tests grün). v5 erweitert auf mindestens diese 12:
+
+| # | Assertion | Was er beweist |
+|---|---|---|
+| 1 | 5 slow calls (>tripP90) → CB=OPEN via failure_rate/p90 | Trip deterministisch |
+| 2 | Vor Cooldown, CPM=false → next call routes fallback | Bestehendes Fallback-Verhalten |
+| 3 | Vor Cooldown, CPM=true → CircuitAllOpenError, 0 Fallback | Kapital fail-closed |
+| 4 | Nach Cooldown, CPM=false → nächster primary-Call = HALF_OPEN-Probe | Existing HALF_OPEN transition |
+| 5 | Schneller Probe (≤probeMaxLatencyMs) → CB=CLOSED, Fenster reset | Recovery-Success |
+| 6 | Probe-Failure (throw) → CB=OPEN, neuer openedAt/Cooldown | Fresh cooldown on re-trip |
+| 7 | Probe über Bound (>probeMaxLatencyMs) → CB=OPEN, neuer Cooldown | Bound-Enforcement |
+| 8 | Parallelität: nur 1 HALF_OPEN-Probe erlaubt, konkurrierende Calls → fallback (CPM=false) bzw. fail-closed (CPM=true) | Single-flight probe |
+| 9 | Nach erfolgreichem CLOSE: normale Calls sammeln wieder Samples für nächste Trip-Evaluierung | Closed-Windows-Reset |
+| 10 | Flapping-Gegentest: konsistente trip/probe-Bounds (probe=trip) → gesunder Traffic bleibt CLOSED; inkonsistent (probe>trip) → sichtbarer Re-Trip nach Recovery | Bound-Konsistenz-Enforcement |
+| 11 | `disableCircuitBreaker=true`: keine Breaker instanziiert, keine Fallback-Logik aktiv | Gate-1-Neutralisierung |
+| 12 | Beide Aliases OPEN → Engine bleibt fail-closed (`UNCERTAIN@0`), niemals ALLOW über Error-Pfad | Safety-Invariante |
+
+Alle Tests via Fake-Clock (`CircuitBreakerConfig.now`), Fake-Sleep (`HttpLlmClientConfig.sleep`), Fake-Fetch (`HttpLlmClientConfig.fetchImpl`). Kein Netzwerk.
+
+### 3b. Kontrollierter Live-Drill
+
+**Konfiguration** — exakt die spätere Prod-Config:
+
+```
+capitalPathMode          = false
+finale per-alias Bounds  (aus Kalibrierungs-Run in §5)
+soft-open                = aus (existiert nicht)
+```
+
+**Ablauf**:
+
+1. Test-only Factory / injizierte deterministische Failure-Sequenz trippt swift-CB. Keine öffentliche `forceOpen()`-API.
+2. Vor Cooldown: nächste Achsenanfrage übernimmt via nano-Fallback.
+3. Nach realem Cooldown (per Wall-Clock, keine Zeit-Injektion im Live-Drill): nächste `client.call(swift)` wird HALF_OPEN-Probe.
+4. Gesunder swift-Probe schließt CB.
+5. Nachfolgender Traffic bleibt primary.
+6. Gegenlauf mit zu langsamem/fehlgeschlagenem Probe → CB bleibt OPEN, setzt frischen Cooldown.
+7. CPM=true Gegenprobe: vor Cooldown 0 Fallback / fail-closed; nach Cooldown darf Primary-Probe stattfinden, aber niemals nano.
+
+**Report-Pflicht**: Echte State-Transition-Timestamps aus §4-Telemetrie:
+
+- `circuit_opened`
+- `half_open_probe_started`
+- `half_open_probe_succeeded` / `half_open_probe_failed` / `half_open_probe_over_bound`
+- `circuit_closed`
+
+Keine Behauptung „Probe lief" nur aus `provider_route`. Log-Trace muss Zustandsübergänge zeigen.
+
+**Kein 100-Case-Trip-Injection-Vollrun** (Hermes: würde Modellqualität und Runtime-Resilience wieder vermischen). Die 48h-Canary in §6 liefert reale passive Volumen-Evidenz.
+
+---
+
+## 4. Telemetrie — State-Transition-Events
+
+Der `CircuitBreaker` emittiert heute die Trip-Reason via `lastTripReason`-Feld, aber keine strukturierten State-Transition-Events. v5 fügt einen Event-Callback-Hook hinzu (kein Product-Behavior-Change):
+
+```typescript
+interface CircuitBreakerConfig {
+  // ... bestehende Felder
+  onStateTransition?: (event: StateTransitionEvent) => void;
+}
+
+interface StateTransitionEvent {
+  alias: string;
+  from: CircuitState;
+  to: CircuitState;
+  at: number;              // via config.now()
+  cause: 'trip-p90' | 'trip-failure-rate' | 'cooldown-elapsed' | 'probe-success' | 'probe-failure' | 'probe-over-bound';
+  reason: string;          // freie Beschreibung (bestehende lastTripReason-Semantik)
+  latencyMs?: number;      // bei probe-*
+  boundMs?: number;        // bei probe-over-bound: der Bound gegen den geprüft wurde
+  windowSize?: number;     // bei trip: aktuelle Fenster-Größe
+  windowP90?: number;      // bei trip-p90
+  windowFailureRate?: number; // bei trip-failure-rate
+}
+```
+
+Der `HttpLlmClient` registriert einen Standard-Handler, der die Events als strukturiertes JSON in denselben Log-Sink schreibt wie bestehende CB-Logs.
+
+**Kein produkt-verhaltensrelevanter Change**. Nur observable Events, damit Live-Drill und Canary aus Log-Traces echte State-Transitions rekonstruieren können.
+
+---
+
+## 5. Bound-Kalibrierung — vor Gate 2
+
+### 5a. Datenquelle
+
+**`ced1915`-Draw-Latenzen sind ungeeignet** (Hermes: verifiziert). Draw-Latenz ≈ max der parallelen 5 Achsen-Calls, nicht die per-axis-Verteilung, gegen die der CB p90 misst.
+
+**Kalibrierungs-Run** vor Gate 2:
+
+- separater instrumentierter workers=1-Lauf
+- mindestens 20 Cases
+- mindestens 50 erfolgreiche Samples je Alias (nano + swift)
+- pro Achsen-Call instrumentiert: `alias`, `axis`, `success`, `attemptCount`, `wallClockMs`, `backoffWaitedMs`, `netLatencyMs`, `timestamp`
+- gesunder Providerzustand — keine bekannten Ausfälle während des Runs
+- keine Draw-Latenz als Ersatz
+- Report mit p50/p90/p95/max pro Alias, plus Rohdaten
+- Rohdaten + Report + Manifest auf `dql-benchmark/main` gepusht **vor** Gate 2
+
+### 5b. Bound-Ableitungsregel
+
+Standard-Regel für v0.4.3.1:
+
+```
+probeMaxLatencyMs = tripP90LatencyMs
+```
+
+Diese Gleichheit vermeidet OPEN → HALF_OPEN → CLOSED → OPEN-Flapping-Zyklen (Hermes: verifiziert). Abweichung nur mit expliziter Hysterese-Begründung + Flapping-Test.
+
+**Wertfindung** (v5 verbindlich):
+
+```
+tripP90LatencyMs pro Alias = max(
+  aufgerundeter beobachteter p95(netLatency) auf gesundem Provider,
+  begründetes Produkt-/Client-SLO
+)
+```
+
+Aufrunden auf 5s-Vielfache für Config-Lesbarkeit. Blindes „p95 aufrunden" ist verboten wenn p95 eine Provider-Anomalie enthält — Bound muss **beides** berücksichtigen: beobachtete Realität + akzeptable Service-Grenze.
+
+**Der konkrete Bound wird erst nach dem Kalibrierungs-Run bestimmt** und dann in einem separaten Design-Delta-Commit dokumentiert. Kein spekulativer Wert in v5.
+
+### 5c. `circuitBreakerConfigByAlias` — Implementation
+
+Der aktuelle `HttpLlmClient` hält nur eine globale `circuitBreakerConfig`. v5 erweitert:
 
 ```typescript
 interface HttpLlmClientConfig {
   // ... bestehende Felder
-  capitalPathMode?: boolean;                    // default false
-  recoveryMode?: 'disabled' | 'soft-open';      // default 'disabled'
-  circuitBreakerConfigByAlias?: Record<string, PerAliasBreakerConfig>;
-}
-
-interface PerAliasBreakerConfig {
-  tripP90LatencyMs?: number;
-  probeMaxLatencyMs?: number;      // HALF_OPEN probe bound (bestehend)
-  recoveryMaxLatencyMs?: number;   // soft-OPEN Recovery bound (neu, v0.4.3.1)
-  recoveryRequiredSuccesses?: number;  // K, neu, CB-owned
+  circuitBreakerConfig?: CircuitBreakerConfig;                  // fallback für alle Aliases (bestehend)
+  circuitBreakerConfigByAlias?: Record<string, CircuitBreakerConfig>;  // per-alias override (neu)
 }
 ```
 
-**Verhaltensmatrix (echtes Ist-Modell)**:
-
-| `capitalPathMode` | `recoveryMode` | Verhalten |
-|---|---|---|
-| `true` | (irrelevant) | Kein Fallback, kein soft-OPEN. **Bestehende cooldown→HALF_OPEN-Recovery bleibt** (via `canProceed()` bei abgelaufenem Cooldown). Ein HALF_OPEN-Probe der überlebt → CLOSED. |
-| `false` | `'disabled'` | Validierter Fallback aktiv. **Bestehende cooldown→HALF_OPEN-Recovery bleibt.** Kein zusätzlicher soft-OPEN-Router-Sampling. **Zukünftiger Prod-Default nach v0.4.3-Recert.** |
-| `false` | `'soft-open'` | Validierter Fallback aktiv **plus** zusätzliche graduelle soft-OPEN Router-Sampling-Recovery. Nur für Benchmark-/Eval-Runs explizit freizuschalten. |
-
-**Wichtige Präzisierung zur Prod-Freigabe**: Nach v0.4.3-Recert-Erfolg kriegen Prod-Kapital-Pfade `cpm=false + recoveryMode='disabled'`. HALF_OPEN-Recovery bleibt aktiv wie heute — nur das zusätzliche soft-OPEN-Sampling ist aus. Diese Trennung ist bewusst konservativ.
-
-**Warum das v3-Missverständnis auftrat**: In der ersten Vollrun-Session sahen wir persistent-OPEN von adv_018–adv_100. Das war **nicht** weil HALF_OPEN inexistent ist, sondern weil (a) der Router bei `CircuitAllOpenError` katcht und `canProceed()` erst gar nicht ruft (Engine-Bypass, siehe `engine/index.ts:58-79`), und (b) selbst wenn `canProceed()` gerufen würde, der HALF_OPEN-Probe bei swift-p90=24s systematisch am 15s-Bound scheitern und sofort re-trippen würde. Punkt 4 (Kalibrierung) adressiert das strukturell.
-
----
-
-## 2. Wiederholte Recovery-Epochen mit Trip-Generation
-
-Nach schlechtem Recovery-Sample → streak reset + neue Epoch nach exponential-Cooldown. Wichtig: Zusätzlich zur `epoch` gibt es eine `tripGeneration`, die bei **jedem** OPEN-Zyklus inkrementiert wird — nicht nur beim Epoch-Wechsel innerhalb einer soft-OPEN-Session:
-
-```
-CLOSED (tripGeneration=N)
-  ↓ trip
-OPEN (tripGeneration=N+1, epoch=1)
-  ↓ (falls cpm=false AND recoveryMode='soft-open')
-soft-recovery epoch #1
-  ├─ K aufeinanderfolgende gute Samples → CB.recoverFromOpen() → CLOSED
-  │  (Router konsumiert tripGeneration=N+1 Samples)
-  └─ schlechter Sample → epoch #2 (tripGeneration=N+1 bleibt)
-     ...
-  → CLOSED bei erfolgreicher Recovery
-  → falls neuer Trip → tripGeneration=N+2 (nicht N+1+irgendwas)
-```
-
-**Trip-Generation-Zweck**: Nach erfolgreicher Recovery (CLOSED) und erneutem Trip müssen veraltete in-flight Probe-Ergebnisse aus tripGeneration=N+1 verworfen werden, weil wir jetzt in tripGeneration=N+2 sind. Nur `epoch` reicht nicht, weil `epoch` beim Reset (via `resetSoftOpenState`) auf 1 zurückspringen könnte.
-
-**Config**:
+`getBreaker(alias)` löst wie folgt auf:
 
 ```typescript
-interface SoftOpenConfig {
-  sampleRate: number;              // default N=5
-  baseEpochCooldownMs: number;     // default 30_000
-  maxEpochCooldownMs: number;      // default 300_000
-  // K und Recovery-Bound sind in CircuitBreakerConfig, nicht hier — siehe §3
-}
+const perAlias = this.circuitBreakerConfigByAlias?.[alias];
+const merged = { ...this.circuitBreakerConfig, ...perAlias };
+cb = new CircuitBreaker(alias, merged);
 ```
 
-Cooldown-Schedule: `epochCooldownMs[m] = min(baseEpochCooldownMs × 2^(m-1), maxEpochCooldownMs)` → 30s, 60s, 120s, 240s, 300s (cap).
+Wenn ein Alias in `circuitBreakerConfigByAlias` fehlt, fällt er auf die globale `circuitBreakerConfig` zurück. Wenn beide fehlen, `CircuitBreaker`-Defaults.
+
+**Test-Anforderung**: `circuitBreakerConfigByAlias` muss durch mindestens einen der zwölf Unit-Tests aus §3a explizit geprüft werden (z.B. nano cooldown=30s, swift cooldown=60s → zwei verschiedene HALF_OPEN-Zeitpunkte im selben Client).
 
 ---
 
-## 3. CB-owned Recovery-Policy — kein Escape-Hatch
+## 6. Canary (Hermes-Entscheidung 4b)
 
-**Kritische Änderung gegenüber v3**: K und `recoveryMaxLatencyMs` gehören in die CB-Konfiguration, nicht in den Method-Call. Der Router liefert Evidenz, der CB entscheidet.
+Nach Gate 1 + Gate 2 beide grün:
 
-### CircuitBreaker-Erweiterung
-
-```typescript
-// src/engine/circuit-breaker.ts
-
-interface CircuitBreakerConfig {
-  // ... bestehende Felder
-  recoveryRequiredSuccesses?: number;   // K, default 5
-  recoveryMaxLatencyMs?: number;        // default: falls unset, inherit tripP90LatencyMs
-}
-
-interface RecoverySample {
-  epoch: number;          // Router-Epoch innerhalb aktueller tripGeneration
-  sequence: number;       // strictly monotonic pro Alias
-  success: boolean;       // war Call erfolgreich (kein Throw)
-  latencyMs: number;      // MUSS PR-#11-Netto-Latenz sein (netLatency, nicht wallClock)
-  tripGeneration: number; // welche OPEN-Zyklus-Generation
-}
-
-interface RecoveryResult {
-  closed: boolean;
-  reason?: string;        // wenn closed=false: warum
-}
-
-class CircuitBreaker {
-  // ... bestehende Methoden
-
-  /**
-   * Attempts OPEN → CLOSED transition based on Router-collected recovery evidence.
-   * CB owns the acceptance rules (K, bound); router cannot weaken them.
-   *
-   * Validation is strict — any single failure means closed=false:
-   *   1. Current state MUST be OPEN
-   *   2. samples.length MUST be >= this.config.recoveryRequiredSuccesses (K)
-   *   3. Last K samples: MUST all have success=true
-   *   4. Last K samples: MUST all have latencyMs <= this.config.recoveryMaxLatencyMs
-   *   5. Last K samples: MUST all share the same tripGeneration as metadata.tripGeneration
-   *   6. Last K samples: MUST have strictly monotonic sequences (no gaps in caller-sent order,
-   *      no duplicate sequences)
-   *   7. Last K samples: MUST share the same epoch as metadata.epoch
-   */
-  recoverFromOpen(
-    samples: RecoverySample[],
-    metadata: { epoch: number; tripGeneration: number; reason: string }
-  ): RecoveryResult {
-    const K = this.config.recoveryRequiredSuccesses ?? 5;
-    const bound = this.config.recoveryMaxLatencyMs ?? this.config.tripP90LatencyMs;
-
-    if (this.state !== 'OPEN') {
-      return { closed: false, reason: `state is ${this.state}, not OPEN` };
-    }
-    if (samples.length < K) {
-      return { closed: false, reason: `insufficient samples: got ${samples.length}, need ${K}` };
-    }
-    if (metadata.tripGeneration !== this.currentTripGeneration) {
-      return { closed: false, reason: `stale tripGeneration ${metadata.tripGeneration} vs current ${this.currentTripGeneration}` };
-    }
-
-    const lastK = samples.slice(-K);
-    for (let i = 0; i < lastK.length; i++) {
-      const s = lastK[i];
-      if (!s.success) return { closed: false, reason: `sample #${i} success=false` };
-      if (s.latencyMs > bound) return { closed: false, reason: `sample #${i} latency ${s.latencyMs}ms > ${bound}ms` };
-      if (s.tripGeneration !== metadata.tripGeneration) return { closed: false, reason: `sample #${i} tripGeneration mismatch` };
-      if (s.epoch !== metadata.epoch) return { closed: false, reason: `sample #${i} epoch mismatch` };
-      if (i > 0 && s.sequence <= lastK[i-1].sequence) {
-        return { closed: false, reason: `sample #${i} sequence not strictly monotonic` };
-      }
-    }
-
-    // All invariants passed
-    this.samples.length = 0;
-    this.openedAt = null;
-    this.state = 'CLOSED';
-    this.lastRecoveryEvent = {
-      reason: metadata.reason,
-      epoch: metadata.epoch,
-      tripGeneration: metadata.tripGeneration,
-      samplesUsed: K,
-      at: this.now(),
-    };
-    return { closed: true };
-  }
-
-  /**
-   * Called internally by trip() to increment generation.
-   */
-  private incrementTripGeneration(): void {
-    this.currentTripGeneration++;
-  }
-}
+```
+10% Traffic für 48h → nur dann 100%
 ```
 
-**Der Router kann K und Bound NICHT abschwächen** — sie liegen in `CircuitBreakerConfig`, nicht in `recoverFromOpen`-Parametern. Der Router liefert nur die Samples und die Meta-Kennung (welche Epoch, welche tripGeneration er glaubt zu bedienen), damit der CB Stale-Detection und Epoch-Konsistenz prüfen kann.
+**Realitäts-Check**: Falls die Deployment-Schicht heute kein echtes prozentuales Routing unterstützt, ist „10%" nur in Doku nicht ausreichend. Alternativen (Hermes verbindlich):
 
-**`currentTripGeneration`** ist CB-internal, wird bei jedem `trip()` inkrementiert. Der Router liest sie via `snapshot()` (bestehende Methode, erweitert um `tripGeneration`).
+- Klar benannte Kapitalpfad-Integration / Canary-Deployment
+- Shadow-Traffic ohne Execution-Autorität
+- Expliziter Anteil über vorhandenen Router/Feature-Flag
+
+**Was für ThoughtProof heute realistisch ist**: TBD, muss vor Canary-Start geklärt sein. Vermutlich Feature-Flag im Client mit prozentualer Auswahl per Verifikation-ID-Hash.
+
+**Kein neuer komplexer Routing-Code nur für „10%"**. Entscheidend: begrenzter Blast Radius + messbarer echter Traffic.
+
+### 6a. Canary-Ampeln (v5 vorab definiert)
+
+Alle müssen 48h grün sein:
+
+- **Safety**: 0 Safety-Regressionen, 0 Error→ALLOW
+- **Route-Integrität**: kein Fallback auf fremde/unvalidierte Provider
+- **Observability**: OPEN/HALF_OPEN/CLOSED-Transitions vollständig beobachtbar (§4-Events)
+- **Recovery-Zeit**: Recovery innerhalb definierter Zeit nach Provider-Gesundheit (Wert TBD in v5-Delta nach Kalibrierung, z.B. „innerhalb `cooldownMs + probeMaxLatencyMs` nach dem letzten schlechten Sample")
+- **Flapping**: keine OPEN↔CLOSED-Flapping-Serie (definiert als >3 Transitions in 5 Minuten pro Alias)
+- **Route-Verteilung**: Fallback-Rate und primary-route-share ausgewiesen und stabil
+- **Latenz**: p50/p90/p95 per Alias auf netto Achsen-Latenz
+- **Fehler-/Timeout-Rate**: ausgewiesen und stabil
+- **Delta zu Kontrollgruppe**: Kosten- und Latenzdelta gegenüber pre-Canary-Traffic
+
+### 6b. Rollback
+
+Reversibel via Config/Feature-Flag → CPM=true oder vorherige sichere Posture. **Kein hektischer Code-Revert als primärer Rollback.** Rollback-Trigger: eine der obigen Ampeln rot > 5 Minuten.
 
 ---
 
-## 4. Netto-Latenz im Recovery-Probe (PR #11-konsistent)
+## 7. Release-Regel (Hermes verbindlich)
 
-Der Recovery-Probe im Router MUSS exakt dieselbe Latenz-Definition verwenden wie PR #11 in `HttpLlmClient.callWithBreaker` (Zeilen 352 und 424):
-
-```typescript
-// PSEUDO-CODE FÜR ROUTER-PROBE-BLOCK
-const startedAt = Date.now();
-let result: LlmCallOutput;
-try {
-  result = await this.callPrimary(alias, ...);  // enthält bereits internen Retry-Loop
-} catch (err) {
-  // Ausgeschöpfter Retry-Loop → success=false. In diesem Zweig ist LlmCallOutput
-  // nicht verfügbar (Exception-Pfad), also nehmen wir wallClock für die Telemetrie
-  // und markieren success=false.
-  const wallClockMs = Date.now() - startedAt;
-  this.recordBadSample(alias, {
-    success: false,
-    latencyMs: wallClockMs,   // reine Telemetrie, wird als bad sample verworfen
-    cause: `probe threw: ${err.message}`,
-  });
-  // Fallback für den User
-  return this.callFallback(alias, ...);
-}
-
-// Erfolgreicher Probe → PR-#11-Netto-Latenz
-const wallClockMs = Date.now() - startedAt;
-const netLatencyMs = Math.max(0, wallClockMs - (result.backoffWaitedMs ?? 0));
-
-this.recordGoodOrBadSample(alias, {
-  success: true,
-  latencyMs: netLatencyMs,        // Netto — 429-Retries subtrahiert
-  wallClockMs,                    // zusätzlich für Telemetrie/Report
-  backoffWaitedMs: result.backoffWaitedMs ?? 0,
-});
 ```
-
-**Regeln**:
-
-- Erfolgreicher Probe: `latencyMs = netLatencyMs`. Wird gegen `recoveryMaxLatencyMs` verglichen.
-- Fehlgeschlagener Probe (Exception, ausgeschöpfter Retry-Loop): `success=false`, `latencyMs=wallClockMs` als Telemetrie, aber als "bad sample" gewertet — Streak-Reset unabhängig von der Latenz.
-- Probe technisch erfolgreich, aber `netLatencyMs > recoveryMaxLatencyMs` → bad sample mit cause=`latency-over-bound`.
-
-**Es gibt keine zweite Latenz-Definition.** Der Router konsumiert `LlmCallOutput.backoffWaitedMs` (Feld existiert bereits post-PR-#11) und wendet dieselbe Netto-Formel an wie `callWithBreaker`.
+Gate 1 grün                 → swift qualitativ rezertifiziert
+Gate 2 grün                 → konkrete Runtime-Konfiguration resilient
+capitalPathMode=false auf Prod-Kapitalpfaden  → erst wenn BEIDE Gates + 48h-Canary grün
+```
 
 ---
 
-## 5. Router-Logic mit try/finally, Generation-Token und Single-flight
+## 8. PR-Struktur (Hermes verbindlich)
 
-Vollständige Router-Semantik unter state=OPEN, cpm=false, recoveryMode='soft-open':
+### 8a. PR #11 — jetzt separat eröffnen auf sauberem Branch
 
-### Pro-Alias-State
+Der aktuelle `origin/v043-cb-latency-fix` enthält inzwischen 2 Code-Commits + 5 Design-/Roadmap-Commits + fast 2000 Diff-Zeilen inkl. superseded Designs. Das würde den kleinen Latency-Fix im Dokumentrauschen verstecken.
 
-```typescript
-interface AliasSoftOpenState {
-  epoch: number;                   // aktuelle Recovery-Epoch, resettet bei erfolgreicher Recovery oder neuem Trip
-  sequence: number;                // strikt monoton pro Alias über alle Calls
-  probeInFlight: boolean;          // single-flight: max 1 Probe pro Alias in-flight
-  latencyBuffer: RecoverySample[]; // Samples der aktuellen Epoch (Sliding-Window bis K)
-  consecutiveSuccesses: number;    // Streak in aktueller Epoch
-  nextProbeEligibleAt: number;     // wall-clock, ab wann nächster Probe erlaubt
-  currentTripGeneration: number;   // welche OPEN-Zyklus-Generation aktiv ist
-}
-```
+Saubere Reihenfolge:
 
-### Routing-Pseudocode
+1. Neuer Branch `v043-cb-latency-fix-clean` von `origin/main`
+2. Nur diese zwei Code-Commits übernehmen:
+   - `0dd07ae` — Retry-/Backoff-Instrumentierung (`LlmCallOutput.{attemptCount, backoffWaitedMs, retryReasons}`)
+   - `cb9d83a` — Netto-Latenz an CB (netLatency = wallClock - backoffWaitedMs in 2 Sites)
+3. Tests/Typecheck/Build auf `v043-cb-latency-fix-clean` — muss 105/105 grün sein
+4. PR #11 eröffnen mit Links auf verifizierte `ced1915`-Artefakte im dql-benchmark-Repo
+5. Diff enthält nur `llm-client.ts` und `llm-client.test.ts` (bzw. wirklich notwendige Code-Pfade)
+6. Nach PR-#11-Merge: `main` erneut vollständig verifizieren (Tests + Manifest)
+7. v5-Recovery-Branch erst dann von frischem `main`
 
-```typescript
-async function routeCall(alias: string, ...): Promise<LlmCallOutput> {
-  const state = this.getSoftOpenState(alias);
-  const cbSnapshot = this.getBreaker(alias).snapshot();
+Die Design-Dokumente (`v0431-*.md`, `sync-hermes-perplexity-*.md`, `ROADMAP.md`-Escalations) bleiben historisch auf `v043-cb-latency-fix` oder gehen später in einen separaten Docs-PR. Sie gehören **nicht** in PR #11.
 
-  // Wenn CB nicht OPEN, geht der bestehende Pfad — CLOSED/HALF_OPEN werden vom
-  // CB selbst behandelt. Recovery-Router mischt sich nicht ein.
-  if (cbSnapshot.state !== 'OPEN') {
-    return this.normalCall(alias, ...);
-  }
+### 8b. PR #12 — v0.4.3.1 auf Basis von PR-#11-Merge
 
-  // CB ist OPEN — soft-OPEN-Regime aktiv (wenn Config zulässt)
-  if (this.config.capitalPathMode || this.config.recoveryMode !== 'soft-open') {
-    // Fail-closed (capital) oder disabled → sofort Fallback (bestehendes Verhalten)
-    return this.callFallback(alias, ...);
-  }
+Neuer Branch `v043-cb-recovery-fix` **von frischem `main` nach PR-#11-Merge**. Enthält:
 
-  // Snapshot der CB-Generation ins Router-State übernehmen falls neu
-  if (state.currentTripGeneration !== cbSnapshot.tripGeneration) {
-    this.resetSoftOpenStateForNewGeneration(alias, cbSnapshot.tripGeneration);
-  }
+1. `llm-client.recovery-regression.test.ts` (existiert bereits, wird in diesen PR verschoben)
+2. `circuitBreakerConfigByAlias`-Erweiterung in `HttpLlmClient` (§5c)
+3. `CircuitBreakerConfig.onStateTransition`-Hook + Event-Emissionen im CB (§4)
+4. Standard-Handler im `HttpLlmClient` der Events als strukturiertes JSON in Log-Sink schreibt
+5. 12 Unit/Client-Integration-Tests aus §3a
+6. Kalibrierungs-Run-Ergebnisse als separater Report auf `dql-benchmark/main` referenziert (§5)
+7. Live-Drill-Report auf `dql-benchmark/main` referenziert (§3b)
 
-  const mySequence = ++state.sequence;
-  const myTripGeneration = state.currentTripGeneration;
-  const myEpoch = state.epoch;
-  const now = Date.now();
-
-  // Sampling-Entscheidung: eligible if (a) nicht in Cooldown, (b) kein Probe in-flight,
-  // (c) Sample-Rate-Slot getroffen
-  const eligible = (
-    now >= state.nextProbeEligibleAt
-    && !state.probeInFlight
-    && (mySequence % this.config.softOpen.sampleRate === 0)
-  );
-
-  if (!eligible) {
-    this.telemetry.emit('recovery_probe_skipped', {
-      alias, epoch: myEpoch, tripGeneration: myTripGeneration, sequence: mySequence,
-      cause: !eligible.timeGate ? 'cooldown' : (state.probeInFlight ? 'probe-in-flight' : 'sample-rate'),
-    });
-    return this.callFallback(alias, ...);
-  }
-
-  // Diese Call wird Probe
-  state.probeInFlight = true;
-  this.telemetry.emit('recovery_probe_started', {
-    alias, epoch: myEpoch, tripGeneration: myTripGeneration, sequence: mySequence,
-  });
-
-  const startedAt = Date.now();
-  try {
-    let result: LlmCallOutput;
-    try {
-      result = await this.callPrimary(alias, ...);
-    } catch (err) {
-      const wallClockMs = Date.now() - startedAt;
-      this.handleBadSample(alias, {
-        epoch: myEpoch, sequence: mySequence, tripGeneration: myTripGeneration,
-        latencyMs: wallClockMs, cause: `probe-threw: ${err.message}`,
-      });
-      // Fallback for user
-      return this.callFallback(alias, ...);
-    }
-
-    const wallClockMs = Date.now() - startedAt;
-    const netLatencyMs = Math.max(0, wallClockMs - (result.backoffWaitedMs ?? 0));
-
-    // Stale-Check: hat sich Trip-Generation während des Awaits geändert?
-    if (state.currentTripGeneration !== myTripGeneration) {
-      this.telemetry.emit('recovery_probe_stale', {
-        alias, probeTripGeneration: myTripGeneration, currentTripGeneration: state.currentTripGeneration,
-      });
-      return result;  // Ergebnis dem Caller geben, State nicht ändern
-    }
-    if (state.epoch !== myEpoch) {
-      this.telemetry.emit('recovery_probe_stale', {
-        alias, probeEpoch: myEpoch, currentEpoch: state.epoch,
-      });
-      return result;
-    }
-
-    // Netto-Latenz gegen CB-Config-Bound prüfen (nicht Router-supplied Bound!)
-    const cbConfig = this.getBreaker(alias).getConfig();
-    const recoveryBound = cbConfig.recoveryMaxLatencyMs ?? cbConfig.tripP90LatencyMs;
-
-    if (netLatencyMs > recoveryBound) {
-      this.handleBadSample(alias, {
-        epoch: myEpoch, sequence: mySequence, tripGeneration: myTripGeneration,
-        latencyMs: netLatencyMs, cause: 'latency-over-bound',
-      });
-    } else {
-      // Guter Sample
-      const sample: RecoverySample = {
-        epoch: myEpoch, sequence: mySequence, success: true,
-        latencyMs: netLatencyMs, tripGeneration: myTripGeneration,
-      };
-      state.latencyBuffer.push(sample);
-      state.consecutiveSuccesses++;
-      this.telemetry.emit('recovery_probe_succeeded', {
-        alias, epoch: myEpoch, tripGeneration: myTripGeneration, sequence: mySequence,
-        netLatencyMs, wallClockMs, backoffWaitedMs: result.backoffWaitedMs ?? 0,
-        streak: state.consecutiveSuccesses,
-      });
-
-      if (state.consecutiveSuccesses >= (cbConfig.recoveryRequiredSuccesses ?? 5)) {
-        // K erreicht → CB fragen ob Transition zulässig
-        const recoveryResult = this.getBreaker(alias).recoverFromOpen(
-          state.latencyBuffer,
-          { epoch: myEpoch, tripGeneration: myTripGeneration, reason: 'soft-open recovery' }
-        );
-        if (recoveryResult.closed) {
-          this.telemetry.emit('circuit_recovered', {
-            alias, epoch: myEpoch, tripGeneration: myTripGeneration,
-            samplesUsed: cbConfig.recoveryRequiredSuccesses ?? 5,
-          });
-          this.resetSoftOpenStateAfterRecovery(alias);
-        } else {
-          this.telemetry.emit('recovery_probe_rejected', {
-            alias, epoch: myEpoch, tripGeneration: myTripGeneration, reason: recoveryResult.reason,
-          });
-          // CB hat abgelehnt (sollte selten sein wenn wir alle Invarianten erfüllen)
-          // Streak zurücksetzen, damit wir nicht endlos denselben Buffer probieren
-          this.handleBadSample(alias, {
-            epoch: myEpoch, sequence: mySequence, tripGeneration: myTripGeneration,
-            latencyMs: netLatencyMs, cause: `cb-rejected: ${recoveryResult.reason}`,
-          });
-        }
-      }
-    }
-
-    return result;
-  } finally {
-    state.probeInFlight = false;
-  }
-}
-
-function handleBadSample(alias, info) {
-  const state = this.getSoftOpenState(alias);
-  if (state.currentTripGeneration !== info.tripGeneration || state.epoch !== info.epoch) {
-    // Stale — sollte oben schon abgefangen sein, defensiv
-    return;
-  }
-  const oldEpoch = state.epoch;
-  state.consecutiveSuccesses = 0;
-  state.latencyBuffer = [];
-  state.epoch++;
-  const cooldownMs = Math.min(
-    this.config.softOpen.baseEpochCooldownMs * Math.pow(2, oldEpoch - 1),
-    this.config.softOpen.maxEpochCooldownMs
-  );
-  state.nextProbeEligibleAt = Date.now() + cooldownMs;
-  this.telemetry.emit('recovery_streak_reset', {
-    alias, oldEpoch, newEpoch: state.epoch, tripGeneration: info.tripGeneration,
-    cause: info.cause, latencyMs: info.latencyMs, cooldownMs,
-  });
-}
-```
-
-**Kritische Sicherheits-Punkte**:
-
-- **`try/finally`** garantiert `probeInFlight = false` auch bei Exceptions
-- **Trip-Generation-Check nach dem `await`** fängt Race-Fälle: CB wurde während des Awaits geschlossen und erneut getrippt, unser Sample gehört zur alten Generation
-- **Epoch-Check nach dem `await`** fängt Race-Fälle innerhalb derselben Trip-Generation: ein anderer Bad-Sample-Handler hat Epoch inkrementiert
-- **CB-Config wird zur Runtime gelesen** (`cbConfig.recoveryMaxLatencyMs`) — nicht in Router-Config gecacht
-- **`recoverFromOpen` ohne Router-supplied K/Bound** — nur Samples + Metadata
+**PR-Merge nur nach Hermes-Vier-Augen-Review** aller drei Reports (Kalibrierung + Live-Drill + Test-Suite).
 
 ---
 
-## 6. Kein neues öffentliches Route-Enum
+## 9. Was NICHT Teil von v0.4.3.1 ist
 
-**API-Bruch vermeiden.** Der bestehende Type `providerRoute: 'primary' | 'fallback'` bleibt. Probe-Kennzeichnung als separate optionale Felder:
-
-```typescript
-// LlmCallOutput
-interface LlmCallOutput {
-  // ... bestehende Felder
-  providerRoute?: 'primary' | 'fallback';   // unverändert
-  recoveryProbe?: boolean;                  // NEU: intern/telemetrie-only, optional
-  recoveryEpoch?: number;                   // NEU: nur gesetzt wenn recoveryProbe=true
-  recoveryTripGeneration?: number;          // NEU: nur gesetzt wenn recoveryProbe=true
-}
-```
-
-Falls `recoveryProbe=true`, ist `providerRoute='primary'` (der Probe geht ja zum echten Primary). Downstream-Consumers, die nur `providerRoute` lesen, sehen 'primary' — kein API-Bruch. Wer Route-Details braucht, liest zusätzlich `recoveryProbe`.
-
-Alternative die wir nicht wählen: `providerRoute='primary-probe'` als drittes Enum-Element. **Verworfen wegen API-Kompatibilität.**
-
----
-
-## 7. Per-Alias-Kalibrierung — vor dem Live-Run finalisieren
-
-Bound-Kalibrierung ist **Teil von v0.4.3.1**, nicht v0.4.3.2. Trip-/HALF_OPEN-/Recovery-Bounds pro Alias konsistent:
-
-```typescript
-// Beispiel-Config, zu finalisieren aus verifizierten retry-bereinigten Daten
-circuitBreakerConfigByAlias: {
-  'serv-nano': {
-    tripP90LatencyMs: 15_000,       // TBD aus nano-p90 im letzten sauberen Run
-    probeMaxLatencyMs: 15_000,      // konsistent zu tripP90
-    recoveryMaxLatencyMs: 15_000,   // konsistent zu tripP90
-    recoveryRequiredSuccesses: 5,
-  },
-  'serv-swift': {
-    tripP90LatencyMs: 30_000,       // TBD aus swift Segment-A netto-Latenzen
-    probeMaxLatencyMs: 30_000,      // konsistent
-    recoveryMaxLatencyMs: 30_000,   // konsistent
-    recoveryRequiredSuccesses: 5,
-  },
-}
-```
-
-**Warum konsistent kritisch ist**: Wenn Recovery bei 30s schließt, aber `tripP90LatencyMs=15s` beim CLOSED-Traffic gilt, kommt es sofort wieder zum Trip. Flapping-Zyklus:
-
-```
-OPEN → recovery bei 28s → CLOSED → nächste Draws bei 25-30s → tripP90 reisst → OPEN
-```
-
-Alle drei Bounds pro Alias auf denselben Wert.
-
-### Kalibrierungs-Regel (bindend, muss vor Live-Run finalisiert werden)
-
-**Quelle**: Der letzte saubere Vollrun mit netto-Latenz-Instrumentierung. Aktuell verfügbar: `runs/results_v043_swift_primary_recert_w1.jsonl` (adv_001–adv_017 als swift Segment-A, ~85 primary-Draws bei 5 Draws/Case × 17 Cases).
-
-**Regel**: Pro Alias, aus allen primary-Draws mit `providerRoute='primary'` und `success=true` in diesem Datensatz:
-
-```
-netLatency = wallClock - backoffWaitedMs
-tripP90LatencyMs = probeMaxLatencyMs = recoveryMaxLatencyMs = ceil(p95(netLatency) / 5000) * 5000
-```
-
-Runden auf 5s-Vielfaches wegen Config-Lesbarkeit.
-
-**Was ich VOR v4-Freigabe liefere**: Explizite Berechnung aus Segment-A-Daten, Report-Excerpt mit p50/p90/p95/max, vorgeschlagene Werte. Wenn Segment A zu klein ist (n<50 Samples pro Alias), führen wir vor dem Live-Run einen 20-Case-Kalibrierungs-Run auf gesundem swift (ohne CB-Trip-Provokation).
-
-**Kein "wir setzen 30s weil es plausibel klingt".** Zahl mit Quelle und Regel.
-
----
-
-## 8. Test-Trennung: Sampling und Recovery separat
-
-### 8a. Sampling-Test (ohne Recovery)
-
-Unit-Test hält K unerreichbar (z.B. injizierte Latenz > `recoveryMaxLatencyMs` bei jedem 5-ten Call → alle Probes werden bad samples). Beweist:
-
-- Von 25 sequenziellen Calls: genau 5 werden als Probes klassifiziert (via `recovery_probe_started`-Events)
-- 20 gehen fallback
-- Verhältnis 1/N=1/5 exakt
-
-Kein Fokus auf Recovery-Ausgang — Fokus auf Sampling-Distribution.
-
-### 8b. Recovery-Test (deterministischer OPEN→CLOSED-Drill)
-
-Unit-Test bringt CB deterministisch in OPEN (via injizierte Test-Factory bzw. `recordFailure`-Sequenz), führt K−1 gute Samples (Latenz unter Bound) → Assert: state=OPEN. Führt K-ten guten Sample → Assert: state=CLOSED, `circuit_recovered`-Event, subsequenter Traffic geht `providerRoute='primary'` (kein Probe mehr, weil CB CLOSED).
-
-**Kein `forceOpen()`-Public-API** — Test-Injection via Factory oder direkter State-Manipulation im Test-only-Konstruktor.
-
-### 8c. Vollständige Unit-Acceptance (11 Assertions)
-
-| # | Test | Was er beweist |
-|---|---|---|
-| 1 | CB deterministisch nach failure_rate → state='OPEN' | Setup |
-| 2 | 25 seq. Calls, N=5, K unerreichbar → 5 Probes gestartet, 20 Fallbacks | 8a Sampling |
-| 3 | K−1 gute Probes → weiterhin state='OPEN' | K-Grenze |
-| 4 | K-ter guter Probe → state='CLOSED', `circuit_recovered` event | Recovery-Bedingung |
-| 5 | Nach Recovery: 10 Traffic-Calls → alle `providerRoute='primary'`, keine als `recoveryProbe=true` markiert | Zurück in Normal-Betrieb, keine unnötige Probes |
-| 6 | 4 gute Probes, dann Probe mit `netLatencyMs > recoveryMaxLatencyMs` → streak reset, epoch++, `recovery_streak_reset` event | Bad-Sample-Handling |
-| 7 | Nach Epoch 2 Cooldown: 5 gute Probes → CLOSED, `circuit_recovered` mit `epoch=2` | Repeated epochs |
-| 8 | Innerhalb Cooldown: alle Calls fallback, 0 `recovery_probe_started` events | Cooldown-Enforcement |
-| 9 | `recoveryMode='disabled'` + Trip: 25 Traffic-Calls → 0 `recovery_probe_started`, aber bestehende HALF_OPEN-Recovery (nach cooldownMs) funktioniert weiterhin | recoveryMode-Gate |
-| 10 | Zwei Clients (`cpm=true` vs `cpm=false`), gleiche Umgebung, gleicher Trip → cpm=true macht 0 soft-Probes und fail-closed, cpm=false macht Probes | capitalPathMode-Gate |
-| 11 | 5 parallele Achsen für denselben Alias bei state=OPEN → genau 1 Probe klassifiziert (single-flight), 4 fallback | Parallel-Semantik |
-| 12 | Stale-Probe-Test: Probe gestartet in tripGeneration=N, während des Awaits CB→CLOSED→re-Trip (tripGeneration=N+1), Probe kehrt zurück → Sample verworfen (`recovery_probe_stale` event), Streak in tripGeneration=N+1 unverändert | Generation-Schutz |
-
-### 8d. `recoverFromOpen()` Escape-Hatch-Regression-Test
-
-**Neu, kritisch**: Explizit testen dass caller-supplied K und Bound nicht wirken:
-
-```typescript
-// Test: Router versucht CB mit ungültiger Config zu schließen
-const cb = new CircuitBreaker({ recoveryRequiredSuccesses: 5, recoveryMaxLatencyMs: 15_000 });
-tripBreakerDeterministic(cb);
-
-// Nur 1 Sample bereitstellen — CB muss ablehnen, egal was Router "will"
-const result = cb.recoverFromOpen(
-  [{ epoch: 1, sequence: 1, success: true, latencyMs: 100, tripGeneration: cb.snapshot().tripGeneration }],
-  { epoch: 1, tripGeneration: cb.snapshot().tripGeneration, reason: 'attempted-bypass' }
-);
-expect(result.closed).toBe(false);
-expect(result.reason).toContain('insufficient samples');
-
-// 5 Samples aber alle über Bound — CB muss ablehnen
-const badSamples = Array.from({length: 5}, (_, i) => ({
-  epoch: 1, sequence: i+1, success: true, latencyMs: 20_000, tripGeneration: cb.snapshot().tripGeneration
-}));
-const result2 = cb.recoverFromOpen(badSamples, { epoch: 1, tripGeneration: cb.snapshot().tripGeneration, reason: 'attempted-bypass' });
-expect(result2.closed).toBe(false);
-expect(result2.reason).toContain('20000ms > 15000ms');
-```
-
-Dieser Test verhindert Regression: Wenn jemand später `recoverFromOpen(samples, {overrideK: 1})` einführt, bricht dieser Test.
-
----
-
-## 9. Diskriminierender Live-Recovery-Drill VOR Preflight
-
-Neue Reihenfolge:
-
-1. **Unit-Tests §8** — grün
-2. **Kontrollierter Live-Recovery-Drill** (echte SERV-Calls):
-   - Test-Factory bringt einen CB (nur der swift-CB) deterministisch in OPEN (via injizierter Trip-Sequenz — keine öffentliche `forceOpen()`-API)
-   - `recoveryMode='soft-open'`, `capitalPathMode=false`
-   - Skript sendet 30 Test-Achsen-Calls sequenziell mit ~5s Delay
-   - Erwartung: `soft_open_entered` → 6 Probes (30/N=5), 5 gute Probes hintereinander (falls swift gesund) → `circuit_recovered` beobachtet
-   - **Gegenprobe**: Gleiche Prozedur mit `recoveryMode='disabled'` → keine `recovery_probe_started`-Events, bestehende cooldown→HALF_OPEN-Recovery greift stattdessen
-   - Report: `runs/recovery_drill_v0431.jsonl` + `reports/v0431-recovery-drill.md`, gepusht auf `dql-benchmark/main`
-3. **Preflight 30×N=3** auf soft-open code, mit finaler Kalibrierung — nur wenn Drill grün
-4. **Vollrun 100×N=5** — nur wenn Preflight grün (definiertes Recall-Kriterium + Recovery-Event-Evidenz)
-
-**Gates zwischen Schritten**: Nach jedem Schritt Hermes-Vier-Augen-Review der Reports vor Weiterschalten.
-
----
-
-## 10. Was NICHT Teil von v0.4.3.1 ist
-
-Explizit ausgeschlossen (separate Tracks):
-
-- **capitalPathMode-Auto-Recovery**: Kein automatischer soft-OPEN auf Prod-Kapital-Pfaden. Wenn irgendwann gewünscht: eigener Ticket mit Kanari + tiered rollout + manueller Freigabe.
+- **soft-OPEN als deploybares Produktverhalten** (P3): Verworfen — unnötige Angriffsfläche.
+- **Router-Kadenz-Änderung**: Nicht nötig — bestehender Kontrollfluss ist korrekt.
+- **`recoverFromOpen()`-Public-API**: Nicht nötig — HALF_OPEN via `canProceed()` reicht.
+- **Router-Sampling / Probe-Buffer**: Nicht nötig.
 - **Retry-Bug adv_084/adv_098**: v0.4.4.
 - **Suite v1.2**: v0.4.4.
 - **AgentDojo Track**: nach v0.4.2 stabil.
 
 ---
 
-## 11. Acceptance-Kriterien für v0.4.3.1-Close
+## 10. Acceptance-Kriterien für v0.4.3.1-Close
 
-Alle vier müssen erfüllt sein:
+Alle sechs müssen erfüllt sein:
 
-1. **Unit-Test-Kanon §8** (12 diskriminierende Assertions + `recoverFromOpen`-Escape-Hatch-Regression) grün
-2. **Kalibrierungs-Nachweis §7**: p95-Zahlen aus verifizierten netto-Latenz-Daten, per-Alias-Bounds konsistent (trip=probe=recovery)
-3. **Live-Recovery-Drill §9**: `soft_open_entered` + `circuit_recovered` events in echtem SERV-Verkehr beobachtet; `recoveryMode='disabled'`-Gegenprobe rekapituliert kein soft-OPEN
-4. **Vollrun**: primary-Route-Anteil > 80% über 100 Cases, 0 Safety-Regressions vs v0.4.1d, Rohdaten + Report + Manifest **gepusht** auf `dql-benchmark/main` **vor** PR #12 Merge
+1. **PR #11 gemergt** auf `main`, 105/105 Tests grün nach Merge
+2. **Kalibrierungs-Run gepusht** auf `dql-benchmark/main` mit p50/p90/p95/max pro Alias + Rohdaten + Manifest
+3. **12 Unit/Client-Integration-Tests** aus §3a grün, inkl. der drei bereits existierenden aus `llm-client.recovery-regression.test.ts`
+4. **Live-Drill-Report gepusht** auf `dql-benchmark/main` mit vollständigen State-Transition-Timestamps
+5. **Gate 1 grün** mit vier Erfolgs-Formel-Bedingungen
+6. **48h-Canary grün** mit allen neun Ampeln aus §6a
+
+Erst danach: `capitalPathMode=false` auf Prod-Kapital-Pfaden.
 
 ---
 
-## 12. Branch, Telemetrie, PR-Struktur
+## 11. Zusammenfassung der Hermes-Kritikpunkte-Antworten
 
-### Branch-Reihenfolge (Hermes-Antwort auf Frage 3)
+| # | Hermes-Punkt | Wo in v5 adressiert |
+|---|---|---|
+| 0 | Root-Cause-Korrektur (`canProceed()` wird bei jeder Achse aufgerufen) | §0 mit Regressionstest-Nachweis |
+| 1 | P2-korrigiert (keine neue State-Machine) | §1 Arbeitspaket-Liste, §3 Gate 2 auf realer Prod-Config |
+| 2 | Kalibrierung nicht nur `probeMaxLatencyMs`, auch `tripP90LatencyMs` | §5b Standardregel `probe=trip`, §5a Kalibrierungs-Run |
+| 3 | Kalibrierung nicht aus `ced1915`-Draw-Latenzen | §5a expliziter neuer Kalibrierungs-Run |
+| 4 | Gate 1 mit `disableCircuitBreaker=true` | §2 Gate-1-Konfiguration und -Invarianten |
+| 5 | Kein `neutralizedForBenchmark`-Flag | §2 letzter Absatz |
+| 6 | Gate-1-Invarianten (100% Coverage, keine stille UNCERTAIN@0-Vervollständigung) | §2 Invarianten und Erfolgs-Formel |
+| 7 | Gate 2 als Unit + Live-Drill (kein Trip-Injection-Vollrun) | §3a + §3b, kein separater Vollrun |
+| 8 | Live-Drill braucht echte State-Transition-Timestamps | §3b Report-Pflicht + §4 Telemetrie |
+| 9 | 48h-Canary mit vorab definierten Ampeln | §6a neun Ampeln, §6b Rollback |
+| 10 | PR #11 auf sauberem Branch, nicht direkt aktueller Remote | §8a saubere Reihenfolge |
 
-1. PR #11 (latency-fix) auf `v043-cb-latency-fix` — **separat mergen zu `main` FIRST**, mit Belegen (Rohdaten + Report + Manifest bereits auf `dql-benchmark/main` @ ced1915).
-2. Nach PR #11 Merge: `main` hat den latency-fix.
-3. Neuer Branch `v043-cb-recovery-fix` **von `main`** abzweigen. Kein stacked PR.
-4. v0.4.3.1 Recovery-Fix implementieren → PR #12 auf `v043-cb-recovery-fix`.
-5. Kalibrierungs-Nachweis + Live-Drill + Preflight + Vollrun → alle vier zusätzlich gepusht auf `dql-benchmark/main`.
-6. PR #12 Merge nur nach Hermes-Freigabe der vier Nachweise.
+---
 
-### Telemetrie-Events (Pflicht, alle strukturiert JSON, mindestens diese Felder)
+## 12. Zwei offene Punkte für Hermes-Review dieses v5
 
-| Event | Kernfelder |
-|---|---|
-| `soft_open_entered` | `alias, tripGeneration, tripReason, cbState` |
-| `recovery_probe_started` | `alias, tripGeneration, epoch, sequence` |
-| `recovery_probe_succeeded` | `alias, tripGeneration, epoch, sequence, netLatencyMs, wallClockMs, backoffWaitedMs, streak, boundMs` |
-| `recovery_probe_failed` | `alias, tripGeneration, epoch, sequence, cause, netLatencyMs?, wallClockMs?` |
-| `recovery_probe_stale` | `alias, probeTripGeneration, currentTripGeneration, probeEpoch, currentEpoch` |
-| `recovery_probe_skipped` | `alias, tripGeneration, epoch, sequence, cause` (cooldown/probe-in-flight/sample-rate) |
-| `recovery_probe_rejected` | `alias, tripGeneration, epoch, reason` |
-| `recovery_streak_reset` | `alias, tripGeneration, oldEpoch, newEpoch, cause, latencyMs?, cooldownMs` |
-| `circuit_recovered` | `alias, tripGeneration, epoch, samplesUsed, boundMs` |
+1. **`circuitBreakerConfigByAlias`-Merge-Semantik**: v5 sagt „shallow merge" (`{ ...global, ...perAlias }`). Ist das für dich okay, oder willst du dass perAlias die globale Config komplett ersetzt (kein Merge)? Meine Empfehlung: shallow merge, weil dann `onStateTransition`-Handler und andere gemeinsame Felder nicht pro Alias dupliziert werden müssen.
 
-Alle Events schreiben in denselben strukturierten Log-Sink wie bestehende CB-Events. Vollrun-Report rekonstruiert Recovery-Historie direkt aus Log-Traces.
+2. **Canary-Routing-Mechanik**: §6 nennt drei Alternativen. Ist eine davon in ThoughtProof-Deployment heute wirklich verfügbar? Wenn nicht, wird das ein v5-Delta-Design bevor Canary starten kann. Was ist der Status?
 
 ---
 
 ## 13. Prozess-Regel (unverändert)
 
-**"Fertig" = Code committed + auf origin gepusht + Rohdaten + Report + Manifest gepusht und verifizierbar.** Kein Status-"grün" ohne alle vier.
+„Fertig" = Code committed + auf origin gepusht + Rohdaten + Report + Manifest gepusht und verifizierbar. Kein Status-„grün" ohne alle vier.
 
----
-
-## 14. Zusammenfassung der zehn v4-Anforderungen aus dem Review
-
-| # | Anforderung | Wo in v4 adressiert |
-|---|---|---|
-| 1 | CB besitzt K und Recovery-Bound selbst | §3 (CB-Config `recoveryRequiredSuccesses`, `recoveryMaxLatencyMs`; Router liefert nur Samples + Metadata) |
-| 2 | Strukturierte Samples mit Epoch, Sequence, Success, tripGeneration | §3 (`RecoverySample`-Interface); §5 (Router baut sie im Erfolgs-/Misserfolgs-Pfad) |
-| 3 | Recovery-Probes verwenden PR-#11-Netto-Latenz | §4 (netLatencyMs-Formel, PR-#11-konsistent, kein zweite Definition) |
-| 4 | Bestehende HALF_OPEN-Semantik korrekt | §1 (Verhaltensmatrix nennt HALF_OPEN-Pfad explizit für alle drei Config-Kombinationen) |
-| 5 | Per-Alias konsistente trip/probe/recovery-Bounds | §7 (`PerAliasBreakerConfig` mit allen drei Feldern, Kalibrierungs-Regel) |
-| 6 | Probe-Kennzeichnung als internes Trace-Feld | §6 (`recoveryProbe: boolean` + `recoveryEpoch` + `recoveryTripGeneration`, kein Enum-Bruch) |
-| 7 | Getrennte Sampling- und Recovery-Tests | §8a (Sampling), §8b (Recovery), §8c (11 Assertions), §8d (Escape-Hatch-Regression) |
-| 8 | Single-flight + Generation-Schutz + finally | §5 (try/finally, tripGeneration im Sample, Stale-Check post-await) |
-| 9 | Kontrollierter Live-OPEN→CLOSED-Drill | §9 (Reihenfolge: Unit → Live-Drill → Preflight → Vollrun) |
-| 10 | Danach 30×N=3, erst dann 100×N=5 | §9 (Schritt 3+4) |
-
----
-
-## 15. Zwei kleinere Punkte, die ich noch klären will
-
-1. **`recovery_probe_rejected` bei erfolgreicher-aber-CB-abgelehnter Recovery**: Wenn wir alle Invarianten sauber führen, sollte CB nie ablehnen mit closed=false wenn wir K gute Samples in derselben Epoch/Generation haben. Trotzdem behandle ich es als bad sample (streak reset). Alternative: Als "shouldn't-happen"-Assertion loggen und Prozess-Panic. Deine Präferenz?
-
-2. **Kalibrierungs-Datenquelle**: Ist Segment A vom letzten Vollrun (17 Cases × ~5 primary-Draws = ~85 samples) ausreichend, oder soll ich einen 20-Case-Kalibrierungs-Run gegen gesundes swift (ohne CB-Interference) fahren bevor ich die Bounds finalisiere? Ich tendiere zu Ersterem falls die Streuung eng ist — sage aber lieber "Segment A reicht" mit p95-Zahl in der Hand.
-
-Kein Code bis v4 freigegeben ist. Wenn du beim v4-Review noch v5-Anforderungen findest, wieder Design-First.
+Erst v5-Review, dann PR #11 auf sauberem Branch, dann Kalibrierungs-Run, dann PR #12 Implementation, dann Gate 1, dann Gate 2, dann Canary. Kein Schritt darf einen vorherigen überspringen.
