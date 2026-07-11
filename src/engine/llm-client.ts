@@ -86,6 +86,24 @@ export interface LlmCallOutput {
    * ignore this field see no behavioral change.
    */
   providerRoute?: 'primary' | 'fallback';
+  /**
+   * v0.4.3 recert instrumentation — optional, non-breaking.
+   *
+   * attemptCount: 1 if the call succeeded on the first try; N if N-1 retries
+   * were needed. Together with backoffWaitedMs this lets downstream reporting
+   * decompose a large latencyMs sample into (network_time) + (backoff_waits)
+   * so CircuitBreaker trips can be attributed to "real provider instability
+   * with retries" vs "single slow-but-successful call".
+   *
+   * backoffWaitedMs: sum of sleep(backoff) waits between failed attempts.
+   * Zero when attemptCount is 1.
+   *
+   * retryReasons: message excerpts for each retried attempt (max 4, first
+   * 120 chars each). Empty when attemptCount is 1.
+   */
+  attemptCount?: number;
+  backoffWaitedMs?: number;
+  retryReasons?: string[];
 }
 
 export interface LlmClient {
@@ -415,9 +433,17 @@ export class HttpLlmClient implements LlmClient {
     }
 
     let lastErr: unknown;
+    let backoffWaitedMs = 0;
+    const retryReasons: string[] = [];
     for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
       try {
-        return await this.singleCall(binding, apiKey, input);
+        const out = await this.singleCall(binding, apiKey, input);
+        return {
+          ...out,
+          attemptCount: attempt,
+          backoffWaitedMs,
+          retryReasons,
+        };
       } catch (err) {
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
@@ -425,9 +451,11 @@ export class HttpLlmClient implements LlmClient {
         if (!retryable || attempt === this.config.maxAttempts) {
           throw err;
         }
+        if (retryReasons.length < 4) retryReasons.push(msg.slice(0, 120));
         const wait =
           Math.min(this.config.backoffBaseMs * Math.pow(2, attempt - 1), this.config.backoffCapMs) +
           Math.floor(Math.random() * 800);
+        backoffWaitedMs += wait;
         await this.sleep(wait);
       }
     }
