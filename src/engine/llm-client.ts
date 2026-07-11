@@ -86,6 +86,24 @@ export interface LlmCallOutput {
    * ignore this field see no behavioral change.
    */
   providerRoute?: 'primary' | 'fallback';
+  /**
+   * v0.4.3 recert instrumentation — optional, non-breaking.
+   *
+   * attemptCount: 1 if the call succeeded on the first try; N if N-1 retries
+   * were needed. Together with backoffWaitedMs this lets downstream reporting
+   * decompose a large latencyMs sample into (network_time) + (backoff_waits)
+   * so CircuitBreaker trips can be attributed to "real provider instability
+   * with retries" vs "single slow-but-successful call".
+   *
+   * backoffWaitedMs: sum of sleep(backoff) waits between failed attempts.
+   * Zero when attemptCount is 1.
+   *
+   * retryReasons: message excerpts for each retried attempt (max 4, first
+   * 120 chars each). Empty when attemptCount is 1.
+   */
+  attemptCount?: number;
+  backoffWaitedMs?: number;
+  retryReasons?: string[];
 }
 
 export interface LlmClient {
@@ -321,12 +339,21 @@ export class HttpLlmClient implements LlmClient {
     const started = Date.now();
     try {
       const out = await this.callWithRetry(binding, input);
-      primaryBreaker.recordSuccess(Date.now() - started);
+      // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
+      // circuit-breaker, not wall-clock. Backoff waits are retry-policy
+      // delay, not provider processing time. Successful retry clusters
+      // must not inflate the latency signal; exhausted retry loops are
+      // independently represented by the failure-rate path (throw path
+      // below), which feeds recordFailure() only once the retry loop is
+      // exhausted — successful retry clusters emit no failure sample.
+      const wallClock = Date.now() - started;
+      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+      primaryBreaker.recordSuccess(netLatency);
       return { ...out, providerRoute: 'primary' };
     } catch (err) {
-      // Use wall-clock elapsed since the primary attempt began. Retries and
-      // backoff waits inside callWithRetry are legitimately part of the
-      // observed latency — that IS what "this call took N ms" means.
+      // Wall-clock elapsed for failures — the retry loop exhausted, so the
+      // TOTAL time is the meaningful signal for the failure_rate window.
+      // (There is no LlmCallOutput to read backoffWaitedMs from on this path.)
       primaryBreaker.recordFailure(Date.now() - started);
       // If the circuit just tripped from this failure, try fallback for the
       // very SAME call — the caller shouldn't eat one "cold" failure per trip.
@@ -390,7 +417,10 @@ export class HttpLlmClient implements LlmClient {
     const started = Date.now();
     try {
       const out = await this.callWithRetry(fallbackBinding, input);
-      fallbackBreaker.recordSuccess(Date.now() - started);
+      // v0.4.3 CB-latency-fix (PR #11): see primary path for rationale.
+      const wallClock = Date.now() - started;
+      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+      fallbackBreaker.recordSuccess(netLatency);
       return { ...out, providerRoute: 'fallback' };
     } catch (err) {
       fallbackBreaker.recordFailure(Date.now() - started);
@@ -415,9 +445,17 @@ export class HttpLlmClient implements LlmClient {
     }
 
     let lastErr: unknown;
+    let backoffWaitedMs = 0;
+    const retryReasons: string[] = [];
     for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
       try {
-        return await this.singleCall(binding, apiKey, input);
+        const out = await this.singleCall(binding, apiKey, input);
+        return {
+          ...out,
+          attemptCount: attempt,
+          backoffWaitedMs,
+          retryReasons,
+        };
       } catch (err) {
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
@@ -425,9 +463,11 @@ export class HttpLlmClient implements LlmClient {
         if (!retryable || attempt === this.config.maxAttempts) {
           throw err;
         }
+        if (retryReasons.length < 4) retryReasons.push(msg.slice(0, 120));
         const wait =
           Math.min(this.config.backoffBaseMs * Math.pow(2, attempt - 1), this.config.backoffCapMs) +
           Math.floor(Math.random() * 800);
+        backoffWaitedMs += wait;
         await this.sleep(wait);
       }
     }

@@ -192,6 +192,80 @@ describe('HttpLlmClient retry + timeout', () => {
     );
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  // ---------------------------------------------------------------------------
+  // v0.4.3 recert instrumentation — attemptCount, backoffWaitedMs, retryReasons
+  // ---------------------------------------------------------------------------
+  it('populates attemptCount=1 and zero backoff on first-attempt success', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(makeOkResponse());
+    const client = new HttpLlmClient(BINDING, ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: vi.fn().mockResolvedValue(undefined),
+    });
+    const out = await client.call('test-model', { system: 's', user: 'u' });
+    expect(out.attemptCount).toBe(1);
+    expect(out.backoffWaitedMs).toBe(0);
+    expect(out.retryReasons).toEqual([]);
+  });
+
+  it('populates attemptCount, backoffWaitedMs and retryReasons after retries', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed timeout'))
+      .mockResolvedValueOnce(makeOkResponse());
+    // Deterministic sleep tracker so we can assert the summed value.
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(BINDING, ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 6,
+      backoffBaseMs: 100,
+      backoffCapMs: 5_000,
+    });
+    const out = await client.call('test-model', { system: 's', user: 'u' });
+    expect(out.attemptCount).toBe(3);
+    // Two waits happened before the 3rd attempt succeeded. Each wait is
+    // base * 2^(attempt-1) + jitter[0..800). So backoffWaitedMs ≥ 100 + 200.
+    expect(out.backoffWaitedMs).toBeGreaterThanOrEqual(300);
+    // And an upper bound: two waits, each ≤ 5000 + 800.
+    expect(out.backoffWaitedMs).toBeLessThan(11_601);
+    expect(out.retryReasons).toHaveLength(2);
+    expect(out.retryReasons?.[0]).toMatch(/fetch failed/);
+    expect(out.retryReasons?.[1]).toMatch(/fetch failed timeout/);
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it('caps retryReasons at 4 entries even when more retryable errors occur', async () => {
+    // Five retryable failures followed by an OK response. maxAttempts=6.
+    // The retry loop must not push more than 4 reasons into retryReasons;
+    // additional entries are dropped silently so the diagnostics envelope
+    // stays bounded.
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed #0'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #1'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #2'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #3'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #4'))
+      .mockResolvedValueOnce(makeOkResponse());
+    const client = new HttpLlmClient(BINDING, ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: vi.fn().mockResolvedValue(undefined),
+      maxAttempts: 6,
+      backoffBaseMs: 1,
+      backoffCapMs: 5,
+    });
+    const out = await client.call('test-model', { system: 's', user: 'u' });
+    expect(fetchImpl).toHaveBeenCalledTimes(6);
+    expect(out.attemptCount).toBe(6);
+    // Cap is 4 — retry reasons #5 (index 4) and later are dropped.
+    expect(out.retryReasons).toHaveLength(4);
+    expect(out.retryReasons?.[0]).toMatch(/fetch failed #0/);
+    expect(out.retryReasons?.[1]).toMatch(/fetch failed #1/);
+    expect(out.retryReasons?.[2]).toMatch(/fetch failed #2/);
+    expect(out.retryReasons?.[3]).toMatch(/fetch failed #3/);
+  });
 });
 
 // -----------------------------------------------------------------------------
@@ -389,5 +463,112 @@ describe('HttpLlmClient circuit-breaker (PR #10)', () => {
     });
     const out = await client.call('serv-nano', { system: 's', user: 'u' });
     expect(out.providerRoute).toBe('primary');
+  });
+
+  // ---------------------------------------------------------------------------
+  // v0.4.3 CB-latency-fix — PR #11
+  // The CircuitBreaker's p90 latency signal must reflect PROVIDER response time,
+  // not our wall-clock reaction to transient errors. Backoff waits between
+  // failed attempts inside callWithRetry must be subtracted before reporting
+  // to recordSuccess. Failures are still reported wall-clock (they populate
+  // failure_rate, not the latency window).
+  // ---------------------------------------------------------------------------
+  it('PR #11: first-attempt success — CB records wall-clock (backoff=0, no-op change)', async () => {
+    // Instrument sleep so we can measure the wall-clock the CB is asked about.
+    // With NO retries, backoffWaitedMs=0, netLatency == wallClock. The pre-fix
+    // and post-fix behavior are identical on this path.
+    const fetchImpl = vi.fn().mockResolvedValueOnce(makeOkResponse());
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: vi.fn().mockResolvedValue(undefined),
+      maxAttempts: 6,
+    });
+    const out = await client.call('serv-nano', { system: 's', user: 'u' });
+    expect(out.attemptCount).toBe(1);
+    expect(out.backoffWaitedMs).toBe(0);
+    const snap = client.circuitSnapshot();
+    // A single sample recorded; whatever wall-clock we observed is the sample.
+    expect(snap['serv-nano']?.sampleCount).toBe(1);
+    // p90 of a single non-negative number is non-negative. No spurious explosion.
+    expect(snap['serv-nano']?.p90LatencyMs).toBeGreaterThanOrEqual(0);
+    expect(snap['serv-nano']?.p90LatencyMs).toBeLessThan(5_000);
+  });
+
+  it('PR #11: 3-attempt success — CB p90 excludes backoff waits (does NOT trip on retry cluster)', async () => {
+    // Pre-fix: backoff ≥ 300ms + real network ≈ 400ms sample → fine here, but
+    // the important behavior is: the value reported to the CB EQUALS network
+    // time, NOT wall-clock. We assert p90 < wallClock by a margin larger than
+    // the network work could possibly consume.
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(makeOkResponse());
+    // Real sleep so wall-clock is a real, observable delay we can compare to.
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      maxAttempts: 6,
+      backoffBaseMs: 400,
+      backoffCapMs: 2_000,
+    });
+    const wallStart = Date.now();
+    const out = await client.call('serv-nano', { system: 's', user: 'u' });
+    const wallClock = Date.now() - wallStart;
+    expect(out.attemptCount).toBe(3);
+    // Two backoff waits: base*1 + base*2 + jitter = 400 + 800 + [0,1600) ≥ 1200ms.
+    expect(out.backoffWaitedMs).toBeGreaterThanOrEqual(1_200);
+    // Wall-clock includes those waits.
+    expect(wallClock).toBeGreaterThanOrEqual(out.backoffWaitedMs!);
+    // CB p90 must be netLatency = wallClock - backoffWaitedMs. With no real
+    // network fetch impl (vi.fn mock), netLatency is tiny — well under 500ms.
+    const snap = client.circuitSnapshot();
+    expect(snap['serv-nano']?.sampleCount).toBe(1);
+    const p90 = snap['serv-nano']?.p90LatencyMs ?? 0;
+    expect(p90).toBeLessThan(500);
+    // And critically: p90 must be strictly less than wallClock — the fix.
+    expect(p90).toBeLessThan(wallClock);
+  });
+
+  it('PR #11: retry cluster no longer trips the p90 window on a healthy provider', async () => {
+    // Regression harness for the exact Check-B pathology: a single retry-cluster
+    // draw producing an 18+ second wall-clock sample that would push p90 over
+    // the 15s threshold. With the fix, that same call reports a sub-second
+    // netLatency — the CB never trips despite the retries.
+    let call = 0;
+    const fetchImpl = vi.fn().mockImplementation(() => {
+      call++;
+      // First 4 calls of every retry-loop fail transiently; 5th succeeds.
+      if (call % 5 !== 0) return Promise.reject(new TypeError('fetch failed'));
+      return Promise.resolve(makeOkResponse());
+    });
+    // CB tuned exactly like production: p90 trip at 15s.
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: vi.fn().mockResolvedValue(undefined), // instant backoff waits
+      maxAttempts: 6,
+      backoffBaseMs: 5_000, // if these were reported to CB, each sample ≥ 15s
+      backoffCapMs: 20_000,
+      circuitBreakerConfig: {
+        minSamples: 3,
+        tripFailureRate: 0.99, // effectively disable failure-rate trip
+        tripP90LatencyMs: 15_000,
+        windowSize: 20,
+        cooldownMs: 60_000,
+      },
+    });
+    // 5 successful calls, each requiring 5 attempts (4 retries).
+    for (let i = 0; i < 5; i++) {
+      const out = await client.call('serv-nano', { system: 's', user: 'u' });
+      expect(out.attemptCount).toBe(5);
+      // With mocked sleep (returns immediately) the ACTUAL wall-clock and
+      // netLatency will both be tiny. What matters is that the CB was fed
+      // netLatency, not (wallClock + fake_backoff_of_60s).
+    }
+    const snap = client.circuitSnapshot();
+    // Five samples recorded; NONE tripped despite each call having 4 retries.
+    expect(snap['serv-nano']?.state).toBe('CLOSED');
+    expect(snap['serv-nano']?.sampleCount).toBe(5);
+    // p90 stays well below the 15s trip threshold — this is the whole point.
+    expect(snap['serv-nano']?.p90LatencyMs).toBeLessThan(15_000);
   });
 });
