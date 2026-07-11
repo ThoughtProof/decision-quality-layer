@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { runVerification } from './index.js';
 import { StubCascade } from './cascade.js';
 import { SandboxCascade } from './sandbox-cascade.js';
+import { CircuitAllOpenError } from './llm-client.js';
 import type { Cascade, CascadeInput, CascadeOutput } from './cascade.js';
 import type { AxisResult, DqlRequest } from '../types.js';
 
@@ -134,5 +135,40 @@ describe('runVerification', () => {
     const aVerdicts = a.axes.map((x) => x.verdict + ':' + x.confidence).join('|');
     const bVerdicts = b.axes.map((x) => x.verdict + ':' + x.confidence).join('|');
     expect(aVerdicts).toBe(bVerdicts);
+  });
+
+  it('maps CircuitAllOpenError to UNCERTAIN@0 with a fail-closed objection (PR #10)', async () => {
+    // Simulate a full-provider outage: cascade always throws CircuitAllOpenError.
+    const outageCascade: Cascade = {
+      async run(): Promise<CascadeOutput> {
+        throw new CircuitAllOpenError(
+          'serv-nano',
+          'serv-swift',
+          'failure rate 100% ≥ 50% over 5 samples',
+          'failure rate 100% ≥ 50% over 5 samples'
+        );
+      },
+    };
+
+    const out = await runVerification({
+      request: req,
+      cascade: outageCascade,
+      sandboxCascade: sandbox,
+      requestId: 'test_outage',
+      version: '0.1.0',
+    });
+
+    // Every axis must be UNCERTAIN@0 with the fail-closed marker in objection.
+    for (const axis of out.axes) {
+      expect(axis.verdict).toBe('UNCERTAIN');
+      expect(axis.confidence).toBe(0);
+      expect(axis.objection).toMatch(/Provider outage/);
+      expect(axis.objection).toMatch(/circuit-open/);
+      expect(axis.provider_route).toBe('fallback');
+    }
+
+    // Aggregate must NOT be ALLOW under provider outage. UNCERTAIN axes can
+    // only aggregate to REVIEW or BLOCK — that is the fail-closed contract.
+    expect(out.aggregate.verdict).not.toBe('ALLOW');
   });
 });

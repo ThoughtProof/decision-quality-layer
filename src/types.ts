@@ -89,6 +89,24 @@ export interface AxisResult {
   reasoning: string;
   /** Concrete objection if verdict is FAIL or UNCERTAIN. Empty on PASS. */
   objection: string;
+  /**
+   * Which SERV-internal route served the underlying model calls for this
+   * axis. Populated when at least one call in the cascade was routed via
+   * the circuit-breaker fallback path (PR #10). Absent = primary path only.
+   *
+   *   'primary'  — all calls in cascade used their requested alias.
+   *   'fallback' — at least one call in cascade was rerouted to its
+   *                fallback alias because the primary's circuit was OPEN.
+   *
+   * This is safety-relevant metadata: a spike of 'fallback' draws in a
+   * baseline run means the primary alias was degraded during the run and
+   * the reported verdicts may be a mix of primary+fallback — legitimate
+   * (both aliases are 0-false-allow-calibrated) but worth flagging.
+   *
+   * Older AxisResult readers that don't know this field see no behavior
+   * change (optional field).
+   */
+  provider_route?: 'primary' | 'fallback';
 }
 
 // -----------------------------------------------------------------------------

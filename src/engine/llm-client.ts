@@ -14,7 +14,7 @@
  * ADR-0007 in the Sentinel repo for the empirical basis of that pattern.
  *
  * Supported providers:
- *   - `serv`    — SERV provider (openserv.ai) - default for DQL cascade  
+ *   - `serv`    — SERV provider (openserv.ai) - default for DQL cascade
  *   - `openai`  — raw OpenAI chat-completions API
  *   - `groq`    — Groq chat-completions (OpenAI-compatible)
  *   - `mock`    — in-memory router, driven by MockRegistry (tests only)
@@ -32,13 +32,39 @@
  * UNCERTAIN@0 without any retry. The Suite-runner had an outer retry
  * wrapper but its 6×20s cap collapsed together with the fetch cutoff.
  *
- * This client now applies:
+ * This client applies:
  *   - Explicit AbortController-based per-request timeout (default 60s)
  *   - In-client retry loop with exponential backoff (default 6 attempts,
  *     base 800ms, cap 90s) on transient network / rate-limit errors
  *   - Retries are *inner* to the engine — the script-side RetryLlmClient
  *     stays as an outer belt-and-suspenders wrapper for suite runs
+ *
+ * Circuit breaker (PR #10, 2026-07-11):
+ * On top of retry+timeout, each SERV model alias has a CircuitBreaker that
+ * tracks failure rate AND p90 latency in a sliding window. When either
+ * threshold trips (e.g. Sentinel's "degraded but not failed" case at
+ * p90=22s), the alias goes OPEN and subsequent calls route to its
+ * fallback alias (nano↔swift). Both aliases run on the SAME openserv.ai
+ * host and use the SAME SERV_API_KEY — this is deliberate. Both models
+ * are 0-false-allow-calibrated against the adversarial suite; a foreign
+ * vendor (Groq / OpenAI) would silently downgrade that safety property.
+ *
+ * The tradeoff we accept:
+ *   ✅ SERV model overload (per-model queue, per-tier rate limit) is handled
+ *      by cross-tier failover — the common Sentinel-p90=22s case.
+ *   ❌ openserv.ai host-level outage (whole endpoint down, or SERV_API_KEY
+ *      revoked) collapses both circuits at once. In that state the client
+ *      throws CircuitAllOpenError, which the engine maps to a fail-closed
+ *      UNCERTAIN@0 verdict with an explicit objection. For a safety product
+ *      the correct default under provider outage is "escalate to human",
+ *      not "call an uncalibrated model".
+ *
+ * A cross-vendor fallback (Groq / OpenAI) is deliberately NOT in this PR.
+ * It requires a 0-false-allow eval gate on the fallback provider first;
+ * that work is tracked separately.
  */
+
+import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError } from './circuit-breaker.js';
 
 export interface LlmCallInput {
   system: string;
@@ -50,10 +76,44 @@ export interface LlmCallOutput {
   raw: string;
   modelUsed: string;
   latencyMs: number;
+  /**
+   * Which route served the call:
+   *   - 'primary'  — requested alias
+   *   - 'fallback' — fallback alias (primary circuit was OPEN)
+   *
+   * Populated on every call (not just non-primary) so downstream reporting
+   * can attribute EVERY draw to an actual SERV model. Older readers that
+   * ignore this field see no behavioral change.
+   */
+  providerRoute?: 'primary' | 'fallback';
 }
 
 export interface LlmClient {
   call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput>;
+}
+
+/**
+ * Thrown when both the primary alias circuit AND its fallback alias circuit
+ * are OPEN. The engine (src/engine/index.ts) maps this to a fail-closed
+ * UNCERTAIN@0 verdict with an explicit objection — for a safety product,
+ * "escalate to human" is the correct default under provider outage.
+ */
+export class CircuitAllOpenError extends Error {
+  constructor(
+    public readonly primaryAlias: string,
+    public readonly fallbackAlias: string | null,
+    public readonly primaryReason: string,
+    public readonly fallbackReason: string | null
+  ) {
+    super(
+      fallbackAlias
+        ? `[llm-client] both circuits open: ${primaryAlias} (${primaryReason}) and ${fallbackAlias} (${fallbackReason})`
+        : fallbackReason
+          ? `[llm-client] fail-closed on ${primaryAlias} (${primaryReason}) — ${fallbackReason}`
+          : `[llm-client] circuit open and no fallback configured: ${primaryAlias} (${primaryReason})`
+    );
+    this.name = 'CircuitAllOpenError';
+  }
 }
 
 /**
@@ -73,6 +133,17 @@ export interface ModelBinding {
   /** Name of the env var that carries the API key. */
   apiKeyEnv: string;
   baseUrl: string;
+  /**
+   * SERV-internal fallback alias for circuit-breaker routing. When this
+   * alias's circuit is OPEN, calls route to the fallback alias's binding
+   * (which MUST also be present in the same ModelMap). Set to null / undef
+   * for aliases that have no fallback — in that case CircuitAllOpenError is
+   * thrown as soon as the alias circuit opens.
+   *
+   * IMPORTANT: fallback aliases MUST be pre-validated for the same safety
+   * property (0 false_allows on the adversarial suite). See PR #10 body.
+   */
+  fallbackAlias?: string | null;
 }
 
 export const DEFAULT_MODEL_MAP: Record<string, ModelBinding> = {
@@ -84,6 +155,7 @@ export const DEFAULT_MODEL_MAP: Record<string, ModelBinding> = {
     modelId: 'serv-nano',
     apiKeyEnv: 'SERV_API_KEY',
     baseUrl: process.env.SERV_BASE_URL ?? 'https://inference-api.openserv.ai/v1',
+    fallbackAlias: 'serv-swift',
   },
   // Secondary — SERV serv-swift. The cross-family strength comes from serv-swift
   // being a distinct, larger SERV model than serv-nano (mirrors Sentinel's
@@ -93,6 +165,7 @@ export const DEFAULT_MODEL_MAP: Record<string, ModelBinding> = {
     modelId: 'serv-swift',
     apiKeyEnv: 'SERV_API_KEY',
     baseUrl: process.env.SERV_BASE_URL ?? 'https://inference-api.openserv.ai/v1',
+    fallbackAlias: 'serv-nano',
   },
 };
 
@@ -113,9 +186,40 @@ export interface HttpLlmClientConfig {
   sleep?: (ms: number) => Promise<void>;
   /** Injection point for tests — fetch. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
+  /**
+   * Config passed to every CircuitBreaker instance the client creates.
+   * Leave undefined to accept CircuitBreaker defaults.
+   */
+  circuitBreakerConfig?: CircuitBreakerConfig;
+  /**
+   * Disable circuit-breaker routing entirely. Every call goes straight to
+   * its requested alias; no failover, no fail-closed. Intended for tests
+   * and for the specific baseline runs that predate PR #10. Default: false.
+   */
+  disableCircuitBreaker?: boolean;
+  /**
+   * Capital-path mode: when a Primary circuit is OPEN, DO NOT route to the
+   * SERV-internal fallback alias. Instead throw CircuitAllOpenError so the
+   * engine emits UNCERTAIN@0 (fail-closed).
+   *
+   * Rationale (PR #10):
+   * The fallback alias (nano↔swift) has only been smoke-verified against
+   * Suite v1.1 (8 cases) with 0 safety regressions. The full 100-case
+   * adversarial swift-recertification is scheduled as v0.4.3 fast-follow.
+   * Until then, code paths that dispatch REAL CAPITAL — live trading,
+   * Revolut, sentinel.thoughtproof.ai in prod — MUST set this flag so a
+   * SERV-internal outage escalates to human review instead of being served
+   * by an under-certified fallback model.
+   *
+   * Benchmark / eval runners set this to false (default) so Baseline
+   * survival during SERV overload windows is preserved.
+   *
+   * Default: false. Flip to true in prod-capital deploys until v0.4.3.
+   */
+  capitalPathMode?: boolean;
 }
 
-const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl'>> = {
+const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'disableCircuitBreaker' | 'capitalPathMode'>> = {
   timeoutMs: 60_000,
   maxAttempts: 6,
   backoffBaseMs: 800,
@@ -136,9 +240,13 @@ const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
 // -----------------------------------------------------------------------------
 
 export class HttpLlmClient implements LlmClient {
-  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl'>>;
+  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'disableCircuitBreaker' | 'capitalPathMode'>>;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
+  private readonly circuitBreakers: Map<string, CircuitBreaker> = new Map();
+  private readonly circuitBreakerConfig: CircuitBreakerConfig | undefined;
+  private readonly disableCircuitBreaker: boolean;
+  private readonly capitalPathMode: boolean;
 
   constructor(
     private readonly modelMap: Record<string, ModelBinding> = DEFAULT_MODEL_MAP,
@@ -153,6 +261,31 @@ export class HttpLlmClient implements LlmClient {
     };
     this.sleep = config.sleep ?? defaultSleep;
     this.fetchImpl = config.fetchImpl ?? fetch;
+    this.circuitBreakerConfig = config.circuitBreakerConfig;
+    this.disableCircuitBreaker = config.disableCircuitBreaker ?? false;
+    this.capitalPathMode = config.capitalPathMode ?? false;
+  }
+
+  /**
+   * Lazily construct a CircuitBreaker per alias. Kept private — no caller
+   * should hold a stable ref because Map identity is per-client-instance.
+   */
+  private getBreaker(alias: string): CircuitBreaker {
+    let cb = this.circuitBreakers.get(alias);
+    if (!cb) {
+      cb = new CircuitBreaker(alias, this.circuitBreakerConfig);
+      this.circuitBreakers.set(alias, cb);
+    }
+    return cb;
+  }
+
+  /** Snapshot of every alias circuit — for telemetry / test assertions. */
+  circuitSnapshot(): Record<string, ReturnType<CircuitBreaker['snapshot']>> {
+    const out: Record<string, ReturnType<CircuitBreaker['snapshot']>> = {};
+    for (const [alias, cb] of this.circuitBreakers) {
+      out[alias] = cb.snapshot();
+    }
+    return out;
   }
 
   async call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput> {
@@ -160,10 +293,124 @@ export class HttpLlmClient implements LlmClient {
     if (!binding) {
       throw new Error(`[llm-client] unknown model alias: ${modelAlias}`);
     }
+
+    // Fast path: circuit-breaker disabled (tests, or explicit opt-out for
+    // legacy baseline runs). Behavior identical to pre-PR-10.
+    if (this.disableCircuitBreaker) {
+      const out = await this.callWithRetry(binding, input);
+      return { ...out, providerRoute: 'primary' };
+    }
+
+    // Try primary. If its circuit is OPEN, route to fallback alias —
+    // UNLESS we're in capital-path mode, where fail-closed is mandatory
+    // until v0.4.3 recertifies the fallback alias on the full 100-case suite.
+    const primaryBreaker = this.getBreaker(modelAlias);
+    try {
+      primaryBreaker.canProceed();
+    } catch (err) {
+      if (err instanceof CircuitOpenError) {
+        if (this.capitalPathMode) {
+          throw new CircuitAllOpenError(modelAlias, null, err.reason, 'capital-path-mode: fallback disabled until v0.4.3 recertification');
+        }
+        return await this.callViaFallback(modelAlias, binding, input, err.reason);
+      }
+      throw err;
+    }
+
+    // Circuit is CLOSED (or HALF_OPEN probe was granted) — primary attempt.
+    const started = Date.now();
+    try {
+      const out = await this.callWithRetry(binding, input);
+      primaryBreaker.recordSuccess(Date.now() - started);
+      return { ...out, providerRoute: 'primary' };
+    } catch (err) {
+      // Use wall-clock elapsed since the primary attempt began. Retries and
+      // backoff waits inside callWithRetry are legitimately part of the
+      // observed latency — that IS what "this call took N ms" means.
+      primaryBreaker.recordFailure(Date.now() - started);
+      // If the circuit just tripped from this failure, try fallback for the
+      // very SAME call — the caller shouldn't eat one "cold" failure per trip.
+      // In capital-path mode, fail-closed instead of routing to fallback.
+      if (primaryBreaker.snapshot().state === 'OPEN') {
+        if (this.capitalPathMode) {
+          throw new CircuitAllOpenError(
+            modelAlias,
+            null,
+            primaryBreaker.snapshot().lastTripReason,
+            'capital-path-mode: fallback disabled until v0.4.3 recertification'
+          );
+        }
+        return await this.callViaFallback(
+          modelAlias,
+          binding,
+          input,
+          primaryBreaker.snapshot().lastTripReason
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Route a call to the primary's fallback alias. If the primary has no
+   * fallback configured, or the fallback's own circuit is also OPEN, throw
+   * CircuitAllOpenError — the engine will map that to a fail-closed verdict.
+   */
+  private async callViaFallback(
+    primaryAlias: string,
+    primaryBinding: ModelBinding,
+    input: LlmCallInput,
+    primaryReason: string
+  ): Promise<LlmCallOutput> {
+    const fallbackAlias = primaryBinding.fallbackAlias ?? null;
+    if (!fallbackAlias) {
+      throw new CircuitAllOpenError(primaryAlias, null, primaryReason, null);
+    }
+    const fallbackBinding = this.modelMap[fallbackAlias];
+    if (!fallbackBinding) {
+      throw new Error(
+        `[llm-client] fallbackAlias '${fallbackAlias}' for '${primaryAlias}' not in modelMap`
+      );
+    }
+    const fallbackBreaker = this.getBreaker(fallbackAlias);
+    try {
+      fallbackBreaker.canProceed();
+    } catch (err) {
+      if (err instanceof CircuitOpenError) {
+        throw new CircuitAllOpenError(
+          primaryAlias,
+          fallbackAlias,
+          primaryReason,
+          err.reason
+        );
+      }
+      throw err;
+    }
+
+    const started = Date.now();
+    try {
+      const out = await this.callWithRetry(fallbackBinding, input);
+      fallbackBreaker.recordSuccess(Date.now() - started);
+      return { ...out, providerRoute: 'fallback' };
+    } catch (err) {
+      fallbackBreaker.recordFailure(Date.now() - started);
+      throw err;
+    }
+  }
+
+  /**
+   * The original retry-loop, extracted so both primary and fallback paths
+   * share behavior. Does NOT touch any circuit breaker — caller records
+   * outcome on the appropriate breaker.
+   */
+  private async callWithRetry(
+    binding: ModelBinding,
+    input: LlmCallInput
+  ): Promise<LlmCallOutput> {
     const apiKey = this.env[binding.apiKeyEnv];
     if (!apiKey) {
       throw new Error(
-        `[llm-client] missing env var ${binding.apiKeyEnv} for model alias ${modelAlias}`
+        `[llm-client] missing env var ${binding.apiKeyEnv} for provider ${binding.provider}`
       );
     }
 
