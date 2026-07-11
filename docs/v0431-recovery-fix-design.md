@@ -1,98 +1,197 @@
-# v0.4.3.1 CB Recovery Fix — Design
+# v0.4.3.1 CB Recovery Fix — Design Draft (Sub-Option 3, benchmark-only soft-OPEN)
 
 **Status**: BLOCKING v0.4.3 Recert
-**Priority**: escalated from v0.4.4 roadmap → v0.4.3.1 blocking
-**Author**: Perplexity (recording Hermes' decision)
+**Priority**: v0.4.3.1 blocking (was formerly v0.4.4 roadmap)
+**Author**: Perplexity (recording Hermes' architectural decision)
 **Date**: 2026-07-11
+**Iteration**: v2 (Hermes rejected Sub-Option 2, chose Sub-Option 3 with capital-path safety carve-out)
 
-## Problem (recap)
+---
 
-Vollrun `v043-cb-latency-fix @ cb9d83a` (workers=1, 100 cases × N=5):
+## Was Hermes entschieden hat
 
-- Case 1-16: 100% swift-primary, 15/17 gt_match (88,2%) in Segment A
-- Case 17: legitimer p90-Trip auf swift (retry-Cluster, 270s wall-clock)
-- Case 18-100: **83 Cases in Folge kein einziger primary-Call** — CB persistent-OPEN
+**Sub-Option 3 (soft-OPEN)**, mit vier harten Präzisierungen:
 
-Root cause: HALF_OPEN probe uses the same real-traffic Achsen-Prompts, in the same swift-Latenz-Umgebung. Any probe attempt immediately re-trips (p90-Fenster wird sofort wieder überschritten). Der CB kann in dieser Konfiguration nach einem legitimen Trip **nie recovern**, bis Prozess-Restart oder manueller Redeploy.
+1. **capitalPathMode=true → kein soft-Recovery**. Dort bleibt das heutige fail-closed-Verhalten unverändert. Recovery-Automatik ist ein Verfügbarkeits-Feature für Benchmark-Runs, kein Kapital-Pfad-Feature.
+2. **Traffic ist die Probe, kein synthetisches Payload**. Reale DQL-Achsen-Calls im soft-OPEN-Regime — 1 von N durchgelassen, Rest fallback. Beobachten statt raten.
+3. **Logik gehört in `HttpLlmClient.call()` Routing-Schicht**, nicht in die `CircuitBreaker`-Klasse. Die CB bleibt eine kontext-freie State-Machine ohne Wissen über capitalPathMode.
+4. **Prozess-Regel** (retroaktiv seit 2026-07-11): "fertig" = committed + gepusht + Rohdaten/Manifest gepusht.
 
-## Verworfene Design-Option: 50-Token-Ping-Probe
+**Verworfen**:
 
-Ich hatte in der ersten Session-Skizze einen "synthetic 50-token ping"-Probe vorgeschlagen. **Hermes hat das verworfen mit korrekter Begründung**:
+- Sub-Option 2 (zeit-basierter Cooldown mit Window-Flush) — rät statt zu messen, "3 echte Calls in Folge" nach Cooldown-Ablauf setzt ungetesteten Provider auf realen Traffic scharf, Flapping mit Zeitverzögerung.
+- 50-Token-Ping (formerly Option A) — Probe-Latenz spiegelt echte Achsen-Latenz nicht wider, Circuit flappt.
 
-> Der Probe muss reale Achsen-Latenz widerspiegeln. Sonst flappt der Circuit: Probe passes (weil trivial) → HALF_OPEN → echter DQL-Traffic mit realistischen 5s-Reasoning-Tokens trippt sofort wieder → OPEN. Cycle wiederholt sich ohne progress.
+---
 
-**Konsequenz**: Ein Probe, dessen Latenz nicht dem echten Achsen-Verhalten entspricht, ist funktional äquivalent zu "keinem Probe" — er misst eine andere Größe als der Trip-Detector, und die beiden Signale entkoppeln sich.
+## Wo genau der Fix ansetzt (Code-Anker)
 
-## Design-Anforderungen (Hermes-Freigabe erforderlich)
+Kein Change in `src/engine/circuit-breaker.ts`. Die CB behält ihre 3 States (CLOSED / OPEN / HALF_OPEN) und bleibt kontext-frei.
 
-Der Probe MUSS:
+**Alle Changes in `src/engine/llm-client.ts`**, spezifisch im Routing-Teil von `HttpLlmClient.call()`. Die capitalPathMode-Verzweigung existiert bereits an Z330 (primary trip) und Z364 (fallback trip); die soft-OPEN-Logik läuft parallel dazu.
 
-1. **Achsen-shape haben** — vollständiger DQL-Achsen-Prompt (system + user + reasoning), 5s+ token generation, gleiche Model-Config wie echter Traffic
-2. **Deterministisch reproduzierbar** — feste Achsen-Prompt-Vorlage, nicht aus dem echten Traffic gezogen (sonst wird Probe = Traffic, kein separates Signal)
-3. **Trip-Threshold-konsistent** — Probe-Latenz zählt in dasselbe p90-Fenster wie echter Traffic ODER in ein probe-eigenes Fenster mit expliziter Recovery-Semantik
-4. **Recovery-Signal von Trip-Signal getrennt haltbar** — sonst haben wir das gleiche Coupling-Problem wie im 50-Token-Ping, nur mit realistischen Latenzen
+Konzeptionell:
 
-## Skizze — 3 Sub-Optionen zur Diskussion
+```
+call(alias, prompt) {
+  breaker = getBreaker(alias)
 
-### Sub-Option 1: Probe-Achse mit Toleranz-Fenster
+  if (breaker.state === 'OPEN' && !capitalPathMode) {
+    // soft-OPEN gate: nur benchmark
+    if (shouldLetThrough(alias)) {
+      // dieser Call wird als Recovery-Sample benutzt
+      result = tryPrimary()
+      registerRecoverySample(alias, result.latency, result.failed)
+      return result  // oder fallback wenn tryPrimary getripped
+    } else {
+      // Standard fallback path (rest der N-1 Calls)
+      return fallback()
+    }
+  }
 
-- Probe ist ein **fixer 4-Turn-Achsen-Prompt** (system + 3 messages, ~500 tokens context, erwartete Output-Länge ~200 tokens) — bewusst gewählt aus der niedrigeren Perzentile der echten Suite-Prompt-Distribution
-- Probe-Latenz wird gemessen und **nicht** ins Trip-Fenster gezählt. Stattdessen: HALF_OPEN → probe → wenn Latenz ≤ 1,3× median(letzte 10 successful pre-trip primary latencies), CLOSED; sonst zurück zu OPEN
-- **Vorteil**: reale Achsen-shape, aber Recovery-Threshold ist dynamisch relativ zum pre-trip-Verhalten (nicht statisch)
-- **Risiko**: 1,3×-Faktor ist Hyperparameter, muss kalibriert werden
+  // capitalPathMode=true: klassisches Verhalten, kein soft-OPEN
+  // canProceed() throws → fail-closed über CircuitAllOpenError
+  ...
+}
+```
 
-### Sub-Option 2: Zeit-basierte Recovery + Achsen-Sample-Bootstrap
+---
 
-- Nach OPEN: fixe cooldown-Zeit (z.B. 5 Min, konfigurierbar)
-- Nach cooldown: HALF_OPEN, aber der p90-Fenster wird **explizit geflushed** (kein Sample-Carry-over)
-- 3 echte Achsen-Calls in Folge müssen unter Trip-Threshold liegen, dann CLOSED
-- Falls einer trippt: zurück zu OPEN, cooldown neu
-- **Vorteil**: keine Probe-Traffic-Entkoppelung, natürlicher recovery über echten Traffic
-- **Risiko**: bei anhaltender Provider-Latenz wird der Circuit ewig oszillieren (OPEN → 5min wait → HALF_OPEN → trip → OPEN → 5min wait ...). Der Cooldown muss lang genug sein, dass Provider-Anomalien realistischerweise abgeklungen sind (5 Min ist evtl. zu kurz).
+## State-Machine (nur soft-OPEN-Erweiterung)
 
-### Sub-Option 3: Zwei-Ebenen CB (soft-OPEN + hard-OPEN)
+Der CircuitBreaker selbst kennt nur CLOSED / OPEN / HALF_OPEN wie heute. Die soft-OPEN-Semantik ist eine **Router-Interpretation** von "state=OPEN + capitalPathMode=false":
 
-- Bei Trip: **soft-OPEN** — HALF_OPEN-artiges Verhalten, aber statt 1 Probe wird **jeder N-te Traffic-Call durchgelassen** (z.B. jeder 5.). Andere Calls gehen fallback.
-- Wenn 3 durchgelassene Calls in Folge unter Trip-Threshold: CLOSED
-- Wenn irgendein durchgelassener Call trippt: **hard-OPEN**, klassisches HALF_OPEN-mit-Cooldown (wie heute)
-- **Vorteil**: kein separater Probe, natürlicher Übergang, kein Traffic-Verlust während Recovery-Test
-- **Risiko**: komplexere State-Machine, mehr Test-Fläche, capitalPathMode-Semantik bei soft-OPEN nicht offensichtlich
+```
+CLOSED
+  ↓ (trip via p90 oder failure_rate)
+OPEN
+  ↓ (Router-side, benchmark-only): "soft-OPEN" — 1 von N Calls wird durchgelassen
+  ├─ Sample-Sequenz akkumuliert im Router (nicht im CB-Sample-Window)
+  ├─ 3 aufeinanderfolgende Samples unter tripP90LatencyMs → recordSuccess()×3 auf den CB → CB von OPEN direkt zurück nach CLOSED
+  └─ irgendein Sample über Threshold → Router markiert "hard-OPEN"
+     ↓
+HARD-OPEN
+  ↓ (klassisches HALF_OPEN-mit-cooldown via canProceed(), wie heute)
+  Recovery nur durch cooldownMs-Ablauf → HALF_OPEN probe → success → CLOSED
+```
 
-## Meine Empfehlung (Diskussions-Basis für Hermes)
+**Wichtig**: Der CB weiß nichts von "soft" vs "hard" OPEN. Der Router entscheidet basierend auf `(cb.state, capitalPathMode, softOpenAttempts, softOpenSuccesses)`.
 
-**Sub-Option 2** ist am einfachsten und am wenigsten Hyperparameter-abhängig. Aber der Cooldown-Wert ist kritisch — zu kurz = flapping, zu lang = zu träge bei echter Provider-Recovery.
+## Sample-Kontabilität
 
-Konkreter Vorschlag zur Kalibrierung:
+Die 3 Sample-Sequenz-Zählung darf **nicht** in `CircuitBreaker.samples[]` gespeichert werden — das würde die Trip-Logik verändern. Stattdessen:
 
-- Base cooldown = 5 Min
-- Bei re-trip innerhalb 30 Min: cooldown × 2 (exponential backoff bis max 60 Min)
-- Bei 60 Min continuous CLOSED: cooldown-Zähler reset
+- **Router-lokale Struktur** pro Alias: `{ softOpenAttempts: 0, softOpenConsecutiveSuccesses: 0, softOpenActive: boolean }`
+- Bei Successful Recovery-Sample: `softOpenConsecutiveSuccesses++`; wenn `>= K` (Threshold, siehe unten), rufe `breaker.recordSuccess()` mehrfach mit dem gemessenen latency, um die Trip-Bedingung zurückzusetzen → CB transitioniert transparent zurück auf CLOSED via seine eigene Recovery-Logik
+- Bei irgendeinem Sample über Threshold ODER Failed Call: `softOpenActive = false`, `softOpenConsecutiveSuccesses = 0`, Router fällt zurück auf HARD-OPEN-Interpretation → CB.canProceed() throwt weiter
 
-Das ist **defensiv**: der CB gibt langsam Vertrauen zurück, verweigert es aber schnell bei wiederholtem Fehlverhalten.
+**Alternative**: eigene Router-Methode `breaker.transitionOpenToClosed()` — expliziter, aber verändert die CB-API. Auf 4 Augen zu diskutieren: nutze ich `recordSuccess`×K als natürliche State-Transition, oder eine explizite `reset()`-artige Methode?
 
-**Aber**: das ist mein Vorschlag, nicht das entschiedene Design. Ich baue nichts davon ohne dein explizites Signal auf eine Sub-Option + Parameter.
+Meine Präferenz: `recordSuccess`×K. Grund: kein neuer API-Punkt in der CB, die Success-Latenzen sind echte Samples (nicht synthetische), und die CB-eigene Recovery-Logik (HALF_OPEN → CLOSED bei probeMaxLatencyMs-under-Verhalten) macht die Arbeit ohne dass wir sie extern erzwingen.
 
-## Testing-Anforderungen
+**Aber**: das bedeutet der CB muss den ersten Recovery-Sample als HALF_OPEN-Probe akzeptieren. Aktuell erlaubt `canProceed()` HALF_OPEN nur nach cooldownMs-Ablauf. Wir umgehen das:
 
-Egal welche Sub-Option:
+- Router ruft `breaker.canProceed()` NICHT im soft-OPEN-Regime (er weiß dass es OPEN ist und würde throwen)
+- Router ruft direkt `breaker.recordSuccess(latency)` mit dem gemessenen Sample
+- Nach K aufeinanderfolgenden Success-Samples unter Threshold: CB-`samples[]` enthält K Werte die alle unter tripP90LatencyMs sind → **aber** die CB ist noch OPEN, weil `state` sich nur in `canProceed()` ändert
 
-- Unit tests: state machine (CLOSED → OPEN → recovery-attempt → CLOSED oder OPEN)
-- Integration test: real openserv-Call-Cluster, künstlicher Trip induziert, dann verifizieren dass Recovery innerhalb realistischer Zeit stattfindet
-- **Regression test**: der Vollrun `v043_swift_primary_recert_w1.jsonl` MUSS mit dem Fix bis Case 100 primary-Anteil > 80% zeigen. Das ist das messbare Erfolgs-Signal.
+**Das ist die Design-Lücke, die ich noch nicht sauber gelöst habe.** Zwei Wege:
 
-## Was blockiert bis zur Fertigstellung
+**Weg A**: Router ruft nach K erfolgreichen Samples explizit `breaker.forceClose()` (neue CB-API). Klar, aber CB-API-Erweiterung.
 
-- v0.4.3 Recert (capitalPathMode=false auf Prod-Kapital)
-- Jeder weitere swift-primary Vollrun (bringt kein neues Signal ohne Recovery)
+**Weg B**: Router setzt `openedAt` zurück auf `now - cooldownMs - 1` bevor er `canProceed()` ruft. Dann läuft der letzte Recovery-Sample durch den normalen HALF_OPEN-Pfad. Hacky, benutzt private State.
 
-## Was NICHT blockiert wird
+**Meine Empfehlung**: Weg A. `forceClose(reason: string)` als expliziter Router-Escape-Hatch, mit Telemetrie-Log. Sauber, testbar, dokumentiert.
 
-- PR #11 kann so gemerged werden (der Fix ist korrekt und Voraussetzung für v0.4.3.1) — aber ohne v0.4.3.1 fertig, kein Recert-Merge auf Prod-Kapital-Pfaden
-- Suite v1.2 Arbeit (unabhängig)
-- Retry-Bug adv_084/adv_098 (separater Track)
+---
 
-## Prozess-Regel (retroaktiv seit dieser Session)
+## Parameter (Draft zur Kalibrierung)
 
-**"Fertig" = Code committed + gepusht auf origin + Rohdaten + Report + Manifest gepusht.**
+Alle Parameter benchmark-only (`capitalPathMode=false`), im `HttpLlmClientConfig`:
 
-Die Session hier hat gezeigt, dass "gepusht" nicht implizit angenommen werden darf. Ab jetzt gehört der Push explizit in jeden Statusbericht.
+| Parameter | Vorschlag | Begründung |
+|---|---|---|
+| `softOpenSampleRate` | 1 von N=5 Calls durchgelassen | Balance zwischen Recovery-Speed und Fallback-Anteil. Bei N=5 ist der Router zu 80% im fallback, zu 20% im Recovery-Test — genug Signal, wenig Traffic-Risiko. |
+| `softOpenConsecutiveThreshold` | K=3 aufeinanderfolgende Samples unter tripP90LatencyMs | Hoch genug dass ein einzelner Lucky-Call nicht schließt, niedrig genug für sinnvolle Recovery-Zeit. Bei sampleRate=1/5 = 3 Samples ≈ 15 Verifikationen wall. |
+| `softOpenLatencyBound` | inherit `tripP90LatencyMs` (aktuell 15_000ms) | Konsistenz mit Trip-Threshold — recovery erfordert dieselbe Latenz-Klasse die Trip auslösen würde. |
+| `softOpenHardTripAfter` | 1 (bei erstem Sample über Threshold: sofort hard-OPEN) | Keine zweite Chance im soft-OPEN. Ein einziger schlechter Sample = Provider nicht recovered. |
+
+**Hermes' Hinweis war explizit**: K=3 muss hoch genug sein für Robustheit. Meine Frage zurück: **K=3 oder K=5?** Bei sampleRate=1/5, N=100 Cases × 5 draws × 5 axes = 2500 total axis calls:
+
+- K=3: Recovery frühestens nach ~15 axes (~3 Verifikationen) im soft-OPEN
+- K=5: Recovery frühestens nach ~25 axes (~5 Verifikationen)
+
+Vollrun-Beispiel: nach Trip bei adv_017 (Case 17), bei K=3 wäre Recovery frühestens bei Case ~20 möglich. Bei K=5 frühestens bei Case ~22. Beide führen zu **~80% primary-Anteil über 100 Cases**, was das Empirisch-Kriterium erfüllt. K=5 defensiver.
+
+Meine Empfehlung: **K=5**, weil das Empirisch-Kriterium (>80% primary) mit beiden erreichbar ist und K=5 mehr Puffer gegen "einmal Glücks-Call in einer instabilen Umgebung" bietet.
+
+---
+
+## Interaktion mit capitalPathMode=true
+
+Klar und einfach: **soft-OPEN wird niemals aktiv wenn `capitalPathMode=true`**.
+
+Konkret im Router:
+
+```typescript
+// Pseudocode
+if (breaker.state === 'OPEN') {
+  if (this.capitalPathMode) {
+    // Klassisches Verhalten: kein Fallback, kein soft-OPEN
+    breaker.canProceed()  // throwt CircuitOpenError → engine fail-closed
+  } else {
+    // benchmark-Pfad: soft-OPEN mit sampling
+    if (this.shouldSoftOpenSample(alias)) {
+      return await this.tryWithRecoveryTracking(alias, ...)
+    } else {
+      return await this.fallback(alias, ...)  // ohne soft-OPEN-Zählung
+    }
+  }
+}
+```
+
+Konsequenz bei Prod-Kapital-Pfaden nach einem Trip: **wie heute** — CircuitAllOpenError → UNCERTAIN@0 → Alarm → Mensch. Die Verfügbarkeits-Debt bleibt bewusst offen; sie wird durch **Betriebsverfahren** (Alerting + manueller Redeploy) gemanaged, nicht durch Auto-Recovery, weil "auto-scharf-schalten" auf einem Kapital-Pfad das falsche Trade-off ist.
+
+Das ist eine **absichtliche Design-Entscheidung**, keine TODO. Wenn wir später Verfügbarkeits-Automatik auf Kapital-Pfaden wollen, ist das ein separater Ticket mit anderen Anforderungen (Kanari, tiered rollout, manuelle Freigabe).
+
+---
+
+## Tests
+
+**Neue Unit tests im Router** (nicht in circuit-breaker.test.ts):
+
+1. `softOpen: capitalPathMode=true → no soft-OPEN attempts, fail-closed on CircuitOpenError` — beweist die Sicherheitsregel
+2. `softOpen: capitalPathMode=false, state=OPEN → 1 von 5 Calls geht durch, rest fallback` — Sampling-Rate
+3. `softOpen: K=5 consecutive samples under threshold → CB force-closed, subsequent traffic primary` — Recovery-Bedingung
+4. `softOpen: sample over threshold → hard-OPEN, kein weiterer soft-OPEN attempt bis cooldown` — Escape-Path
+5. `softOpen: capitalPathMode wechselt zwischen calls von false auf true → soft-OPEN-Attempts sofort gestoppt` — Race-Condition
+
+**Empirisches Kriterium (das eigentliche Gate)**:
+
+- Vollrun-Rerun `v043_swift_primary_recert_w1` mit dem Fix MUSS zeigen: **primary-Route-Anteil > 80% über alle 100 Cases**, capitalPathMode=false
+- Sekundär: capitalPathMode=true-Vollrun (falls neu gebaut) MUSS gleiches Verhalten wie ohne Fix zeigen (fail-closed, keine soft-Recovery) — beweist die Sicherheitsregel unter echtem Traffic
+
+---
+
+## Was ich als Nächstes NICHT tue
+
+- Kein Code bis wir den Draft durch haben
+- Kein Kompilieren, keine Tests, kein Push
+- Kein PR-Draft für v0.4.3.1
+
+## Was ich als Nächstes tue, wenn du Draft freigibst
+
+1. Router-Logik in `HttpLlmClient.call()` implementieren, `capitalPathMode`-Verzweigung erweitern
+2. `CircuitBreaker.forceClose(reason)` als expliziten Router-Escape-Hatch, mit Test dass er nur aus dem Router aufgerufen wird
+3. Config: `softOpenSampleRate` (N=5 default), `softOpenConsecutiveThreshold` (K=5 default), `softOpenLatencyBound` (inherit tripP90LatencyMs), `softOpenHardTripAfter` (1 default)
+4. 5 neue Router-Tests wie oben
+5. Vollrun-Rerun `v043_swift_primary_recert_w1` mit dem Fix, workers=1, N=5, ~24 Min wall
+6. Rohdaten + Report + Manifest auf `dql-benchmark/main` VOR PR-Öffnung
+7. PR (v0.4.3.1) auf `decision-quality-layer/v043-cb-latency-fix` (aufbauend auf PR #11) oder neuer Branch — deine Wahl
+
+## Offene Design-Fragen an dich
+
+1. **K=3 oder K=5**? Ich empfehle K=5 (defensiver). Argument dagegen: Recovery langsamer, längere Fallback-Phase im Vollrun.
+2. **`CircuitBreaker.forceClose(reason)` als neue Public-API** — ok, oder soll die State-Transition anders erzwungen werden? Ich sehe keinen sauberen Weg ohne API-Erweiterung.
+3. **Branch-Strategie**: v0.4.3.1 auf `v043-cb-latency-fix` draufsetzen (dann ein PR mit beiden Fixes), oder eigener Branch `v043-cb-recovery-fix` von `v043-cb-latency-fix` abgezweigt (zwei PRs, klarer trennbar)? Meine Präferenz: eigener Branch, klare Bounded-Reviews.
+4. **Telemetrie**: Wollen wir Recovery-Attempts als eigenes Event loggen (für Observability), oder reicht die Standard-CB-State-Transition-Log-Line?
