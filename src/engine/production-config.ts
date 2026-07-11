@@ -533,11 +533,25 @@ export function resolveProductionConfig(
     reasons,
   );
 
-  // --- v0431-active shadow-mode invariant (B2) --------------------------
+  // --- v0431-active shadow-mode invariant (B2 + Hermes H2 fix) ---------
   // If v0431_active=true in pot-cli, per-alias CB overrides MUST be
-  // provided explicitly for EVERY known alias. This forbids the "canary
-  // ON but relying on baseline defaults" configuration — which would
-  // silently apply v0.4.3 knobs while looking calibrated.
+  // provided explicitly for EVERY known alias AND every alias object MUST
+  // explicitly set every policy-relevant CB field. This forbids the
+  // "canary ON but relying on baseline defaults" configuration — which
+  // would silently apply v0.4.3 knobs while looking calibrated. Empty
+  // or partial objects (e.g. { 'serv-nano': {} }) are rejected here.
+  //
+  // Required fields per alias (policy-relevant knobs the resolver hashes):
+  //   - tripP90LatencyMs
+  //   - tripFailureRate
+  //   - cooldownMs
+  // If further CB knobs become resolver-visible in a later commit, add
+  // them here so ACTIVE keeps requiring an EXPLICIT value for each.
+  const V0431_REQUIRED_CB_FIELDS = [
+    'tripP90LatencyMs',
+    'tripFailureRate',
+    'cooldownMs',
+  ] as const;
   if (v0431Active && mode === 'pot-cli') {
     const raw = env.DQL_CB_CONFIG_BY_ALIAS;
     if (raw === undefined || raw === '') {
@@ -554,6 +568,34 @@ export function resolveProductionConfig(
           reasons.push(
             `DQL_V0431_ACTIVE=true requires DQL_CB_CONFIG_BY_ALIAS entries for [${missing.join(', ')}]; got ${JSON.stringify(Object.keys(parsed))}`,
           );
+        }
+        // Hermes H2: every alias entry must be a NON-EMPTY object that
+        // explicitly sets each policy-relevant field. Empty {} or partial
+        // objects that would silently inherit baseline defaults are
+        // rejected here so a canary deploy cannot look "calibrated"
+        // while actually running defaults.
+        for (const alias of KNOWN_ALIASES) {
+          if (!(alias in parsed)) continue; // already reported above
+          const entry = parsed[alias];
+          if (
+            entry === null ||
+            typeof entry !== 'object' ||
+            Array.isArray(entry)
+          ) {
+            reasons.push(
+              `DQL_V0431_ACTIVE=true requires DQL_CB_CONFIG_BY_ALIAS['${alias}'] to be a non-null object`,
+            );
+            continue;
+          }
+          const entryObj = entry as Record<string, unknown>;
+          const missingFields = V0431_REQUIRED_CB_FIELDS.filter(
+            (f) => !(f in entryObj),
+          );
+          if (missingFields.length > 0) {
+            reasons.push(
+              `DQL_V0431_ACTIVE=true requires DQL_CB_CONFIG_BY_ALIAS['${alias}'] to explicitly set [${missingFields.join(', ')}]; got ${JSON.stringify(Object.keys(entryObj))}`,
+            );
+          }
         }
       } catch {
         // JSON parse error already reported by readCbByAlias.

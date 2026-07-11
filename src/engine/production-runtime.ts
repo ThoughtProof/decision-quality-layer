@@ -18,7 +18,11 @@
  */
 
 import crypto from 'node:crypto';
-import { HttpLlmClient, type ModelBinding } from './llm-client.js';
+import {
+  HttpLlmClient,
+  type HttpLlmClientConfig,
+  type ModelBinding,
+} from './llm-client.js';
 import type { LlmClient } from './llm-client.js';
 import { PotCliCascade } from './cascade-pot.js';
 import type { Cascade } from './cascade.js';
@@ -64,6 +68,33 @@ export interface ProductionRuntime {
  * prove that the exact instance the factory returns is the SAME instance
  * that ends up serving cascade calls. Production callers omit all fields.
  */
+/**
+ * Test-only whitelist of HttpLlmClientConfig fields the factory allows
+ * callers to inject via `clientOptionsOverride`. Deliberately EXCLUDES
+ * every safety-relevant knob:
+ *   - `capitalPathMode`             — set from resolver
+ *   - `circuitBreakerConfig(ByAlias)` — set from resolver + v0431_active gate
+ *   - `disableCircuitBreaker`       — set from resolver
+ * Only instrumental fields (clock, fetch, sleep, retry/timing knobs) are
+ * exposed here so tests cannot silently subvert the safety posture the
+ * factory just wired. This is the Hermes design-hint fix (post-260d125
+ * review) that replaces the previous `Record<string, unknown>`.
+ */
+export interface ClientOptionsOverride {
+  /** Test override for global fetch. */
+  fetchImpl?: HttpLlmClientConfig['fetchImpl'];
+  /** Test override for backoff sleep. */
+  sleep?: HttpLlmClientConfig['sleep'];
+  /** Test override for per-request timeout. */
+  timeoutMs?: HttpLlmClientConfig['timeoutMs'];
+  /** Test override for max retry attempts. */
+  maxAttempts?: HttpLlmClientConfig['maxAttempts'];
+  /** Test override for base backoff. */
+  backoffBaseMs?: HttpLlmClientConfig['backoffBaseMs'];
+  /** Test override for backoff cap. */
+  backoffCapMs?: HttpLlmClientConfig['backoffCapMs'];
+}
+
 export interface CreateProductionRuntimeOptions {
   /** Test override for the LlmClient. */
   clientOverride?: LlmClient;
@@ -71,12 +102,16 @@ export interface CreateProductionRuntimeOptions {
   identityOverride?: { instanceId: string; coldStartAt: number };
   /**
    * Test-only extra options merged into the HttpLlmClientConfig the factory
-   * uses. Enables tests to inject `fetchImpl` / `now` / etc. WITHOUT
-   * bypassing the factory's own wiring of `serv_base_url`, per-alias CB,
-   * `capital_path_mode`, and `disable_circuit_breaker`. Production callers
-   * omit this field.
+   * uses. Enables tests to inject `fetchImpl` / `sleep` / retry knobs
+   * WITHOUT bypassing the factory's own wiring of `serv_base_url`,
+   * per-alias CB, `capital_path_mode`, and `disable_circuit_breaker`.
+   * The whitelisted shape (`ClientOptionsOverride`) intentionally omits
+   * every safety-relevant field; the factory further re-applies safety
+   * options AFTER the override so a stray override can never win over
+   * resolver-derived safety knobs (Hermes design-hint fix, post-260d125).
+   * Production callers omit this field.
    */
-  clientOptionsOverride?: Record<string, unknown>;
+  clientOptionsOverride?: ClientOptionsOverride;
 }
 
 /**
@@ -121,8 +156,15 @@ export function createProductionRuntime(
     circuitBreakerConfigByAlias: cbByAliasForClient,
     disableCircuitBreaker: config.disable_circuit_breaker,
   };
-  const mergedClientOptions = opts.clientOptionsOverride
-    ? { ...baseClientOptions, ...opts.clientOptionsOverride }
+  // Hermes design-hint fix (post-260d125 review): the override is a
+  // typed WHITELIST of instrumental fields. The factory-derived safety
+  // options (capitalPathMode, circuitBreakerConfigByAlias,
+  // disableCircuitBreaker) are re-spread AFTER the override so that
+  // even a typed override cannot silently subvert them. The
+  // ClientOptionsOverride type does not include those fields, but this
+  // ordering makes the invariant robust to future field additions.
+  const mergedClientOptions: HttpLlmClientConfig = opts.clientOptionsOverride
+    ? { ...opts.clientOptionsOverride, ...baseClientOptions }
     : baseClientOptions;
 
   const client =

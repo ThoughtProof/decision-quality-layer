@@ -212,3 +212,209 @@ describe('M7 + M8 — /dql/health handler contract', () => {
     expect(state.jsonBody.alias_gate_ready).toBe(true);
   });
 });
+
+/**
+ * H1 (Hermes review of 260d125): alias_gate_ready MUST check the full
+ * safety posture. Each of the following negative single-condition tests
+ * must collapse the flag to false even when every OTHER canary
+ * precondition is set. These tests are DISCRIMINATING: they flip exactly
+ * ONE bit at a time relative to the M8 happy-path baseline.
+ */
+describe('H1 — alias_gate_ready collapses on any safety-posture defect', () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  function primeSafeCanary(): void {
+    process.env.DQL_CASCADE = 'pot-cli';
+    process.env.SERV_API_KEY = 'sk-test';
+    process.env.DQL_CAPITAL_PATH_MODE = '1';
+    process.env.DQL_V0431_ACTIVE = '1';
+    process.env.DQL_RUNTIME_DIAGNOSTICS = '1';
+    process.env.DQL_DISABLE_CIRCUIT_BREAKER = '0';
+    process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
+      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+    });
+    process.env.VERCEL_GIT_COMMIT_SHA = 'abc1234def5678';
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    for (const key of Object.keys(process.env)) {
+      if (!(key in ORIGINAL_ENV)) delete process.env[key];
+    }
+    for (const [k, v] of Object.entries(ORIGINAL_ENV)) {
+      if (typeof v === 'string') process.env[k] = v;
+    }
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in ORIGINAL_ENV)) delete process.env[key];
+    }
+    for (const [k, v] of Object.entries(ORIGINAL_ENV)) {
+      if (typeof v === 'string') process.env[k] = v;
+    }
+  });
+
+  it('baseline: fully safe canary posture → alias_gate_ready=true', async () => {
+    primeSafeCanary();
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.alias_gate_ready).toBe(true);
+  });
+
+  it('capital_path_mode=false collapses alias_gate_ready to false (Hermes gegenbeweis)', async () => {
+    primeSafeCanary();
+    process.env.DQL_CAPITAL_PATH_MODE = '0';
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.capital_path_mode).toBe(false);
+    expect(state.jsonBody.alias_gate_ready).toBe(false);
+  });
+
+  it('disable_circuit_breaker=true collapses alias_gate_ready to false (Hermes gegenbeweis)', async () => {
+    primeSafeCanary();
+    process.env.DQL_DISABLE_CIRCUIT_BREAKER = '1';
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.disable_circuit_breaker).toBe(true);
+    expect(state.jsonBody.alias_gate_ready).toBe(false);
+  });
+
+  it('diagnostics_on=false is rejected at resolver level for canary (no false-positive alias_gate)', async () => {
+    // Note: v0431_active=1 + pot-cli + diagnostics=0 is a resolver-level
+    // ConfigError (existing invariant), so health returns 503. This test
+    // pins BOTH invariants in a single place so a future weakening of
+    // the resolver rule would still be caught here by the alias_gate
+    // guard fallback.
+    primeSafeCanary();
+    process.env.DQL_RUNTIME_DIAGNOSTICS = '0';
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.status).toBe('config_invalid');
+  });
+
+  it('v0431_active=false collapses alias_gate_ready to false', async () => {
+    primeSafeCanary();
+    process.env.DQL_V0431_ACTIVE = '0';
+    // v0431_active=0 removes the CB_CONFIG_BY_ALIAS requirement, but the
+    // key was already set to a valid explicit config, so resolver stays
+    // clean. Health returns 200 with alias_gate_ready=false.
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.v0431_active).toBe(false);
+    expect(state.jsonBody.alias_gate_ready).toBe(false);
+  });
+
+  it('commit_sha missing collapses alias_gate_ready to false (M8 pin)', async () => {
+    primeSafeCanary();
+    delete process.env.VERCEL_GIT_COMMIT_SHA;
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.commit_sha).toBeNull();
+    expect(state.jsonBody.alias_gate_ready).toBe(false);
+  });
+
+  it('serv_api_key_bound=false collapses alias_gate_ready to false', async () => {
+    primeSafeCanary();
+    delete process.env.SERV_API_KEY;
+    // Missing SERV_API_KEY in pot-cli → resolver ConfigError → 503.
+    // Again this pin doubles as an invariant on both the resolver rule
+    // and the alias_gate guard.
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.status).toBe('config_invalid');
+  });
+});
+
+/**
+ * H2 (Hermes review of 260d125): with v0431_active=true in pot-cli,
+ * every known alias entry in DQL_CB_CONFIG_BY_ALIAS MUST explicitly set
+ * every policy-relevant CB field. Empty or partial objects that would
+ * silently inherit baseline defaults must be rejected with 503
+ * CONFIG_INVALID at the resolver level.
+ */
+describe('H2 — v0431_active rejects empty / partial per-alias CB entries', () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  function primeActiveCanaryMinusAliasCfg(): void {
+    process.env.DQL_CASCADE = 'pot-cli';
+    process.env.SERV_API_KEY = 'sk-test';
+    process.env.DQL_CAPITAL_PATH_MODE = '1';
+    process.env.DQL_V0431_ACTIVE = '1';
+    process.env.DQL_RUNTIME_DIAGNOSTICS = '1';
+    process.env.VERCEL_GIT_COMMIT_SHA = 'abc1234def5678';
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    for (const key of Object.keys(process.env)) {
+      if (!(key in ORIGINAL_ENV)) delete process.env[key];
+    }
+    for (const [k, v] of Object.entries(ORIGINAL_ENV)) {
+      if (typeof v === 'string') process.env[k] = v;
+    }
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in ORIGINAL_ENV)) delete process.env[key];
+    }
+    for (const [k, v] of Object.entries(ORIGINAL_ENV)) {
+      if (typeof v === 'string') process.env[k] = v;
+    }
+  });
+
+  it('empty object per alias → 503 CONFIG_INVALID (Hermes reproduziert)', async () => {
+    primeActiveCanaryMinusAliasCfg();
+    process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
+      'serv-nano': {},
+      'serv-swift': {},
+    });
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.status).toBe('config_invalid');
+  });
+
+  it('partial object per alias (missing cooldownMs) → 503 CONFIG_INVALID', async () => {
+    primeActiveCanaryMinusAliasCfg();
+    process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
+      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+    });
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.status).toBe('config_invalid');
+  });
+
+  it('all fields present per alias → 200 (positive control)', async () => {
+    primeActiveCanaryMinusAliasCfg();
+    process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
+      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+    });
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.alias_gate_ready).toBe(true);
+  });
+});

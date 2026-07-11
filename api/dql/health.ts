@@ -18,10 +18,20 @@
  *     stable enum ('openserv-default' | 'custom' | 'unset').
  *   • `commit_sha` / `config_schema_version` are BUILD identity; they
  *     are surfaced but NOT part of `config_hash`.
- *   • `alias_gate_ready` is only true when the deploy is Canary-ready:
- *     v0431_active + pot-cli + commit_sha non-null + serv_api_key_bound.
- *     A null commit_sha (or missing key binding) MUST NOT let the deploy
- *     preflight pass — alias_gate_ready=false makes that unambiguous.
+ *   • `alias_gate_ready` is only true when the deploy is Canary-ready
+ *     AND the safety posture is intact:
+ *       - runtime_mode === 'pot-cli'
+ *       - v0431_active === true
+ *       - capital_path_mode === true  (fallback disabled — explicit)
+ *       - disable_circuit_breaker === false  (CB actually in play)
+ *       - diagnostics_on === true  (observability required for canary)
+ *       - commit_sha non-empty  (deploy identity)
+ *       - serv_api_key_bound === true  (provider auth wired)
+ *     A safety-inactive deploy (CB disabled, CPM off, diagnostics off,
+ *     null commit_sha, or missing key binding) MUST NOT be waved through
+ *     by this signal — alias_gate_ready=false makes that unambiguous.
+ *     Kalibrierungs- or dogfooding-modes that intentionally disable the
+ *     CB MUST use a SEPARATE signal, not `alias_gate_ready` (Hermes H1).
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -69,14 +79,29 @@ export default function handler(_req: VercelRequest, res: VercelResponse) {
   try {
     const config = resolveProductionConfig(process.env, { requiredMode: mode });
     const configHash = computeConfigHash(config);
-    // Alias-Gate readiness: a Canary deploy is only preflight-ready when
-    // pot-cli + v0431_active + non-null commit_sha + a bound API key.
+    // Alias-Gate readiness (Hermes H1 fix, 2026-07-11 review of 260d125):
+    // a Canary deploy is only preflight-ready when EVERY safety-relevant
+    // knob is set to its canary-safe value AND the deploy identity is
+    // fully bound. Any one of the following being false collapses the
+    // signal to false — no partial "looks ready" states.
+    //   - pot-cli mode (Live path chosen)
+    //   - v0431_active (canary flag ON)
+    //   - capital_path_mode (fallback path explicitly disabled)
+    //   - !disable_circuit_breaker (CB actually running)
+    //   - diagnostics_on (observability required for canary)
+    //   - commit_sha non-empty (deploy identity known)
+    //   - serv_api_key_bound (provider auth wired)
     // Stub or non-canary deploys explicitly report alias_gate_ready=false
     // — not "n/a" — so a deploy pipeline cannot accidentally treat
-    // "absence of the field" as ready.
+    // "absence of the field" as ready. Calibration-mode deploys that
+    // deliberately disable the CB MUST introduce their OWN signal; they
+    // must NOT reuse this one.
     const aliasGateReady =
       config.runtime_mode === 'pot-cli' &&
       config.v0431_active &&
+      config.capital_path_mode &&
+      !config.disable_circuit_breaker &&
+      config.diagnostics_on &&
       typeof commitSha === 'string' &&
       commitSha.length > 0 &&
       config.serv_api_key_bound;
