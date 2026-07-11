@@ -237,10 +237,18 @@ describe('HttpLlmClient retry + timeout', () => {
   });
 
   it('caps retryReasons at 4 entries even when more retryable errors occur', async () => {
-    // Six retryable errors would be attempted — the 6th throws.
-    // We only want to verify the reasons array is capped at 4 during collection.
-    const fetchImpl = vi.fn();
-    for (let i = 0; i < 6; i++) fetchImpl.mockRejectedValueOnce(new TypeError(`fetch failed #${i}`));
+    // Five retryable failures followed by an OK response. maxAttempts=6.
+    // The retry loop must not push more than 4 reasons into retryReasons;
+    // additional entries are dropped silently so the diagnostics envelope
+    // stays bounded.
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed #0'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #1'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #2'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #3'))
+      .mockRejectedValueOnce(new TypeError('fetch failed #4'))
+      .mockResolvedValueOnce(makeOkResponse());
     const client = new HttpLlmClient(BINDING, ENV, {
       fetchImpl: fetchImpl as unknown as typeof fetch,
       sleep: vi.fn().mockResolvedValue(undefined),
@@ -248,12 +256,15 @@ describe('HttpLlmClient retry + timeout', () => {
       backoffBaseMs: 1,
       backoffCapMs: 5,
     });
-    await expect(client.call('test-model', { system: 's', user: 'u' })).rejects.toThrow();
-    // The final throw doesn't carry the diagnostics envelope; this test
-    // documents that the cap is 4 and only the retried-attempt reasons are
-    // captured, not the terminal one. We verify by inspecting an intermediate
-    // succeed scenario in the previous test.
+    const out = await client.call('test-model', { system: 's', user: 'u' });
     expect(fetchImpl).toHaveBeenCalledTimes(6);
+    expect(out.attemptCount).toBe(6);
+    // Cap is 4 — retry reasons #5 (index 4) and later are dropped.
+    expect(out.retryReasons).toHaveLength(4);
+    expect(out.retryReasons?.[0]).toMatch(/fetch failed #0/);
+    expect(out.retryReasons?.[1]).toMatch(/fetch failed #1/);
+    expect(out.retryReasons?.[2]).toMatch(/fetch failed #2/);
+    expect(out.retryReasons?.[3]).toMatch(/fetch failed #3/);
   });
 });
 

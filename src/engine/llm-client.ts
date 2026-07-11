@@ -340,14 +340,12 @@ export class HttpLlmClient implements LlmClient {
     try {
       const out = await this.callWithRetry(binding, input);
       // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
-      // circuit-breaker, not wall-clock. Backoff waits between failed
-      // attempts are our reaction to transient errors, not provider
-      // response time — reporting them to the p90 trip metric would
-      // double-penalize retries (once in failure_rate signal, once in
-      // latency signal) and cause spurious trips on ordinary retry
-      // clusters that eventually succeed. Failed attempts are already
-      // captured via the per-alias failure_rate window when the retry
-      // loop exhausts (throw path below).
+      // circuit-breaker, not wall-clock. Backoff waits are retry-policy
+      // delay, not provider processing time. Successful retry clusters
+      // must not inflate the latency signal; exhausted retry loops are
+      // independently represented by the failure-rate path (throw path
+      // below), which feeds recordFailure() only once the retry loop is
+      // exhausted — successful retry clusters emit no failure sample.
       const wallClock = Date.now() - started;
       const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
       primaryBreaker.recordSuccess(netLatency);
