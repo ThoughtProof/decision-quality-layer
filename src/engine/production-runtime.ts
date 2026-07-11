@@ -17,10 +17,16 @@
  * `createProductionRuntime` reads env once and constructs the bundle.
  */
 
+import crypto from 'node:crypto';
 import { HttpLlmClient } from './llm-client.js';
 import type { LlmClient } from './llm-client.js';
 import { PotCliCascade } from './cascade-pot.js';
 import type { Cascade } from './cascade.js';
+import {
+  resolveProductionConfig,
+  computeConfigHash,
+  type ProductionConfig,
+} from './production-config.js';
 
 /**
  * Everything the production request path needs, resolved once at cold-start.
@@ -34,30 +40,81 @@ export interface ProductionRuntime {
   cascade: Cascade;
   client: LlmClient;
   /**
-   * Non-secret identity of the runtime — for /dql/health and correlation.
-   * Populated in the follow-up commit that adds resolveProductionConfig.
-   * Reserved as optional for now to keep this commit source-compatible.
+   * Fully-resolved, validated config used to construct this runtime.
+   * The value hashed into `configHash` is derived from EXACTLY these
+   * fields — no secret ever appears here.
    */
-  identity?: {
+  config: ProductionConfig;
+  /** Deterministic SHA-256 of the canonicalised config. */
+  configHash: string;
+  /** Non-secret identity for /dql/health and cross-service correlation. */
+  identity: {
+    /** Per-cold-start random id — stable for the life of this bundle. */
     instanceId: string;
+    /** ms since epoch of the cold-start moment. */
     coldStartAt: number;
   };
+}
+
+/**
+ * Optional overrides for tests: injecting a controlled client lets a test
+ * prove that the exact instance the factory returns is the SAME instance
+ * that ends up serving cascade calls. Production callers omit both fields.
+ */
+export interface CreateProductionRuntimeOptions {
+  /** Test override for the LlmClient. */
+  clientOverride?: LlmClient;
+  /** Test override for identity clock/randomness. */
+  identityOverride?: { instanceId: string; coldStartAt: number };
 }
 
 /**
  * Construct the cold-start production bundle.
  *
  * The `env` argument is threaded through explicitly (instead of reading
- * `process.env` directly) so tests can construct a runtime with a controlled
- * environment. Production callers pass `process.env`.
+ * `process.env` directly) so tests can construct a runtime with a
+ * controlled environment. Production callers pass `process.env`.
  *
- * The follow-up commit wires in `resolveProductionConfig(env)` to derive the
- * circuit-breaker per-alias config and CPM value from env. This commit uses
- * the HttpLlmClient defaults so we can prove the wiring shape end-to-end
- * before adding config-resolver complexity.
+ * When `opts.clientOverride` is provided (tests only), that exact instance
+ * is passed to `PotCliCascade` and stored on the returned bundle. This
+ * enables a discriminating identity assertion that observes the wired
+ * client through cascade output.
+ *
+ * Errors:
+ *   - Throws `ProductionConfigError` when resolution fails (from
+ *     `resolveProductionConfig`). Callers upstream (handler cold-start)
+ *     should catch and surface as a 503 on /dql/health.
  */
-export function createProductionRuntime(_env: NodeJS.ProcessEnv): ProductionRuntime {
-  const client = new HttpLlmClient();
+export function createProductionRuntime(
+  env: NodeJS.ProcessEnv,
+  opts: CreateProductionRuntimeOptions = {},
+): ProductionRuntime {
+  const config = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
+  const configHash = computeConfigHash(config);
+  // v0.4.3.1 §D: capital_path_mode is passed EXPLICITLY into the client.
+  // No `?? false` silent default at any layer below this line.
+  const client =
+    opts.clientOverride ??
+    new HttpLlmClient(undefined, env, {
+      capitalPathMode: config.capital_path_mode,
+    });
   const cascade = new PotCliCascade(client);
-  return { cascade, client };
+  const identity = opts.identityOverride ?? {
+    instanceId: crypto.randomBytes(8).toString('hex'),
+    coldStartAt: Date.now(),
+  };
+  return { cascade, client, config, configHash, identity };
+}
+
+/**
+ * Stub-mode variant of the runtime factory. Used by the /dql/health
+ * endpoint when it needs to answer WITHOUT contacting a provider. Callers
+ * that expect real cascade behavior MUST use createProductionRuntime.
+ */
+export function resolveHealthConfig(env: NodeJS.ProcessEnv): {
+  config: ProductionConfig;
+  configHash: string;
+} {
+  const config = resolveProductionConfig(env, { requiredMode: 'stub' });
+  return { config, configHash: computeConfigHash(config) };
 }

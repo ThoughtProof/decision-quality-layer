@@ -37,24 +37,37 @@ import {
   createProductionRuntime,
   type ProductionRuntime,
 } from '../../src/engine/production-runtime.js';
+import { ProductionConfigError } from '../../src/engine/production-config.js';
 
 const VERSION = '0.2.0';
 const MAX_BODY_SIZE = 1_000_000; // 1 MB
 
-// v0.4.3.1 §C.2: production runtime bundle is constructed once per cold-start
-// and holds the concrete HttpLlmClient. The engine only sees the generic
-// Cascade; the Handler owns the client for isolate-scope diagnostics (wired
-// in a follow-up commit). Stub path constructs only a Cascade — no client.
-function pickRuntime(): { cascade: Cascade; production?: ProductionRuntime } {
+// v0.4.3.1 §C.2 + §D: production runtime bundle is constructed at cold-start.
+// If resolveProductionConfig throws, we cache the error and surface 503 to
+// every /dql/verify request until the next cold-start. This mirrors what
+// /dql/health reports and prevents a partially-initialised runtime from
+// serving traffic.
+type RuntimeInit =
+  | { kind: 'stub'; cascade: Cascade }
+  | { kind: 'production'; production: ProductionRuntime; cascade: Cascade }
+  | { kind: 'error'; reason: ProductionConfigError };
+
+function pickRuntime(): RuntimeInit {
   const mode = (process.env.DQL_CASCADE ?? 'stub').trim().toLowerCase();
   if (mode === 'pot-cli' || mode === 'potcli' || mode === 'live') {
-    const production = createProductionRuntime(process.env);
-    return { cascade: production.cascade, production };
+    try {
+      const production = createProductionRuntime(process.env);
+      return { kind: 'production', production, cascade: production.cascade };
+    } catch (e) {
+      if (e instanceof ProductionConfigError) {
+        return { kind: 'error', reason: e };
+      }
+      throw e;
+    }
   }
-  return { cascade: new StubCascade() };
+  return { kind: 'stub', cascade: new StubCascade() };
 }
 const RUNTIME = pickRuntime();
-const cascade = RUNTIME.cascade;
 const sandboxCascade = new SandboxCascade();
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -111,9 +124,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     //   - Sandbox request                        → skip charge (free)
     //   - Otherwise                              → 402 Payment Required with both options
 
+    // v0.4.3.1 §D: if cold-start resolver failed, /dql/verify surfaces 503
+    // for real (non-sandbox) requests. Sandbox mode remains available so
+    // integrators can still exercise the API contract during outages.
+    if (RUNTIME.kind === 'error' && !validation.request.sandbox) {
+      return res.status(503).json({
+        error: 'Runtime not initialised',
+        code: 'RUNTIME_UNHEALTHY',
+        reasons: RUNTIME.reason.reasons,
+      });
+    }
+
     const response = await runVerification({
       request: validation.request,
-      cascade,
+      cascade: RUNTIME.kind === 'error' ? new StubCascade() : RUNTIME.cascade,
       sandboxCascade,
       requestId,
       version: VERSION,
