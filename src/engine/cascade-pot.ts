@@ -142,8 +142,11 @@ export class PotCliCascade implements Cascade {
     const parsed = parseAxisResponse(axis, out.raw);
     // Attach provider_route from the llm-client output. When the client
     // doesn't provide it (e.g. Mock/Stub cascade in tests), leave undefined.
+    // v0.4.3.1 (§C.3): a served response also sets provider_outcome='served'
+    // so downstream aggregators can distinguish served-fallback from fail-closed.
     if (out.providerRoute) {
       parsed.provider_route = out.providerRoute;
+      parsed.provider_outcome = 'served';
     }
     return {
       modelId: out.modelUsed,
@@ -185,6 +188,15 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
       ? 'fallback'
       : primary.provider_route ?? secondary.provider_route;
 
+  // v0.4.3.1 (§C.3): merged provider_outcome is 'served' only if BOTH draws
+  // were served (they must have been — combineVerdicts is called with two
+  // served AxisResults from the cascade). If either lacks 'served', the
+  // merged result carries the more-informative label from primary.
+  const mergedOutcome: 'served' | 'circuit_rejected' | undefined =
+    primary.provider_outcome === 'served' && secondary.provider_outcome === 'served'
+      ? 'served'
+      : primary.provider_outcome ?? secondary.provider_outcome;
+
   const merged = (verdict: AxisVerdict, confidence: number, note: string): AxisResult => ({
     axis: primary.axis,
     verdict,
@@ -196,6 +208,7 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
         : [primary.objection, secondary.objection].filter(Boolean).join(' | ') ||
           (secondary.objection || primary.objection),
     ...(mergedRoute ? { provider_route: mergedRoute } : {}),
+    ...(mergedOutcome ? { provider_outcome: mergedOutcome } : {}),
   });
 
   if (p === 'PASS' && s === 'PASS') {

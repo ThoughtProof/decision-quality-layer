@@ -71,10 +71,12 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
           confidence: 0,
           reasoning,
           objection,
-          // Fail-closed events must be attributable to a provider incident.
-          // Tag as 'fallback' so post-hoc reports can filter these draws out
-          // of "normal primary-served" statistics.
-          ...(isCircuitAllOpen ? { provider_route: 'fallback' as const } : {}),
+          // v0.4.3.1 (§C.3): `provider_route` names ONLY a route that actually
+          // served a response. A CircuitAllOpenError means no provider was
+          // called — tag `provider_outcome='circuit_rejected'` instead and
+          // leave `provider_route` absent so report aggregators do not count
+          // this axis as a fallback-served draw.
+          ...(isCircuitAllOpen ? { provider_outcome: 'circuit_rejected' as const } : {}),
         };
         return { result, modelsUsed: [] };
       }

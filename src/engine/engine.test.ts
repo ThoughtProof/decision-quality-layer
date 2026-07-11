@@ -159,12 +159,15 @@ describe('runVerification', () => {
     });
 
     // Every axis must be UNCERTAIN@0 with the fail-closed marker in objection.
+    // v0.4.3.1 (§C.3): provider_route is undefined (no route served) and
+    // provider_outcome is 'circuit_rejected' (circuit-breaker rejected the call).
     for (const axis of out.axes) {
       expect(axis.verdict).toBe('UNCERTAIN');
       expect(axis.confidence).toBe(0);
       expect(axis.objection).toMatch(/Provider outage/);
       expect(axis.objection).toMatch(/circuit-open/);
-      expect(axis.provider_route).toBe('fallback');
+      expect(axis.provider_route).toBeUndefined();
+      expect(axis.provider_outcome).toBe('circuit_rejected');
     }
 
     // Aggregate must NOT be ALLOW under provider outage. UNCERTAIN axes can

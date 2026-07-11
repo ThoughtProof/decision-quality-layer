@@ -105,8 +105,28 @@ export interface AxisResult {
    *
    * Older AxisResult readers that don't know this field see no behavior
    * change (optional field).
+   *
+   * Semantics (v0.4.3.1): `provider_route` describes **which route actually
+   * served a response**. If no provider answered (both circuits open, no
+   * fallback attempted or fallback also failed), this field is `undefined`
+   * and `provider_outcome` explains why. This prevents fail-closed axes from
+   * being mis-attributed to the fallback route in downstream metrics.
    */
   provider_route?: 'primary' | 'fallback';
+  /**
+   * Outcome classification for the provider chain on this axis.
+   *
+   *   'served'           — some route (primary or fallback) returned a response.
+   *                        `provider_route` names which one.
+   *   'circuit_rejected' — no provider was called because the circuit-breaker
+   *                        rejected the call (CPM=true, or both circuits open).
+   *                        `provider_route` is absent.
+   *
+   * Optional. Omitted when the field is not applicable (e.g. sandbox path,
+   * legacy responses). Report aggregators should count fallback fetches ONLY
+   * from (`provider_route === 'fallback' && provider_outcome === 'served'`).
+   */
+  provider_outcome?: 'served' | 'circuit_rejected';
 }
 
 // -----------------------------------------------------------------------------
