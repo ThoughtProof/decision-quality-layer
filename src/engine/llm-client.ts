@@ -64,8 +64,9 @@
  * that work is tracked separately.
  */
 
-import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError } from './circuit-breaker.js';
+import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError, type CircuitDomainEvent } from './circuit-breaker.js';
 import type { CallContext } from './call-context.js';
+import type { AttemptAttribution } from './runtime-diagnostics.js';
 
 export interface LlmCallInput {
   system: string;
@@ -87,6 +88,21 @@ export interface LlmCallOutput {
    * ignore this field see no behavioral change.
    */
   providerRoute?: 'primary' | 'fallback';
+  /**
+   * v0.4.3.1 §C+integration — flat attribution field.
+   *
+   * The alias that actually served this response. Equal to the alias the
+   * cascade requested when `providerRoute === 'primary'`; equal to the
+   * primary's `fallbackAlias` when `providerRoute === 'fallback'`. This is
+   * the flattened form of what earlier commits derived by inspecting
+   * `providerRoute` + the cascade's alias request — it is exposed here so
+   * diagnostics and the engine can attribute a response to a concrete
+   * SERV model without re-deriving the mapping.
+   *
+   * Optional for backwards compatibility with older LlmClient impls
+   * (StubLlmClient tests that predate the flag).
+   */
+  attemptAlias?: string;
   /**
    * v0.4.3 recert instrumentation — optional, non-breaking.
    *
@@ -294,6 +310,49 @@ const RETRYABLE_PATTERN =
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // -----------------------------------------------------------------------------
+// Retry-failure telemetry (v0.4.3.1 §C M1)
+//
+// callWithRetry annotates the thrown error with the running attemptCount,
+// backoffWaitedMs, and retryReasons so the caller's failure branch can
+// compute netLatency symmetrically with the success branch. The annotation
+// lives on a NON-ENUMERABLE symbol property so it does not leak into logs
+// or JSON serialization by accident.
+// -----------------------------------------------------------------------------
+
+const RETRY_TELEMETRY = Symbol.for('dql.llm.retryTelemetry');
+
+interface RetryTelemetry {
+  attemptCount: number;
+  backoffWaitedMs: number;
+  retryReasons: readonly string[];
+}
+
+function annotateRetryFailure<E>(err: E, telemetry: RetryTelemetry): E {
+  if (err && typeof err === 'object') {
+    try {
+      Object.defineProperty(err as object, RETRY_TELEMETRY, {
+        value: Object.freeze({ ...telemetry, retryReasons: Object.freeze([...telemetry.retryReasons]) }),
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+    } catch {
+      // If the error object is frozen or an exotic value, fall through —
+      // caller will use the wall-clock latency (safe upper bound).
+    }
+  }
+  return err;
+}
+
+function readRetryTelemetry(err: unknown): RetryTelemetry | null {
+  if (err && typeof err === 'object' && RETRY_TELEMETRY in err) {
+    const raw = (err as { [k: symbol]: unknown })[RETRY_TELEMETRY];
+    if (raw && typeof raw === 'object') return raw as RetryTelemetry;
+  }
+  return null;
+}
+
+// -----------------------------------------------------------------------------
 // Real (fetch-based) client
 // -----------------------------------------------------------------------------
 
@@ -390,8 +449,7 @@ export class HttpLlmClient implements LlmClient {
   async call(
     modelAlias: string,
     input: LlmCallInput,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    _ctx?: CallContext,
+    ctx?: CallContext,
   ): Promise<LlmCallOutput> {
     const binding = this.modelMap[modelAlias];
     if (!binding) {
@@ -401,8 +459,33 @@ export class HttpLlmClient implements LlmClient {
     // Fast path: circuit-breaker disabled (tests, or explicit opt-out for
     // legacy baseline runs). Behavior identical to pre-PR-10.
     if (this.disableCircuitBreaker) {
-      const out = await this.callWithRetry(binding, input);
-      return { ...out, providerRoute: 'primary' };
+      const started = Date.now();
+      try {
+        const out = await this.callWithRetry(binding, input);
+        this.recordAttempt(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          ok: true,
+          netLatencyMs: Math.max(0, (Date.now() - started) - (out.backoffWaitedMs ?? 0)),
+          backoffWaitedMs: out.backoffWaitedMs ?? 0,
+          attemptCount: out.attemptCount ?? 1,
+        });
+        return { ...out, providerRoute: 'primary', attemptAlias: modelAlias };
+      } catch (err) {
+        const telemetry = readRetryTelemetry(err);
+        const wallClock = Date.now() - started;
+        this.recordAttempt(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          ok: false,
+          netLatencyMs: Math.max(0, wallClock - (telemetry?.backoffWaitedMs ?? 0)),
+          backoffWaitedMs: telemetry?.backoffWaitedMs ?? 0,
+          attemptCount: telemetry?.attemptCount ?? 1,
+        });
+        throw err;
+      }
     }
 
     // K5 admission-safety: verify preconditions BEFORE admit(). A missing
@@ -438,10 +521,13 @@ export class HttpLlmClient implements LlmClient {
         }
         // Primary was already OPEN; hand off to fallback without a primary
         // fetch. `primaryAttempted=false` propagates through callViaFallback.
-        return await this.callViaFallback(modelAlias, binding, input, err.reason, false);
+        return await this.callViaFallback(modelAlias, binding, input, err.reason, false, ctx);
       }
       throw err;
     }
+    // v0.4.3.1 §C: forward any admission-time events (open_to_half_open) to
+    // the diagnostics collector before the fetch begins.
+    this.recordEventsToCtx(ctx, primaryAdmission.events);
 
     // Circuit admitted (CLOSED, or HALF_OPEN probe was granted) — primary attempt.
     const started = Date.now();
@@ -450,6 +536,8 @@ export class HttpLlmClient implements LlmClient {
       let out;
       let ok: boolean;
       let netLatency: number;
+      let attemptCount = 1;
+      let backoffWaitedMs = 0;
       let retryErr: unknown = null;
       try {
         out = await this.callWithRetry(binding, input);
@@ -457,37 +545,52 @@ export class HttpLlmClient implements LlmClient {
         // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
         // circuit-breaker, not wall-clock. Backoff waits are retry-policy
         // delay, not provider processing time.
-        netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+        backoffWaitedMs = out.backoffWaitedMs ?? 0;
+        attemptCount = out.attemptCount ?? 1;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
         ok = true;
       } catch (err) {
         retryErr = err;
-        // Wall-clock elapsed for failures. There is no LlmCallOutput here.
-        // For symmetry with the success path we cannot subtract backoff we
-        // did not accumulate; wall-clock is the meaningful signal for the
-        // failure_rate window at this layer.
-        netLatency = Date.now() - started;
+        // v0.4.3.1 §C M1 (latency symmetry): read the annotated telemetry
+        // from the retry loop so failure path subtracts backoff waits too.
+        const telemetry = readRetryTelemetry(err);
+        backoffWaitedMs = telemetry?.backoffWaitedMs ?? 0;
+        attemptCount = telemetry?.attemptCount ?? 1;
+        const wallClock = Date.now() - started;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
         ok = false;
         out = undefined;
       }
 
       // K5: recordOutcome runs inside the try{} so the routing decision
       // below can read the post-mutation state (i.e. whether this outcome
-      // just tripped the breaker). We deliberately drop the events return
-      // in E-core; C+integration wires them through the diagnostics
+      // just tripped the breaker). v0.4.3.1 §C: mutation events (transitions,
+      // stale_result, invalid_outcome) are forwarded to the diagnostics
       // collector.
-      primaryBreaker.recordOutcome(primaryAdmission.token, {
+      const mutation = primaryBreaker.recordOutcome(primaryAdmission.token, {
         ok,
         netLatencyMs: netLatency,
       });
+      this.recordEventsToCtx(ctx, mutation.events);
       completed = true;
+
+      // Record an attempt-attribution row for THIS primary fetch. Every
+      // fetch (success or failure) yields exactly one row.
+      this.recordAttempt(ctx, {
+        requestedAlias: modelAlias,
+        attemptAlias: modelAlias,
+        route: 'primary',
+        ok,
+        netLatencyMs: netLatency,
+        backoffWaitedMs,
+        attemptCount,
+      });
 
       if (ok && out) {
         // Stale-success (mutation.accepted === false, e.g. wrong_state): the
         // baseline contract is to serve the successful primary response and
-        // leave state unchanged. The mutation events themselves are dropped
-        // here in E-core; C+integration will route them through the
-        // per-request diagnostics collector.
-        return { ...out, providerRoute: 'primary' };
+        // leave state unchanged. Events were already forwarded above.
+        return { ...out, providerRoute: 'primary', attemptAlias: modelAlias };
       }
 
       // Failure path: decide fallback vs rethrow based on breaker state
@@ -510,7 +613,8 @@ export class HttpLlmClient implements LlmClient {
           binding,
           input,
           primaryBreaker.snapshot().lastTripReason,
-          true // primaryAttempted
+          true, // primaryAttempted
+          ctx,
         );
       }
       // Breaker still CLOSED after ordinary failure → rethrow original error.
@@ -522,10 +626,14 @@ export class HttpLlmClient implements LlmClient {
       // last-resort guard; production paths are expected to complete=true.
       if (!completed) {
         try {
-          primaryBreaker.recordOutcome(primaryAdmission.token, {
+          const mutation = primaryBreaker.recordOutcome(primaryAdmission.token, {
             ok: false,
             netLatencyMs: 0,
           });
+          // Forward events from the defensive report too — the diagnostics
+          // collector never causes control flow, and swallow-on-error is
+          // enforced inside recordEventsToCtx.
+          this.recordEventsToCtx(ctx, mutation.events);
         } catch {
           // Even the defensive report failing must not mutate the response.
         }
@@ -544,7 +652,8 @@ export class HttpLlmClient implements LlmClient {
     primaryBinding: ModelBinding,
     input: LlmCallInput,
     primaryReason: string,
-    primaryAttempted: boolean
+    primaryAttempted: boolean,
+    ctx?: CallContext,
   ): Promise<LlmCallOutput> {
     const fallbackAlias = primaryBinding.fallbackAlias ?? null;
     if (!fallbackAlias) {
@@ -585,6 +694,7 @@ export class HttpLlmClient implements LlmClient {
       }
       throw err;
     }
+    this.recordEventsToCtx(ctx, fallbackAdmission.events);
 
     const started = Date.now();
     let completed = false;
@@ -592,39 +702,101 @@ export class HttpLlmClient implements LlmClient {
       let out;
       let ok: boolean;
       let netLatency: number;
+      let attemptCount = 1;
+      let backoffWaitedMs = 0;
       let retryErr: unknown = null;
       try {
         out = await this.callWithRetry(fallbackBinding, input);
         const wallClock = Date.now() - started;
-        netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+        backoffWaitedMs = out.backoffWaitedMs ?? 0;
+        attemptCount = out.attemptCount ?? 1;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
         ok = true;
       } catch (err) {
         retryErr = err;
-        netLatency = Date.now() - started;
+        // v0.4.3.1 §C M1 (latency symmetry) on the fallback path too.
+        const telemetry = readRetryTelemetry(err);
+        backoffWaitedMs = telemetry?.backoffWaitedMs ?? 0;
+        attemptCount = telemetry?.attemptCount ?? 1;
+        const wallClock = Date.now() - started;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
         ok = false;
         out = undefined;
       }
-      fallbackBreaker.recordOutcome(fallbackAdmission.token, {
+      const mutation = fallbackBreaker.recordOutcome(fallbackAdmission.token, {
         ok,
         netLatencyMs: netLatency,
       });
+      this.recordEventsToCtx(ctx, mutation.events);
       completed = true;
+      this.recordAttempt(ctx, {
+        requestedAlias: primaryAlias,
+        attemptAlias: fallbackAlias,
+        route: 'fallback',
+        ok,
+        netLatencyMs: netLatency,
+        backoffWaitedMs,
+        attemptCount,
+      });
       if (ok && out) {
-        return { ...out, providerRoute: 'fallback' };
+        return { ...out, providerRoute: 'fallback', attemptAlias: fallbackAlias };
       }
       throw retryErr instanceof Error ? retryErr : new Error(String(retryErr));
     } catch (unexpected) {
       if (!completed) {
         try {
-          fallbackBreaker.recordOutcome(fallbackAdmission.token, {
+          const mutation = fallbackBreaker.recordOutcome(fallbackAdmission.token, {
             ok: false,
             netLatencyMs: 0,
           });
+          this.recordEventsToCtx(ctx, mutation.events);
         } catch {
           // best-effort
         }
       }
       throw unexpected;
+    }
+  }
+
+  /**
+   * v0.4.3.1 §C+integration: forward CircuitBreaker domain events to the
+   * request-scoped RuntimeDiagnosticsCollector, if attached. Fully guarded:
+   * a missing collector, a null event array, or a throw inside the
+   * collector MUST NOT alter the response path.
+   */
+  private recordEventsToCtx(
+    ctx: CallContext | undefined,
+    events: readonly CircuitDomainEvent[] | undefined,
+  ): void {
+    const collector = ctx?.collector;
+    if (!collector || !events || events.length === 0) return;
+    try {
+      collector.recordEvents(events);
+    } catch {
+      // Diagnostics are observation only — never poison the caller.
+    }
+  }
+
+  /**
+   * v0.4.3.1 §C+integration: record one attempt-attribution row per
+   * provider FETCH attempted during this call. The row is scoped to the
+   * handler-owned requestId (with optional axis/callId).
+   */
+  private recordAttempt(
+    ctx: CallContext | undefined,
+    row: Omit<AttemptAttribution, 'requestId' | 'axis' | 'callId'>,
+  ): void {
+    const collector = ctx?.collector;
+    if (!collector) return;
+    try {
+      collector.recordAttempt({
+        requestId: ctx.requestId,
+        axis: ctx.axis,
+        callId: ctx.callId,
+        ...row,
+      });
+    } catch {
+      // Never throw from diagnostics.
     }
   }
 
@@ -647,7 +819,12 @@ export class HttpLlmClient implements LlmClient {
     let lastErr: unknown;
     let backoffWaitedMs = 0;
     const retryReasons: string[] = [];
+    // v0.4.3.1 §C M1 (latency symmetry): count attempts even on the failure
+    // path so callers can subtract backoff waits from wall-clock and report
+    // a meaningful netLatency to the CircuitBreaker on failure too.
+    let attemptCount = 0;
     for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
+      attemptCount = attempt;
       try {
         const out = await this.singleCall(binding, apiKey, input);
         return {
@@ -661,7 +838,14 @@ export class HttpLlmClient implements LlmClient {
         const msg = err instanceof Error ? err.message : String(err);
         const retryable = RETRYABLE_PATTERN.test(msg);
         if (!retryable || attempt === this.config.maxAttempts) {
-          throw err;
+          // v0.4.3.1 §C M1: annotate the thrown error with the retry-loop
+          // instrumentation so the caller can compute netLatency
+          // symmetrically with the success path.
+          throw annotateRetryFailure(err, {
+            attemptCount,
+            backoffWaitedMs,
+            retryReasons: [...retryReasons],
+          });
         }
         if (retryReasons.length < 4) retryReasons.push(msg.slice(0, 120));
         const wait =

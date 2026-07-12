@@ -18,6 +18,7 @@
  */
 
 import type { Axis } from '../types.js';
+import type { RuntimeDiagnosticsCollector } from './runtime-diagnostics.js';
 
 /**
  * Per-request context propagated from handler → engine → cascade → llm-client.
@@ -41,11 +42,16 @@ export interface CallContext {
    */
   callId?: string;
   /**
-   * Forward-compatible slot for RuntimeDiagnosticsCollector (v0.4.3.1 amend §2).
-   * Not populated in this commit. When later wired in, downstream components
-   * push circuit-breaker state transitions into it via call-local sinks.
+   * Optional RuntimeDiagnosticsCollector (v0.4.3.1 §C+integration).
+   *
+   * Populated by the handler when DQL_RUNTIME_DIAGNOSTICS=1 on the
+   * v0431_active canary path. The LLM client and downstream components push
+   * CircuitBreaker domain events (transitions, stale results, invalid
+   * outcomes) and per-attempt attribution rows into it. When absent,
+   * downstream MUST behave identically to earlier releases — the collector
+   * is a pure observation sink, never a control-flow input.
    */
-  // collector?: RuntimeDiagnosticsCollector;  // reserved
+  collector?: RuntimeDiagnosticsCollector;
 }
 
 /**
