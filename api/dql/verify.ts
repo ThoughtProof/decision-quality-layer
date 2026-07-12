@@ -210,7 +210,7 @@ export function sendJsonWithDiagnostics(
  * NEVER throws. Any failure inside the flush is swallowed — the response
  * status/body must not be affected by diagnostics.
  */
-function flushDiagnosticsHeader(
+export function flushDiagnosticsHeader(
   collector: RuntimeDiagnosticsCollector | null,
   res: VercelResponse,
 ): void {
@@ -230,6 +230,10 @@ function flushDiagnosticsHeader(
       res.setHeader('X-DQL-Diagnostics', serialized);
     } else {
       res.setHeader('X-DQL-Diagnostics-Truncated', '1');
+      // v0.4.3.1 §C+integration M2 follow-up (Hermes b5f9dc6 review):
+      // binding_summaries is a first-class stream on the snapshot and MUST
+      // appear in the truncation counts (both retained and dropped). Without
+      // it, an oversize response would silently hide summary evidence.
       res.setHeader(
         'X-DQL-Diagnostics-Counts',
         JSON.stringify({
@@ -237,11 +241,13 @@ function flushDiagnosticsHeader(
           stale_results: snapshot.stale_results.items.length,
           invalid_outcomes: snapshot.invalid_outcomes.items.length,
           attempts: snapshot.attempts.items.length,
+          binding_summaries: snapshot.binding_summaries.items.length,
           dropped: {
             transitions: snapshot.transitions.dropped,
             stale_results: snapshot.stale_results.dropped,
             invalid_outcomes: snapshot.invalid_outcomes.dropped,
             attempts: snapshot.attempts.dropped,
+            binding_summaries: snapshot.binding_summaries.dropped,
           },
         }),
       );

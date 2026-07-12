@@ -555,3 +555,106 @@ describe('H4 — sendJsonWithDiagnostics ordering: setHeader BEFORE res.json', (
     expect(diagIdx).toBeLessThan(jsonIdx);
   });
 });
+
+// -----------------------------------------------------------------------------
+// v0.4.3.1 §C+integration M2 follow-up (Hermes b5f9dc6 review):
+// When the serialized diagnostics snapshot exceeds the 8 KiB header cap,
+// flushDiagnosticsHeader MUST:
+//   - omit X-DQL-Diagnostics,
+//   - set X-DQL-Diagnostics-Truncated: '1',
+//   - emit X-DQL-Diagnostics-Counts including binding_summaries (retained)
+//     AND dropped.binding_summaries.
+// Regression: the initial C+integration commit b5f9dc6 dropped the new
+// binding_summaries stream from these counts (both retained and dropped).
+// -----------------------------------------------------------------------------
+
+describe('M2 follow-up — truncation counts include binding_summaries', () => {
+  it('over-cap snapshot: counts expose binding_summaries retained + dropped, X-DQL-Diagnostics is absent, Truncated=1', async () => {
+    vi.resetModules();
+    const mod = await import('./verify.js');
+    const rd = await import('../../src/engine/runtime-diagnostics.js');
+    // Force a snapshot that exceeds 8 KiB when serialized. Overflow the
+    // binding_summaries cap (default 50) with 55 pushes → dropped=5, kept=50.
+    // Attempts fill the rest of the payload to guarantee > 8 KiB.
+    const collector = new rd.RuntimeDiagnosticsCollector('req-m2-oversize');
+    for (let i = 0; i < 55; i++) {
+      collector.recordBindingSummary({
+        requestId: 'req-m2-oversize',
+        axis: `axis-${i}`,
+        callId: `call-${i}`,
+        requestedAlias: 'serv-nano',
+        attemptAlias: 'serv-nano',
+        route: 'primary',
+        ok: i % 2 === 0,
+        netLatencyMs: 42 + i,
+        backoffWaitedMs: 5 * i,
+        wallClockMs: 100 + i,
+        attemptCount: (i % 3) + 1,
+      });
+    }
+    for (let i = 0; i < 200; i++) {
+      collector.recordAttempt({
+        requestId: 'req-m2-oversize',
+        axis: `axis-${i % 5}`,
+        callId: `call-${i}`,
+        requestedAlias: 'serv-nano',
+        attemptAlias: 'serv-nano',
+        route: 'primary',
+        iteration: (i % 3) + 1,
+        ok: i % 4 !== 0,
+        elapsedMs: 10 + i,
+        errorCategory: i % 4 === 0 ? 'timeout' : undefined,
+      });
+    }
+    // Serialized size sanity: must be > 8 KiB to actually exercise the
+    // truncation branch.
+    const snap = (collector as unknown as {
+      flush: () => unknown;
+    }).flush();
+    // Re-run against a fresh collector because flush() drains — we still
+    // want to test flushDiagnosticsHeader against a populated collector.
+    const c2 = new rd.RuntimeDiagnosticsCollector('req-m2-oversize');
+    for (let i = 0; i < 55; i++) {
+      c2.recordBindingSummary({
+        requestId: 'req-m2-oversize', axis: `axis-${i}`, callId: `call-${i}`,
+        requestedAlias: 'serv-nano', attemptAlias: 'serv-nano',
+        route: 'primary', ok: i % 2 === 0,
+        netLatencyMs: 42 + i, backoffWaitedMs: 5 * i,
+        wallClockMs: 100 + i, attemptCount: (i % 3) + 1,
+      });
+    }
+    for (let i = 0; i < 200; i++) {
+      c2.recordAttempt({
+        requestId: 'req-m2-oversize', axis: `axis-${i % 5}`, callId: `call-${i}`,
+        requestedAlias: 'serv-nano', attemptAlias: 'serv-nano',
+        route: 'primary', iteration: (i % 3) + 1, ok: i % 4 !== 0,
+        elapsedMs: 10 + i,
+        errorCategory: i % 4 === 0 ? 'timeout' : undefined,
+      });
+    }
+    // Guard: verify snap size is over cap before asserting the branch behavior.
+    expect(Buffer.byteLength(JSON.stringify(snap), 'utf8')).toBeGreaterThan(8_192);
+
+    const headers: Record<string, string> = {};
+    const res = {
+      setHeader(k: string, v: string) { headers[k] = String(v); },
+    } as unknown as import('@vercel/node').VercelResponse;
+
+    (mod as unknown as {
+      flushDiagnosticsHeader: (c: unknown, r: unknown) => void;
+    }).flushDiagnosticsHeader(c2, res);
+
+    // Truncated path.
+    expect(headers['X-DQL-Diagnostics']).toBeUndefined();
+    expect(headers['X-DQL-Diagnostics-Truncated']).toBe('1');
+
+    const counts = JSON.parse(headers['X-DQL-Diagnostics-Counts']!);
+    // Retained count for binding_summaries capped at default 50.
+    expect(counts.binding_summaries).toBe(50);
+    // Overflow of 5 pushes MUST be counted as dropped.
+    expect(counts.dropped.binding_summaries).toBe(5);
+    // Other streams remain reported.
+    expect(counts.attempts).toBeGreaterThan(0);
+    expect(counts.dropped).toHaveProperty('attempts');
+  });
+});
