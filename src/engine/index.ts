@@ -17,6 +17,7 @@ import { aggregate } from '../aggregation.js';
 import type { Cascade } from './cascade.js';
 import { CircuitAllOpenError } from './llm-client.js';
 import { generateCallId, type CallContext } from './call-context.js';
+import type { RuntimeDiagnosticsCollector } from './runtime-diagnostics.js';
 
 export interface EngineInput {
   request: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'>;
@@ -26,6 +27,13 @@ export interface EngineInput {
   sandboxCascade: Cascade;
   requestId: string;
   version: string;
+  /**
+   * v0.4.3.1 §C+integration: optional request-scoped diagnostics collector.
+   * When present, the engine attaches it to each per-axis CallContext so
+   * the LLM client can push CB events and per-attempt attribution rows.
+   * Never used for control flow — observation only.
+   */
+  collector?: RuntimeDiagnosticsCollector;
 }
 
 export async function runVerification(input: EngineInput): Promise<DqlResponse> {
@@ -60,6 +68,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
         requestId: input.requestId,
         axis,
         callId: generateCallId(),
+        collector: input.collector,
       };
       try {
         return await cascade.run({ axis, prompt, ctx });

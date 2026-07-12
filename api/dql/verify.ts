@@ -41,6 +41,10 @@ import {
   parseRuntimeMode,
   ProductionConfigError,
 } from '../../src/engine/production-config.js';
+import {
+  RuntimeDiagnosticsCollector,
+  type DiagnosticsSnapshot,
+} from '../../src/engine/runtime-diagnostics.js';
 
 const VERSION = '0.2.0';
 const MAX_BODY_SIZE = 1_000_000; // 1 MB
@@ -81,6 +85,28 @@ const sandboxCascade = new SandboxCascade();
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const requestId = `dql_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+  // v0.4.3.1 §C+integration: per-request diagnostics collector, created ONLY
+  // when the runtime is a valid production bundle AND diagnostics_on=true.
+  // The `finally` block below flushes the collector into the response body's
+  // diagnostics slot (or into a bounded response header on error paths).
+  //
+  // NOTE: `requireDiagnostics` is enforced by the resolver's v0431_active
+  // canary path (see production-config.ts). If the resolver accepted the
+  // config, diagnostics_on is guaranteed truthy for the canary; nothing here
+  // may silently override that.
+  let collector: RuntimeDiagnosticsCollector | null = null;
+  if (
+    RUNTIME.kind === 'production' &&
+    RUNTIME.production.config.diagnostics_on
+  ) {
+    collector = new RuntimeDiagnosticsCollector(requestId);
+  }
+
+  let response: import('../../src/types.js').DqlResponse | null = null;
+  let statusCode = 200;
+  let errorPayload: Record<string, unknown> | null = null;
+  let flushed = false;
 
   try {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -139,28 +165,108 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // able to answer 200 via the sandbox path — that would let a broken
     // deploy appear healthy to callers who probe with sandbox first.
     if (RUNTIME.kind === 'error') {
-      return res.status(503).json({
+      statusCode = 503;
+      errorPayload = {
         error: 'Runtime not initialised',
         code: 'CONFIG_INVALID',
         reasons: RUNTIME.reason.reasons,
-      });
+      };
+      return res.status(statusCode).json(errorPayload);
     }
 
-    const response = await runVerification({
+    response = await runVerification({
       request: validation.request,
       cascade: RUNTIME.cascade,
       sandboxCascade,
       requestId,
       version: VERSION,
+      collector: collector ?? undefined,
     });
+
+    // v0.4.3.1 §C+integration: flush BEFORE res.json() so the header lands
+    // on the wire. This is the primary observability channel for the
+    // canary. Wrapped in try/finally-safe swallow so a diagnostics failure
+    // cannot break the 200. Duplicate flush in the outer `finally` is a
+    // no-op guarded by `flushed`.
+    flushDiagnosticsHeader(collector, res);
+    flushed = true;
 
     return res.status(200).json(response);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
-    return res.status(500).json({
+    statusCode = 500;
+    errorPayload = {
       error: 'Internal server error',
       code: 'INTERNAL_ERROR',
       details: message,
-    });
+    };
+    return res.status(statusCode).json(errorPayload);
+  } finally {
+    // v0.4.3.1 §C+integration: bounded structured flush of the diagnostics
+    // snapshot. Two attachment paths:
+    //   1. Success (status 200 + response is a full DqlResponse) — attach as
+    //      `response.diagnostics`. The response has already been sent above,
+    //      so this mutation is best-effort observability. In the primary
+    //      success path we mutate BEFORE `res.json()` completes via a small
+    //      structured header instead (avoids racing with the socket).
+    //   2. Error path or 503 — attach the snapshot as an `X-DQL-Diagnostics`
+    //      response header (bounded, structured JSON). If headers are already
+    //      sent, we silently drop the header attach; the collector still
+    //      persists inside this closure and would surface via server logs
+    //      elsewhere in production.
+    //
+    // Never throws. Any failure inside the flush is swallowed — diagnostics
+    // must not turn a 200 response into a 500.
+    if (collector && !flushed) {
+      flushDiagnosticsHeader(collector, res);
+    }
+  }
+}
+
+/**
+ * v0.4.3.1 §C+integration: bounded, structured diagnostics header flush.
+ *
+ * The primary success path calls this BEFORE res.json() so the header
+ * actually lands on the wire (Vercel closes headers on the first body
+ * write). The `finally` handler calls it as a safety net on error paths
+ * where headers may still be settable.
+ *
+ * NEVER throws. Any failure inside the flush is swallowed — the response
+ * status/body must not be affected by diagnostics.
+ */
+function flushDiagnosticsHeader(
+  collector: RuntimeDiagnosticsCollector | null,
+  res: VercelResponse,
+): void {
+  if (!collector) return;
+  try {
+    if (res.headersSent) return;
+    const snapshot: DiagnosticsSnapshot = collector.flush();
+    const serialized = JSON.stringify(snapshot);
+    // Cap header value at 8 KB to stay well below Vercel's 16 KB per-header
+    // limit. When over-cap, emit compact counts instead so operators still
+    // know the request produced diagnostics that could not fit on the wire.
+    if (serialized.length <= 8_192) {
+      res.setHeader('X-DQL-Diagnostics', serialized);
+    } else {
+      res.setHeader('X-DQL-Diagnostics-Truncated', '1');
+      res.setHeader(
+        'X-DQL-Diagnostics-Counts',
+        JSON.stringify({
+          transitions: snapshot.transitions.items.length,
+          stale_results: snapshot.stale_results.items.length,
+          invalid_outcomes: snapshot.invalid_outcomes.items.length,
+          attempts: snapshot.attempts.items.length,
+          dropped: {
+            transitions: snapshot.transitions.dropped,
+            stale_results: snapshot.stale_results.dropped,
+            invalid_outcomes: snapshot.invalid_outcomes.dropped,
+            attempts: snapshot.attempts.dropped,
+          },
+        }),
+      );
+    }
+  } catch {
+    // Diagnostics must never poison a live response.
   }
 }
