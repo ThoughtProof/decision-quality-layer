@@ -155,6 +155,12 @@ export function createProductionRuntime(
     capitalPathMode: config.capital_path_mode,
     circuitBreakerConfigByAlias: cbByAliasForClient,
     disableCircuitBreaker: config.disable_circuit_breaker,
+    // v0.4.3.1 §C+integration H1: enforce diagnostics precondition on
+    // every call() when the canary is active AND diagnostics_on=true.
+    // This closes the gap where the resolver enforced env=1 but no client
+    // check enforced that the concrete call carried a Request-Collector.
+    // Non-overridable: re-spread after clientOptionsOverride below.
+    requireDiagnostics: config.v0431_active && config.diagnostics_on,
   };
   // Hermes design-hint fix (post-260d125 review): the override is a
   // typed WHITELIST of instrumental fields. The factory-derived safety
