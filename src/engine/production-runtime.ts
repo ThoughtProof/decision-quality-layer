@@ -247,6 +247,10 @@ export function resolveCbByAlias(
       tripP90LatencyMs: src.tripP90LatencyMs,
       tripFailureRate: src.tripFailureRate,
       cooldownMs: src.cooldownMs,
+      windowSize: src.windowSize,
+      windowAgeMs: src.windowAgeMs,
+      minSamples: src.minSamples,
+      probeMaxLatencyMs: src.probeMaxLatencyMs,
     };
   }
   return out;

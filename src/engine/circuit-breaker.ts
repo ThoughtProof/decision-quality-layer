@@ -1,18 +1,18 @@
 /**
  * Circuit Breaker with sliding-window failure-rate + p90-latency detection.
  *
- * PURPOSE
+ * v0.4.3.1 §E redesign — Token-based admission API with state-machine-owned
+ * domain events. Replaces the older canProceed/recordSuccess/recordFailure
+ * triple. See docs/design/v0431-c-e-design-briefing-v4.md and
+ * docs/design/v0431-c-e-design-briefing-v4-delta.md for the binding contract.
+ *
+ * PURPOSE (unchanged from v0.4.3)
  * The DQL cascade calls the SERV inference API for every axis of every case.
  * When SERV is under load, individual requests either (a) fail transient, or
  * (b) succeed slowly (30-50s latency). The in-client retry loop handles (a)
- * cleanly (0/2500 fetch-failed in v0.4.1c baseline). What it does NOT handle
- * is (b): a "degraded but not failed" state where every request succeeds
- * eventually, but p90 latency creeps up and drags Sentinel Trade-Verify to
- * p90=22s. That's the actual production bottleneck.
- *
- * A pure failure-rate trigger (3b) would miss this — no failures, just slow
- * successes. So this breaker tracks both dimensions: failure rate AND p90
- * latency over a sliding window. Either threshold trips the circuit.
+ * cleanly. What it does NOT handle is (b): a "degraded but not failed" state
+ * where every request succeeds eventually, but p90 latency creeps up. A pure
+ * failure-rate trigger would miss this — so this breaker tracks both.
  *
  * STATE MACHINE
  *
@@ -20,35 +20,34 @@
  *           If failure_rate ≥ trip_failure_rate OR p90_latency ≥ trip_p90_ms
  *           over the current window → OPEN.
  *
- *   OPEN   — trip has occurred. All calls are refused with CircuitOpenError
- *           until cooldown_ms has elapsed since the trip. Caller (HttpLlmClient)
- *           is responsible for routing to a fallback binding — this class
- *           does not know or care what the fallback is.
+ *   OPEN   — trip has occurred. admit() throws CircuitOpenError until
+ *           cooldown_ms has elapsed since the trip.
  *
- *   HALF_OPEN — cooldown elapsed. The NEXT call is allowed through as a
- *           probe. If it succeeds within probe_max_latency_ms → CLOSED,
- *           window is reset. If it fails or is too slow → OPEN again with
- *           a fresh cooldown timer.
+ *   HALF_OPEN — cooldown elapsed. The single admitted probe carries a
+ *           probe-token; only ONE in-flight probe at any time (synchronous
+ *           single-flight claim on admission).
  *
- * WHY SLIDING-WINDOW, NOT CONSECUTIVE-N
+ * TOKENS (K2)
  *
- * Consecutive-N (e.g. "5 failures in a row → trip") reacts too slowly to
- * gradual degradation. A window that says "≥50% failure over the last 20
- * requests within the last 60s" catches the same signal that Sentinel's own
- * RCA (2026-07-08) needed to catch: intermittent slowness that only shows
- * up when you look at the aggregate.
+ * Every admission returns an Object.freeze()d token tracked in a private
+ * WeakSet<object> issued/consumed registry. Tokens are one-shot and
+ * breaker-bound. Plain-object forgery and cross-breaker tokens are
+ * detected as `invalid_token`.
  *
- * WINDOW SIZE
+ * EPOCHS (D6b)
  *
- * The window is bounded in BOTH count (max N samples) and time (max age_ms).
- * A sample rolls out when EITHER limit is exceeded, whichever fires first.
- * This prevents a burst of quick requests from evicting older-but-relevant
- * samples, and prevents ancient samples from lingering when traffic is slow.
+ *   closedEpoch     bumps on every HALF_OPEN → CLOSED
+ *   tripGeneration  bumps on every CLOSED → OPEN
+ *   recoveryEpoch   bumps on every HALF_OPEN → OPEN (same trip generation);
+ *                   resets to 0 on CLOSED → OPEN and on HALF_OPEN → CLOSED
+ *   probeSequence   bumps on every OPEN → HALF_OPEN (globally monotonic)
+ *   stateRevision   bumps on every state mutation (globally monotonic)
  *
  * DETERMINISM
  *
- * All time reads go through the injected `now()` clock. Tests can drive the
- * breaker deterministically without setTimeout / Date.now dependencies.
+ * All time reads go through the constructor-injected `now()` clock. There is
+ * no caller-supplied `now` parameter on admit() or recordOutcome() (K3).
+ * There is no public reset() (K3).
  */
 
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
@@ -65,9 +64,7 @@ export interface CircuitBreakerConfig {
    */
   tripFailureRate?: number;
   /**
-   * p90 latency threshold that trips the circuit, in ms. Default: 15_000
-   * (15s — well below Sentinel's degraded p90=22s but above healthy SERV
-   * response times ~2-6s under normal load).
+   * p90 latency threshold that trips the circuit, in ms. Default: 15_000.
    * Only enforced once the window has at least `minSamples` samples.
    */
   tripP90LatencyMs?: number;
@@ -82,11 +79,10 @@ export interface CircuitBreakerConfig {
   cooldownMs?: number;
   /**
    * Max latency for the half-open probe request. If the probe succeeds but
-   * exceeds this, we go back to OPEN (SERV is still degraded). Default:
-   * equal to tripP90LatencyMs.
+   * exceeds this, we go back to OPEN. Default: equal to tripP90LatencyMs.
    */
   probeMaxLatencyMs?: number;
-  /** Injected clock — defaults to Date.now. */
+  /** Injected clock — test-only field. Defaults to Date.now. */
   now?: () => number;
 }
 
@@ -100,7 +96,7 @@ export class CircuitOpenError extends Error {
   constructor(
     public readonly circuitName: string,
     public readonly state: CircuitState,
-    public readonly reason: string
+    public readonly reason: string,
   ) {
     super(`[circuit-breaker] ${circuitName} is ${state}: ${reason}`);
     this.name = 'CircuitOpenError';
@@ -117,6 +113,134 @@ const DEFAULTS: Required<Omit<CircuitBreakerConfig, 'now'>> = {
   probeMaxLatencyMs: 15_000,
 };
 
+// -----------------------------------------------------------------------------
+// Token & event types (S3 discriminated)
+// -----------------------------------------------------------------------------
+
+export type NormalAdmissionToken = Readonly<{
+  kind: 'normal';
+  admissionSequence: number;
+  closedEpoch: number;
+  stateRevision: number;
+}>;
+
+export type ProbeAdmissionToken = Readonly<{
+  kind: 'probe';
+  admissionSequence: number;
+  tripGeneration: number;
+  recoveryEpoch: number;
+  probeSequence: number;
+  stateRevision: number;
+}>;
+
+export type CircuitAdmissionToken = NormalAdmissionToken | ProbeAdmissionToken;
+
+export type CircuitTransitionEvent =
+  | {
+      kind: 'closed_to_open';
+      reason: 'failure_rate' | 'latency';
+      alias: string;
+      from: 'CLOSED';
+      to: 'OPEN';
+      at: number;
+      tripGeneration: number;
+      stateRevision: number;
+    }
+  | {
+      kind: 'open_to_half_open';
+      alias: string;
+      from: 'OPEN';
+      to: 'HALF_OPEN';
+      at: number;
+      tripGeneration: number;
+      recoveryEpoch: number;
+      probeSequence: number;
+      stateRevision: number;
+    }
+  | {
+      kind: 'half_open_to_open';
+      reason: 'probe_failed' | 'probe_slow';
+      alias: string;
+      from: 'HALF_OPEN';
+      to: 'OPEN';
+      at: number;
+      tripGeneration: number;
+      recoveryEpoch: number;
+      probeSequence: number;
+      stateRevision: number;
+    }
+  | {
+      kind: 'half_open_to_closed';
+      alias: string;
+      from: 'HALF_OPEN';
+      to: 'CLOSED';
+      at: number;
+      tripGeneration: number;
+      recoveryEpoch: number;
+      probeSequence: number;
+      closedEpoch: number;
+      stateRevision: number;
+    };
+
+export type CircuitStaleResultEvent = {
+  kind: 'stale_result';
+  reason:
+    | 'invalid_token'
+    | 'already_consumed'
+    | 'wrong_state'
+    | 'wrong_epoch'
+    | 'wrong_generation';
+  alias: string;
+  at: number;
+  stateRevision: number;
+};
+
+export type CircuitInvalidOutcomeEvent = {
+  kind: 'invalid_outcome';
+  reason: 'nan_latency' | 'infinite_latency' | 'negative_latency';
+  alias: string;
+  at: number;
+  stateRevision: number;
+};
+
+export type CircuitDomainEvent =
+  | CircuitTransitionEvent
+  | CircuitStaleResultEvent
+  | CircuitInvalidOutcomeEvent;
+
+export type CircuitAdmission =
+  | {
+      kind: 'normal';
+      token: NormalAdmissionToken;
+      events: readonly CircuitTransitionEvent[];
+    }
+  | {
+      kind: 'probe';
+      token: ProbeAdmissionToken;
+      events: readonly CircuitTransitionEvent[];
+    };
+
+export interface CircuitMutationResult {
+  readonly accepted: boolean;
+  readonly events: readonly CircuitDomainEvent[];
+}
+
+export interface CircuitSnapshot {
+  state: CircuitState;
+  sampleCount: number;
+  failureRate: number;
+  p90LatencyMs: number;
+  openedAt: number | null;
+  lastTripReason: string;
+  closedEpoch: number;
+  tripGeneration: number;
+  recoveryEpoch: number;
+  probeSequence: number;
+  stateRevision: number;
+}
+
+// -----------------------------------------------------------------------------
+
 export class CircuitBreaker {
   private state: CircuitState = 'CLOSED';
   private readonly samples: Sample[] = [];
@@ -125,6 +249,23 @@ export class CircuitBreaker {
   private readonly now: () => number;
   /** Cause of the most recent trip — for CircuitOpenError.reason and telemetry. */
   private lastTripReason: string = '';
+
+  // Epochs / generations (D6b)
+  private closedEpoch = 0;
+  private tripGeneration = 0;
+  private recoveryEpoch = 0;
+  private probeSequence = 0;
+  private stateRevision = 0;
+  private admissionSequence = 0;
+
+  // Probe single-flight flag (I3): set inside admit() when we hand out a probe
+  // token; cleared inside recordOutcome() when the probe completes (accepted or
+  // stale). Only one in-flight probe at a time.
+  private probeInFlight = false;
+
+  // Token identity registry (K2). WeakSet<object> — tokens are frozen objects.
+  private readonly issued = new WeakSet<object>();
+  private readonly consumed = new WeakSet<object>();
 
   constructor(public readonly name: string, config: CircuitBreakerConfig = {}) {
     this.config = {
@@ -141,99 +282,209 @@ export class CircuitBreaker {
   }
 
   /**
-   * Check whether a call may proceed. Throws CircuitOpenError when the
-   * circuit is OPEN and cooldown has not elapsed. Transitions OPEN→HALF_OPEN
-   * transparently when cooldown ends.
-   *
-   * When HALF_OPEN, the FIRST call to canProceed() returns without throwing
-   * (probe allowed); subsequent HALF_OPEN calls throw until the probe result
-   * is reported via recordSuccess / recordFailure.
+   * Attempt to admit a call. Returns a discriminated admission carrying a
+   * frozen one-shot token plus any transition events that occurred during
+   * admission (currently only `open_to_half_open`). Throws CircuitOpenError
+   * if the circuit refuses the call (OPEN in cooldown, or HALF_OPEN with a
+   * probe in flight).
    */
-  canProceed(): void {
-    if (this.state === 'CLOSED') return;
+  admit(): CircuitAdmission {
+    const now = this.now();
+    const events: CircuitTransitionEvent[] = [];
 
     if (this.state === 'OPEN') {
-      const openedFor = this.now() - (this.openedAt ?? 0);
+      const openedFor = now - (this.openedAt ?? 0);
       if (openedFor >= this.config.cooldownMs) {
-        // Cooldown elapsed → transition to HALF_OPEN; the current call is
-        // the probe.
+        // OPEN → HALF_OPEN synchronously; the current admission is the probe.
         this.state = 'HALF_OPEN';
-        return;
-      }
-      throw new CircuitOpenError(this.name, 'OPEN', this.lastTripReason);
-    }
-
-    // HALF_OPEN: only one in-flight probe allowed. We track this implicitly:
-    // once a call is allowed through in HALF_OPEN state, we flip to
-    // 'PROBING' semantics by not permitting further calls until a result is
-    // reported. We express this by requiring the caller to record the
-    // probe outcome before another canProceed() succeeds.
-    //
-    // Simple implementation: if state is HALF_OPEN, we've ALREADY allowed
-    // one probe through (via the OPEN→HALF_OPEN transition above). Any
-    // subsequent canProceed() call before recordSuccess/recordFailure means
-    // a concurrent request — reject to keep probes single-flight.
-    throw new CircuitOpenError(
-      this.name,
-      'HALF_OPEN',
-      'probe request already in flight'
-    );
-  }
-
-  /**
-   * Record a successful call with its latency. Advances state as needed:
-   *   - HALF_OPEN + latency ≤ probeMaxLatencyMs → CLOSED (window reset)
-   *   - HALF_OPEN + latency > probeMaxLatencyMs → OPEN (still degraded)
-   *   - CLOSED → append sample, check trip conditions
-   */
-  recordSuccess(latencyMs: number): void {
-    if (this.state === 'HALF_OPEN') {
-      if (latencyMs <= this.config.probeMaxLatencyMs) {
-        this.close();
+        this.probeSequence += 1;
+        this.stateRevision += 1;
+        events.push({
+          kind: 'open_to_half_open',
+          alias: this.name,
+          from: 'OPEN',
+          to: 'HALF_OPEN',
+          at: now,
+          tripGeneration: this.tripGeneration,
+          recoveryEpoch: this.recoveryEpoch,
+          probeSequence: this.probeSequence,
+          stateRevision: this.stateRevision,
+        });
+        // fall through to HALF_OPEN branch below to issue the probe token
       } else {
-        this.trip(`probe succeeded but latency ${latencyMs}ms > ${this.config.probeMaxLatencyMs}ms`);
+        throw new CircuitOpenError(this.name, 'OPEN', this.lastTripReason);
       }
-      return;
     }
 
-    if (this.state === 'OPEN') {
-      // Shouldn't happen — canProceed should have thrown. Ignore.
-      return;
+    if (this.state === 'HALF_OPEN') {
+      if (this.probeInFlight) {
+        throw new CircuitOpenError(
+          this.name,
+          'HALF_OPEN',
+          'probe request already in flight',
+        );
+      }
+      // Claim the probe slot synchronously — no await between the state check
+      // and this assignment, so a concurrent admit() in the same microtask
+      // will see probeInFlight=true and throw. (I3)
+      this.probeInFlight = true;
+      this.admissionSequence += 1;
+      const token: ProbeAdmissionToken = Object.freeze({
+        kind: 'probe',
+        admissionSequence: this.admissionSequence,
+        tripGeneration: this.tripGeneration,
+        recoveryEpoch: this.recoveryEpoch,
+        probeSequence: this.probeSequence,
+        stateRevision: this.stateRevision,
+      });
+      this.issued.add(token);
+      return { kind: 'probe', token, events };
     }
 
-    this.appendSample({ timestamp: this.now(), latencyMs, failed: false });
-    this.evaluateTrip();
+    // CLOSED
+    this.admissionSequence += 1;
+    const token: NormalAdmissionToken = Object.freeze({
+      kind: 'normal',
+      admissionSequence: this.admissionSequence,
+      closedEpoch: this.closedEpoch,
+      stateRevision: this.stateRevision,
+    });
+    this.issued.add(token);
+    return { kind: 'normal', token, events };
   }
 
   /**
-   * Record a failed call. Advances state as needed:
-   *   - HALF_OPEN → OPEN (still broken)
-   *   - CLOSED → append sample, check trip conditions
+   * Report the outcome of an admitted call. Consumes the token. Returns a
+   * mutation result with `accepted` and any domain events emitted by this
+   * mutation (transitions and/or stale_result and/or invalid_outcome).
    */
-  recordFailure(latencyMs: number): void {
-    if (this.state === 'HALF_OPEN') {
-      this.trip(`probe failed after ${latencyMs}ms`);
-      return;
+  recordOutcome(
+    token: CircuitAdmissionToken,
+    outcome: { ok: boolean; netLatencyMs: number },
+  ): CircuitMutationResult {
+    const now = this.now();
+
+    // -- K2: Identity checks. Neither branch mutates state or samples. --
+    if (!this.issued.has(token)) {
+      return this.staleOnly('invalid_token', now);
+    }
+    if (this.consumed.has(token)) {
+      return this.staleOnly('already_consumed', now);
+    }
+    // Token is legit and unused → mark it consumed. Even if we later reject
+    // due to state/epoch mismatch or invalid latency, the token is one-shot.
+    this.consumed.add(token);
+
+    // -- D6a: Latency validation. NaN/Infinity/negative → coerce to Failure. --
+    const invalidOutcomeEvents: CircuitInvalidOutcomeEvent[] = [];
+    let ok = outcome.ok;
+    let netLatencyMs = outcome.netLatencyMs;
+    if (Number.isNaN(netLatencyMs)) {
+      invalidOutcomeEvents.push(this.makeInvalidOutcome('nan_latency', now));
+      ok = false;
+      netLatencyMs = 0;
+    } else if (!Number.isFinite(netLatencyMs)) {
+      invalidOutcomeEvents.push(this.makeInvalidOutcome('infinite_latency', now));
+      ok = false;
+      netLatencyMs = 0;
+    } else if (netLatencyMs < 0) {
+      invalidOutcomeEvents.push(this.makeInvalidOutcome('negative_latency', now));
+      ok = false;
+      netLatencyMs = 0;
     }
 
-    if (this.state === 'OPEN') {
-      return;
+    // -- S1: State/epoch checks. Explicit reason priority. --
+    if (token.kind === 'normal') {
+      if (this.state !== 'CLOSED') {
+        return this.combine(invalidOutcomeEvents, this.staleOnly('wrong_state', now));
+      }
+      if (token.closedEpoch !== this.closedEpoch) {
+        return this.combine(invalidOutcomeEvents, this.staleOnly('wrong_epoch', now));
+      }
+      // Accept sample into current CLOSED window.
+      this.samples.push({ timestamp: now, latencyMs: netLatencyMs, failed: !ok });
+      this.evictExpired(now);
+      while (this.samples.length > this.config.windowSize) {
+        this.samples.shift();
+      }
+      const tripEvent = this.evaluateTrip(now);
+      const events: CircuitDomainEvent[] = [...invalidOutcomeEvents];
+      if (tripEvent) events.push(tripEvent);
+      return { accepted: true, events };
     }
 
-    this.appendSample({ timestamp: this.now(), latencyMs, failed: true });
-    this.evaluateTrip();
+    // token.kind === 'probe'
+    if (this.state !== 'HALF_OPEN') {
+      // Probe outcome arriving after state has moved on — release probe slot
+      // defensively if we still think a probe is in flight.
+      this.probeInFlight = false;
+      return this.combine(invalidOutcomeEvents, this.staleOnly('wrong_state', now));
+    }
+    if (token.tripGeneration !== this.tripGeneration) {
+      this.probeInFlight = false;
+      return this.combine(invalidOutcomeEvents, this.staleOnly('wrong_generation', now));
+    }
+    if (
+      token.recoveryEpoch !== this.recoveryEpoch ||
+      token.probeSequence !== this.probeSequence
+    ) {
+      this.probeInFlight = false;
+      return this.combine(invalidOutcomeEvents, this.staleOnly('wrong_epoch', now));
+    }
+
+    // Probe legitimately completes.
+    this.probeInFlight = false;
+    const events: CircuitDomainEvent[] = [...invalidOutcomeEvents];
+    if (ok && netLatencyMs <= this.config.probeMaxLatencyMs) {
+      // HALF_OPEN → CLOSED
+      this.closedEpoch += 1;
+      this.recoveryEpoch = 0;
+      this.stateRevision += 1;
+      this.state = 'CLOSED';
+      this.openedAt = null;
+      this.samples.length = 0;
+      events.push({
+        kind: 'half_open_to_closed',
+        alias: this.name,
+        from: 'HALF_OPEN',
+        to: 'CLOSED',
+        at: now,
+        tripGeneration: this.tripGeneration,
+        recoveryEpoch: 0,
+        probeSequence: this.probeSequence,
+        closedEpoch: this.closedEpoch,
+        stateRevision: this.stateRevision,
+      });
+    } else {
+      // HALF_OPEN → OPEN (same trip generation, recoveryEpoch bumps)
+      const reason: 'probe_failed' | 'probe_slow' = ok ? 'probe_slow' : 'probe_failed';
+      const reasonText = ok
+        ? `probe succeeded but latency ${netLatencyMs}ms > ${this.config.probeMaxLatencyMs}ms`
+        : `probe failed after ${netLatencyMs}ms`;
+      this.recoveryEpoch += 1;
+      this.stateRevision += 1;
+      this.state = 'OPEN';
+      this.openedAt = now;
+      this.lastTripReason = reasonText;
+      events.push({
+        kind: 'half_open_to_open',
+        reason,
+        alias: this.name,
+        from: 'HALF_OPEN',
+        to: 'OPEN',
+        at: now,
+        tripGeneration: this.tripGeneration,
+        recoveryEpoch: this.recoveryEpoch,
+        probeSequence: this.probeSequence,
+        stateRevision: this.stateRevision,
+      });
+    }
+    return { accepted: true, events };
   }
 
   /** State snapshot for telemetry / test assertions. */
-  snapshot(): {
-    state: CircuitState;
-    sampleCount: number;
-    failureRate: number;
-    p90LatencyMs: number;
-    openedAt: number | null;
-    lastTripReason: string;
-  } {
-    this.evictExpired();
+  snapshot(): CircuitSnapshot {
+    this.evictExpired(this.now());
     const failed = this.samples.filter((s) => s.failed).length;
     const failureRate = this.samples.length === 0 ? 0 : failed / this.samples.length;
     return {
@@ -243,19 +494,59 @@ export class CircuitBreaker {
       p90LatencyMs: p90(this.samples.map((s) => s.latencyMs)),
       openedAt: this.openedAt,
       lastTripReason: this.lastTripReason,
+      closedEpoch: this.closedEpoch,
+      tripGeneration: this.tripGeneration,
+      recoveryEpoch: this.recoveryEpoch,
+      probeSequence: this.probeSequence,
+      stateRevision: this.stateRevision,
     };
   }
 
-  private appendSample(sample: Sample): void {
-    this.samples.push(sample);
-    this.evictExpired();
-    while (this.samples.length > this.config.windowSize) {
-      this.samples.shift();
-    }
+  // ---- private helpers ------------------------------------------------------
+
+  private staleOnly(
+    reason: CircuitStaleResultEvent['reason'],
+    at: number,
+  ): CircuitMutationResult {
+    return {
+      accepted: false,
+      events: [
+        {
+          kind: 'stale_result',
+          reason,
+          alias: this.name,
+          at,
+          stateRevision: this.stateRevision,
+        },
+      ],
+    };
   }
 
-  private evictExpired(): void {
-    const now = this.now();
+  private makeInvalidOutcome(
+    reason: CircuitInvalidOutcomeEvent['reason'],
+    at: number,
+  ): CircuitInvalidOutcomeEvent {
+    return {
+      kind: 'invalid_outcome',
+      reason,
+      alias: this.name,
+      at,
+      stateRevision: this.stateRevision,
+    };
+  }
+
+  private combine(
+    invalidOutcomes: readonly CircuitInvalidOutcomeEvent[],
+    tail: CircuitMutationResult,
+  ): CircuitMutationResult {
+    if (invalidOutcomes.length === 0) return tail;
+    return {
+      accepted: tail.accepted,
+      events: [...invalidOutcomes, ...tail.events],
+    };
+  }
+
+  private evictExpired(now: number): void {
     while (this.samples.length > 0) {
       const oldest = this.samples[0];
       if (oldest && now - oldest.timestamp > this.config.windowAgeMs) {
@@ -266,46 +557,56 @@ export class CircuitBreaker {
     }
   }
 
-  private evaluateTrip(): void {
-    if (this.samples.length < this.config.minSamples) return;
+  private evaluateTrip(now: number): CircuitTransitionEvent | null {
+    if (this.samples.length < this.config.minSamples) return null;
 
     const failed = this.samples.filter((s) => s.failed).length;
     const failureRate = failed / this.samples.length;
     if (failureRate >= this.config.tripFailureRate) {
-      this.trip(
-        `failure rate ${(failureRate * 100).toFixed(0)}% ≥ ${(this.config.tripFailureRate * 100).toFixed(0)}% over ${this.samples.length} samples`
+      return this.trip(
+        'failure_rate',
+        `failure rate ${(failureRate * 100).toFixed(0)}% ≥ ${(this.config.tripFailureRate * 100).toFixed(0)}% over ${this.samples.length} samples`,
+        now,
       );
-      return;
     }
 
     const p90Latency = p90(this.samples.map((s) => s.latencyMs));
     if (p90Latency >= this.config.tripP90LatencyMs) {
-      this.trip(
-        `p90 latency ${p90Latency}ms ≥ ${this.config.tripP90LatencyMs}ms over ${this.samples.length} samples`
+      return this.trip(
+        'latency',
+        `p90 latency ${p90Latency}ms ≥ ${this.config.tripP90LatencyMs}ms over ${this.samples.length} samples`,
+        now,
       );
-      return;
     }
+    return null;
   }
 
-  private trip(reason: string): void {
+  private trip(
+    reason: 'failure_rate' | 'latency',
+    reasonText: string,
+    now: number,
+  ): CircuitTransitionEvent {
+    this.tripGeneration += 1;
+    this.recoveryEpoch = 0;
+    this.stateRevision += 1;
     this.state = 'OPEN';
-    this.openedAt = this.now();
-    this.lastTripReason = reason;
-  }
-
-  private close(): void {
-    this.state = 'CLOSED';
-    this.openedAt = null;
-    this.samples.length = 0;
-    // Keep lastTripReason for telemetry — helpful to see what caused the
-    // most recent trip even after the circuit closes.
+    this.openedAt = now;
+    this.lastTripReason = reasonText;
+    return {
+      kind: 'closed_to_open',
+      reason,
+      alias: this.name,
+      from: 'CLOSED',
+      to: 'OPEN',
+      at: now,
+      tripGeneration: this.tripGeneration,
+      stateRevision: this.stateRevision,
+    };
   }
 }
 
 /**
- * p90 of a sample array. Returns 0 for empty input. Uses nearest-rank
- * (not linear interpolation) — matches Sentinel's p90 calculation and is
- * simpler to reason about at low N.
+ * p90 of a sample array. Returns 0 for empty input. Uses nearest-rank.
  */
 function p90(values: number[]): number {
   if (values.length === 0) return 0;

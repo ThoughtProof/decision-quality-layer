@@ -473,8 +473,8 @@ describe('B2 — v0431_active gates per-alias CB delivery to client', () => {
       DQL_V0431_ACTIVE: '1',
       DQL_RUNTIME_DIAGNOSTICS: '1',
       DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
-        'serv-nano': { tripP90LatencyMs: 6_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-        'serv-swift': { tripP90LatencyMs: 20_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+        'serv-nano': { tripP90LatencyMs: 6_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
+        'serv-swift': { tripP90LatencyMs: 20_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
       }),
     } as unknown as NodeJS.ProcessEnv;
     const runtime = createProductionRuntime(env);
