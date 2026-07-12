@@ -639,38 +639,30 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     return computeConfigHash(cfg);
   }
 
-  // Helper that swaps in a controlled fetch impl on the factory-built client.
-  // We reach into the runtime's HttpLlmClient and replace its private
-  // fetchImpl at test time via constructor-injection: build the runtime with
-  // clientOverride=undefined but supply a custom clientOptionsOverride.
-  // Since production-runtime factory takes an env and constructs the client
-  // internally, we take a different approach: read the resolved config, then
-  // hand-construct a client using resolveModelBindings + resolveCbByAlias to
-  // mirror EXACTLY what createProductionRuntime would do. This proves the
-  // same wiring path but lets us inject fetchImpl. To satisfy "factory
-  // wiring", we also assert that createProductionRuntime PRODUCES the same
-  // CircuitBreakerConfig for the alias.
-  function buildFactoryLikeClient(
+  // Hermes review round 2 (v0431-e-core-6ca5e61 follow-up): use the REAL
+  // createProductionRuntime factory with the whitelisted clientOptionsOverride
+  // so the sevenField behavioral counter-proofs traverse the full wiring
+  // path Resolver → Factory → Client → Breaker. clientOptionsOverride is
+  // typed to only expose instrumental knobs (fetchImpl, sleep, maxAttempts);
+  // the factory re-spreads safety-relevant options (capitalPathMode,
+  // circuitBreakerConfigByAlias, disableCircuitBreaker) AFTER the override,
+  // so this cannot subvert the per-alias CB wiring being tested.
+  function buildFactoryClient(
     env: NodeJS.ProcessEnv,
     fetchImpl: typeof fetch,
   ): HttpLlmClient {
-    const cfg = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
-    const bindings = resolveModelBindings(cfg);
-    const cbByAlias = resolveCbByAlias(cfg);
-    // Also cross-check: the real factory produces an equivalent per-alias
-    // config, so this hand-built client is the same wiring path.
-    const runtime = createProductionRuntime(env);
-    expect(runtime.config.circuit_breaker_config_by_alias['serv-nano'])
-      .toEqual(cfg.circuit_breaker_config_by_alias['serv-nano']);
-    return new HttpLlmClient(bindings, env, {
-      fetchImpl,
-      capitalPathMode: cfg.capital_path_mode,
-      circuitBreakerConfigByAlias: cbByAlias,
-      // Keep the CB counter-proofs deterministic: no retries and no real
-      // backoff sleeps under fake timers.
-      maxAttempts: 1,
-      sleep: async () => {},
+    const runtime = createProductionRuntime(env, {
+      clientOptionsOverride: {
+        fetchImpl,
+        // Deterministic under fake timers.
+        maxAttempts: 1,
+        sleep: async () => {},
+      },
     });
+    // The factory-built client is our subject of test. Cast to HttpLlmClient
+    // so we can call circuitSnapshot / _testOnlyGetBreaker — the interface
+    // LlmClient hides these introspection hooks by design.
+    return runtime.client as HttpLlmClient;
   }
 
   function makeCbResponse(): Response {
@@ -703,12 +695,12 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     const envHigh = envWithCb({ nano: { tripP90LatencyMs: 5_000, minSamples: 2, tripFailureRate: 1 } });
     expect(hashOf(envLow)).not.toBe(hashOf(envHigh));
 
-    const clientLow = buildFactoryLikeClient(envLow, slowFetchMs(500));
+    const clientLow = buildFactoryClient(envLow, slowFetchMs(500));
     for (let i = 0; i < 2; i++) await clientLow.call('serv-nano', { system: 's', user: 'u' });
     expect(clientLow.circuitSnapshot()['serv-nano']!.state).toBe('OPEN');
 
     vi.setSystemTime(1_000_000);
-    const clientHigh = buildFactoryLikeClient(envHigh, slowFetchMs(500));
+    const clientHigh = buildFactoryClient(envHigh, slowFetchMs(500));
     for (let i = 0; i < 2; i++) await clientHigh.call('serv-nano', { system: 's', user: 'u' });
     expect(clientHigh.circuitSnapshot()['serv-nano']!.state).toBe('CLOSED');
   });
@@ -729,7 +721,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
         if (callIdx <= 3) throw new Error('fetch failed');
         return makeCbResponse();
       }) as unknown as typeof fetch;
-      const client = buildFactoryLikeClient(env, fetchImpl);
+      const client = buildFactoryClient(env, fetchImpl);
       for (let i = 0; i < 5; i++) {
         try {
           await client.call('serv-nano', { system: 's', user: 'u' });
@@ -752,7 +744,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     expect(hashOf(envShort)).not.toBe(hashOf(envLong));
 
     async function tripAndProbe(env: NodeJS.ProcessEnv): Promise<{ postOpenAdmitOk: boolean }> {
-      const client = buildFactoryLikeClient(env, failingFetch());
+      const client = buildFactoryClient(env, failingFetch());
       // 2 failures trip the primary.
       for (let i = 0; i < 2; i++) {
         try {
@@ -804,7 +796,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
         if (callIdx === 1) throw new Error('fetch failed');
         return makeCbResponse();
       }) as unknown as typeof fetch;
-      const client = buildFactoryLikeClient(env, fetchImpl);
+      const client = buildFactoryClient(env, fetchImpl);
       for (let i = 0; i < 4; i++) {
         try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* first call fails */ }
       }
@@ -836,7 +828,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
         if (callIdx <= 1) throw new Error('fetch failed');
         return makeCbResponse();
       }) as unknown as typeof fetch;
-      const client = buildFactoryLikeClient(env, fetchImpl);
+      const client = buildFactoryClient(env, fetchImpl);
       // 1 failure sample
       try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* expected */ }
       // 30 seconds elapse
@@ -862,7 +854,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     expect(hashOf(envLow)).not.toBe(hashOf(envHigh));
 
     async function threeFailures(env: NodeJS.ProcessEnv): Promise<string> {
-      const client = buildFactoryLikeClient(env, failingFetch());
+      const client = buildFactoryClient(env, failingFetch());
       for (let i = 0; i < 3; i++) {
         try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* expected */ }
       }
@@ -889,7 +881,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
         vi.setSystemTime(Date.now() + 500);
         return makeCbResponse();
       }) as unknown as typeof fetch;
-      const client = buildFactoryLikeClient(env, fetchImpl);
+      const client = buildFactoryClient(env, fetchImpl);
       // Trip: 2 failures.
       for (let i = 0; i < 2; i++) {
         try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* expected */ }

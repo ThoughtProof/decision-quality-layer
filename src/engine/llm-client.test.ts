@@ -902,18 +902,28 @@ describe('HttpLlmClient circuit-breaker (PR #10)', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
-  it('H2 T19: unexpected throw after probe admission — exactly one defensive failure, breaker leaves HALF_OPEN', async () => {
-    // Prime the primary to OPEN, wait for cooldown, then submit a call whose
-    // fetchImpl throws a *non-Error* (pathological). The completed-flag
-    // catch must synthesize exactly one recordOutcome(failure) so the probe
-    // slot is released and the breaker leaves HALF_OPEN (re-opens on
-    // failure).
+  it('H2 T19: pathological throw AFTER admit() and BEFORE first recordOutcome — defensive completed-flag catch actually fires (discriminating)', async () => {
+    // Hermes v0431-e-core-6ca5e61-review round 2: the previous T19 (using a
+    // plain 'non-retryable fatal' Error from fetch) was NOT discriminating
+    // because the inner try/catch in llm-client.call() catches the fetch
+    // error, sets retryErr, and then normally reaches recordOutcome() — so
+    // completed becomes true and the outer defensive catch never runs. The
+    // test would still pass with the defensive catch stripped.
+    //
+    // To make T19 discriminate, we inject a pathological throw AT the first
+    // recordOutcome invocation. Only the completed-flag catch can rescue
+    // the token in that scenario. We prove it fires by observing that the
+    // outer catch's defensive recordOutcome is invoked — i.e. the breaker
+    // sees a SECOND recordOutcome call for the same token during a single
+    // client.call().
+    let now = 1_000_000;
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    // Two failures to trip primary, then a happy fetch on the probe.
     const fetchImpl = vi
       .fn()
       .mockRejectedValueOnce(new Error('fetch failed'))
-      .mockRejectedValueOnce(new Error('fetch failed'));
-    let now = 1_000_000;
-    const sleep = vi.fn().mockResolvedValue(undefined);
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      .mockResolvedValueOnce(makeOkResponse());
     const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
       fetchImpl: fetchImpl as unknown as typeof fetch,
       sleep,
@@ -928,24 +938,50 @@ describe('HttpLlmClient circuit-breaker (PR #10)', () => {
         now: () => now,
       },
     });
-    // Two failures trip primary.
+    // Trip.
     await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow();
     await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow();
     expect(client._testOnlyGetBreaker('serv-nano').snapshot().state).toBe('OPEN');
     now += 31_000; // past cooldown → next admit is a probe.
 
-    // Pathological throw: rethrow a plain object that isn't an Error.
-    // The retry loop's inner try/catch treats non-retryable throws as fatal.
-    // In our client the completed-flag catch must fire the defensive
-    // recordOutcome(failure) so the probe slot is released.
-    fetchImpl.mockImplementationOnce(async () => {
-      throw new Error('non-retryable fatal'); // 400-style non-retryable via error type
+    // Poison the primary breaker's recordOutcome: the FIRST call in this
+    // client.call() throws (pathological); the SECOND call (defensive path)
+    // must succeed so the token/probe slot is released cleanly.
+    const cb = client._testOnlyGetBreaker('serv-nano');
+    const originalRecordOutcome = cb.recordOutcome.bind(cb);
+    const recordOutcomeSpy = vi.spyOn(cb, 'recordOutcome');
+    let callIdx = 0;
+    recordOutcomeSpy.mockImplementation(function (this: unknown, token: unknown, outcome: unknown) {
+      callIdx++;
+      if (callIdx === 1) {
+        throw new Error('pathological: recordOutcome exploded mid-flow');
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (originalRecordOutcome as any)(token, outcome);
     });
-    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow();
-    // The breaker recorded a failure outcome on the probe → back to OPEN.
-    const snap = client._testOnlyGetBreaker('serv-nano').snapshot();
-    expect(snap.state).toBe('OPEN');
-    // Not stranded in HALF_OPEN:
+
+    // The client's outer defensive catch must re-invoke recordOutcome with
+    // ok:false so the probe slot is released. The final throw is the
+    // pathological error propagating up.
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /pathological/
+    );
+
+    // Discriminator #1: recordOutcome was called TWICE in one client.call().
+    // The first threw; the defensive catch synthesized the second. If the
+    // defensive catch were removed, this would drop to 1.
+    expect(recordOutcomeSpy).toHaveBeenCalledTimes(2);
+    // Discriminator #2: the SECOND (defensive) invocation reports ok:false
+    // — not the original outcome (which could have been ok:true because
+    // the probe fetch succeeded before recordOutcome threw).
+    const defensiveCall = recordOutcomeSpy.mock.calls[1] as unknown as [
+      unknown,
+      { ok: boolean; netLatencyMs: number },
+    ];
+    expect(defensiveCall[1].ok).toBe(false);
+    // The breaker state after the defensive outcome: token consumed, probe
+    // slot released, breaker no longer stranded in HALF_OPEN.
+    const snap = cb.snapshot();
     expect(snap.state).not.toBe('HALF_OPEN');
   });
 
