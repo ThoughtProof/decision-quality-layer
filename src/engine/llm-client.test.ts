@@ -572,6 +572,404 @@ describe('HttpLlmClient circuit-breaker (PR #10)', () => {
     expect(snap['serv-nano']?.p90LatencyMs).toBeLessThan(15_000);
   });
 
+  // ---------------------------------------------------------------------------
+  // v0.4.3.1 §E-core H1: K5 admission-safety — preconditions BEFORE admit()
+  // ---------------------------------------------------------------------------
+  it('H1: missing primary API key with minSamples=1 — rejects, breaker stays CLOSED, no fetch', async () => {
+    // K5 contract: a missing env var is a local configuration error and
+    // must NEVER appear as a provider-failure sample. Even with the most
+    // trigger-happy config (minSamples=1, tripFailureRate=0.5), the
+    // circuit must remain CLOSED.
+    const fetchImpl = vi.fn();
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, {} as NodeJS.ProcessEnv, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      circuitBreakerConfig: {
+        minSamples: 1,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /missing env var/
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // Breaker was constructed lazily via getBreaker — not via admit — so
+    // circuitSnapshot may or may not know it. We assert on the accessor:
+    const snap = client._testOnlyGetBreaker('serv-nano').snapshot();
+    expect(snap.state).toBe('CLOSED');
+    expect(snap.sampleCount).toBe(0);
+    expect(snap.stateRevision).toBe(0);
+    expect(snap.tripGeneration).toBe(0);
+  });
+
+  it('H1: missing fallback API key when primary breaker is OPEN — rejects, no fetch, no state change', async () => {
+    // Both bindings share SERV_API_KEY in DUAL_ENV — to isolate the fallback,
+    // define a fresh 2-alias map with distinct env vars so we can starve
+    // ONLY the fallback.
+    const isoBinding: Record<string, ModelBinding> = {
+      'primary-a': {
+        provider: 'serv',
+        modelId: 'primary-a',
+        apiKeyEnv: 'PRIMARY_API_KEY',
+        baseUrl: 'https://example.test/v1',
+        fallbackAlias: 'fallback-b',
+      },
+      'fallback-b': {
+        provider: 'serv',
+        modelId: 'fallback-b',
+        apiKeyEnv: 'FALLBACK_API_KEY',
+        baseUrl: 'https://example.test/v1',
+      },
+    };
+    const isoEnv = { PRIMARY_API_KEY: 'sk-primary' } as unknown as NodeJS.ProcessEnv;
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValue(new Error('fetch failed'));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(isoBinding, isoEnv, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      circuitBreakerConfig: {
+        minSamples: 2,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    // Two primary failures trip the primary breaker. The 2nd call reaches
+    // callViaFallback — where the fallback API key precondition must fail
+    // BEFORE fallback admit() is called.
+    await expect(client.call('primary-a', { system: 's', user: 'u' })).rejects.toThrow(
+      /fetch failed/
+    );
+    const fetchCountAfterCall1 = fetchImpl.mock.calls.length;
+    await expect(client.call('primary-a', { system: 's', user: 'u' })).rejects.toThrow(
+      /missing env var/
+    );
+    // The 2nd call attempted primary (which failed and tripped), then
+    // rejected in requireApiKey(fallbackBinding) — no fallback fetch.
+    expect(fetchImpl.mock.calls.length).toBe(fetchCountAfterCall1 + 1);
+    // Fallback breaker never received an admission.
+    const fbSnap = client._testOnlyGetBreaker('fallback-b').snapshot();
+    expect(fbSnap.state).toBe('CLOSED');
+    expect(fbSnap.sampleCount).toBe(0);
+    expect(fbSnap.stateRevision).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // v0.4.3.1 §E-core H2: Client control-flow matrix (K4/K5 under CPM=false/true)
+  // ---------------------------------------------------------------------------
+  //
+  // Matrix legend:
+  //   ROW A: primary admission REJECTED (primary breaker already OPEN)
+  //   ROW B: primary ordinary failure, breaker still CLOSED
+  //   ROW C: primary failure trips OR reopens
+  //   ROW D: primary success
+  //   Each row is exercised under CPM=false and CPM=true.
+  //   Additional rows: fallback-admission reject in two contexts, fallback
+  //   fetch failure, unexpected throw after probe admission, TypeError('fetch
+  //   failed') retry semantics.
+
+  it('H2 row A / CPM=false: primary admission rejected → fallback admission + fetch', async () => {
+    // Use a linear binding (primary→fallback, fallback has no further hop)
+    // so we can trip primary offline without polluting the fallback breaker.
+    const linBinding: Record<string, ModelBinding> = {
+      'primary-a': {
+        provider: 'serv',
+        modelId: 'primary-a',
+        apiKeyEnv: 'SERV_API_KEY',
+        baseUrl: 'https://primary.test/v1',
+        fallbackAlias: 'fallback-b',
+      },
+      'fallback-b': {
+        provider: 'serv',
+        modelId: 'fallback-b',
+        apiKeyEnv: 'SERV_API_KEY',
+        baseUrl: 'https://fallback.test/v1',
+      },
+    };
+    // Two primary failures trip primary (minSamples=2). Then a next call
+    // routes straight to fallback because primary admission is rejected.
+    // Differentiate primary vs fallback by baseUrl.
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlStr.startsWith('https://primary.test')) throw new Error('fetch failed');
+      return makeOkResponse();
+    });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(linBinding, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      circuitBreakerConfig: {
+        minSamples: 2,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    // Warmup: with minSamples=2, the 1st primary failure does not trip
+    // (samples=1 < minSamples), so the error propagates. The 2nd failure
+    // trips the primary (2/2 = 100% ≥ 50%), routing THAT SAME call to the
+    // fallback which succeeds.
+    await expect(client.call('primary-a', { system: 's', user: 'u' })).rejects.toThrow(/fetch/);
+    await client.call('primary-a', { system: 's', user: 'u' }); // 2nd fail trips → same-call fallback ok
+    expect(client._testOnlyGetBreaker('primary-a').snapshot().state).toBe('OPEN');
+    // Fallback breaker recorded only ONE success sample (from the same-call
+    // routing on call #2); still CLOSED.
+    expect(client._testOnlyGetBreaker('fallback-b').snapshot().state).toBe('CLOSED');
+    expect(client._testOnlyGetBreaker('fallback-b').snapshot().sampleCount).toBe(1);
+
+    const fetchCountBefore = fetchImpl.mock.calls.length;
+    const out = await client.call('primary-a', { system: 's', user: 'u' });
+    // Primary admission rejected → exactly ONE fetch (the fallback) started.
+    expect(fetchImpl.mock.calls.length).toBe(fetchCountBefore + 1);
+    expect(out.providerRoute).toBe('fallback');
+    expect(out.modelUsed).toBe('serv:fallback-b');
+  });
+
+  it('H2 row A / CPM=true: primary admission rejected → no fetch, attemptedRoutes=[]', async () => {
+    // Same setup but CPM=true. Prime primary to OPEN first WITHOUT CPM so
+    // the trip path is straightforward, then switch to CPM by using a
+    // second client that shares the same env.
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValue(new Error('fetch failed'));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      capitalPathMode: true,
+      circuitBreakerConfig: {
+        minSamples: 2,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    // 2 failing calls trip primary under CPM. Each is fail-closed.
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(/fetch/);
+    // Under CPM=true, the trip-triggering call rethrows as fail-closed.
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /fail-closed|fetch|circuit/i
+    );
+    expect(client._testOnlyGetBreaker('serv-nano').snapshot().state).toBe('OPEN');
+
+    const fetchCountBefore = fetchImpl.mock.calls.length;
+    try {
+      await client.call('serv-nano', { system: 's', user: 'u' });
+      throw new Error('expected CircuitAllOpenError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(CircuitAllOpenError);
+      expect((err as CircuitAllOpenError).attemptedRoutes).toEqual([]);
+    }
+    // No new fetch was started (primary admission rejected, CPM → fail-closed).
+    expect(fetchImpl.mock.calls.length).toBe(fetchCountBefore);
+  });
+
+  it('H2 row B / CPM=false: ordinary primary failure, breaker still CLOSED → original error, no fallback', async () => {
+    // One failure under minSamples=5 — nowhere near trip. Breaker stays
+    // CLOSED; the caller receives the original error; the fallback is NEVER
+    // reached.
+    const originalErr = new Error('fetch failed: transient blip');
+    const fetchImpl = vi.fn().mockRejectedValueOnce(originalErr);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      circuitBreakerConfig: {
+        minSamples: 5,
+        tripFailureRate: 0.5,
+        windowSize: 10,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /transient blip/
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(client._testOnlyGetBreaker('serv-nano').snapshot().state).toBe('CLOSED');
+  });
+
+  it('H2 row B / CPM=true: ordinary primary failure, breaker still CLOSED → original error, no fallback', async () => {
+    const originalErr = new Error('fetch failed: transient blip');
+    const fetchImpl = vi.fn().mockRejectedValueOnce(originalErr);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      capitalPathMode: true,
+      circuitBreakerConfig: {
+        minSamples: 5,
+        tripFailureRate: 0.5,
+        windowSize: 10,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /transient blip/
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(client._testOnlyGetBreaker('serv-nano').snapshot().state).toBe('CLOSED');
+  });
+
+  it('H2 row C / CPM=true: primary failure trips → fail-closed, attemptedRoutes=[\'primary\']', async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error('fetch failed'));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      capitalPathMode: true,
+      circuitBreakerConfig: {
+        minSamples: 2,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    // 1st failure: below minSamples, error propagates.
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(/fetch/);
+    // 2nd failure: trips the breaker. CPM=true → fail-closed with attemptedRoutes=['primary'].
+    try {
+      await client.call('serv-nano', { system: 's', user: 'u' });
+      throw new Error('expected CircuitAllOpenError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(CircuitAllOpenError);
+      expect((err as CircuitAllOpenError).attemptedRoutes).toEqual(['primary']);
+    }
+  });
+
+  it('H2 row D / CPM=true: primary success — primary served, no fallback', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(makeOkResponse());
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      capitalPathMode: true,
+    });
+    const out = await client.call('serv-nano', { system: 's', user: 'u' });
+    expect(out.providerRoute).toBe('primary');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('H2 fallback-fetch-fail: primary trips, fallback fetches then fails → original fallback error, no tertiary hop', async () => {
+    const fallbackErr = new Error('fetch failed: fallback also down');
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      // Same-call fallback retry:
+      .mockRejectedValueOnce(fallbackErr);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      circuitBreakerConfig: {
+        minSamples: 2,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(/fetch/);
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(/fetch/);
+    // 3rd call: primary trips, fallback attempts, fallback fails —
+    // caller receives original fallback error, NOT a synthetic AllOpen.
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /fallback also down/
+    );
+    // 4 fetches total. No tertiary hop.
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it('H2 T19: unexpected throw after probe admission — exactly one defensive failure, breaker leaves HALF_OPEN', async () => {
+    // Prime the primary to OPEN, wait for cooldown, then submit a call whose
+    // fetchImpl throws a *non-Error* (pathological). The completed-flag
+    // catch must synthesize exactly one recordOutcome(failure) so the probe
+    // slot is released and the breaker leaves HALF_OPEN (re-opens on
+    // failure).
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      .mockRejectedValueOnce(new Error('fetch failed'));
+    let now = 1_000_000;
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      capitalPathMode: true, // Isolate the primary breaker from fallback routing.
+      circuitBreakerConfig: {
+        minSamples: 2,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 30_000,
+        now: () => now,
+      },
+    });
+    // Two failures trip primary.
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow();
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow();
+    expect(client._testOnlyGetBreaker('serv-nano').snapshot().state).toBe('OPEN');
+    now += 31_000; // past cooldown → next admit is a probe.
+
+    // Pathological throw: rethrow a plain object that isn't an Error.
+    // The retry loop's inner try/catch treats non-retryable throws as fatal.
+    // In our client the completed-flag catch must fire the defensive
+    // recordOutcome(failure) so the probe slot is released.
+    fetchImpl.mockImplementationOnce(async () => {
+      throw new Error('non-retryable fatal'); // 400-style non-retryable via error type
+    });
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow();
+    // The breaker recorded a failure outcome on the probe → back to OPEN.
+    const snap = client._testOnlyGetBreaker('serv-nano').snapshot();
+    expect(snap.state).toBe('OPEN');
+    // Not stranded in HALF_OPEN:
+    expect(snap.state).not.toBe('HALF_OPEN');
+  });
+
+  it("H2 T22: TypeError('fetch failed') remains retryable under E-core control-flow", async () => {
+    // Regression guard: PR-#10 RETRYABLE_PATTERN must still catch the raw
+    // undici-flavored 'fetch failed' TypeError — even now that recordOutcome
+    // runs inside the try{}. Two transient throws then success: attemptCount
+    // must reach 3 with 0 fatal escapes.
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(makeOkResponse());
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 5,
+    });
+    const out = await client.call('serv-nano', { system: 's', user: 'u' });
+    expect(out.attemptCount).toBe(3);
+    expect(out.providerRoute).toBe('primary');
+  });
+
   it('T26 (client layer): stale-success — mid-fetch trip does NOT drop the primary response, and the stale outcome does NOT mutate the new state', async () => {
     // Contract: HttpLlmClient.call() served a primary response when the
     // retry loop returned ok=true. If the breaker was concurrently tripped
