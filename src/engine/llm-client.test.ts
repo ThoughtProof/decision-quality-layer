@@ -571,4 +571,72 @@ describe('HttpLlmClient circuit-breaker (PR #10)', () => {
     // p90 stays well below the 15s trip threshold — this is the whole point.
     expect(snap['serv-nano']?.p90LatencyMs).toBeLessThan(15_000);
   });
+
+  it('T26 (client layer): stale-success — mid-fetch trip does NOT drop the primary response, and the stale outcome does NOT mutate the new state', async () => {
+    // Contract: HttpLlmClient.call() served a primary response when the
+    // retry loop returned ok=true. If the breaker was concurrently tripped
+    // by another consumer BETWEEN admit() and recordOutcome(), the token
+    // becomes stale (wrong_epoch when back in CLOSED, or wrong_state when
+    // still OPEN). The client must:
+    //   (a) still return the primary response with providerRoute='primary'
+    //   (b) leave the breaker state (samples, epochs, stateRevision)
+    //       exactly as the concurrent trip left it
+    // This test simulates the race by hooking fetchImpl to trip the
+    // in-client breaker MID-CALL via _testOnlyGetBreaker(). By the time
+    // recordOutcome fires, the breaker is OPEN and the token is stale.
+    const fetchImpl = vi.fn();
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new HttpLlmClient(DUAL_BINDING, DUAL_ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 1,
+      circuitBreakerConfig: {
+        minSamples: 2,
+        tripFailureRate: 0.5,
+        windowSize: 5,
+        tripP90LatencyMs: 999_999,
+        cooldownMs: 60_000,
+      },
+    });
+    // Race helper: during the primary fetch we spin up a side-channel that
+    // trips the primary breaker via its own token machinery. We reach the
+    // same breaker via the test-only accessor. Once trip fires, the token
+    // held by the outer call() is stale.
+    fetchImpl.mockImplementationOnce(async () => {
+      const cb = client._testOnlyGetBreaker('serv-nano');
+      // Drive it to OPEN independently of our outer call. With minSamples=2
+      // and tripFailureRate=0.5, exactly 2 independent admit+failure pairs
+      // trip the breaker. A 3rd admit would already throw CircuitOpenError
+      // and pollute the outer fetch — we must not do that here.
+      for (let i = 0; i < 2; i++) {
+        const adm = cb.admit();
+        cb.recordOutcome(adm.token, { ok: false, netLatencyMs: 500 });
+      }
+      expect(cb.snapshot().state).toBe('OPEN');
+      // Return a successful body so the outer call's retry loop returns ok.
+      return makeOkResponse();
+    });
+
+    // Capture pre-mutation snapshot just before we invoke call(). The
+    // outer admit() will happen inside call(); we care about the state
+    // AFTER the concurrent trip fires inside the fetch.
+    const out = await client.call('serv-nano', { system: 's', user: 'u' });
+
+    // (a) Response served.
+    expect(out.providerRoute).toBe('primary');
+    expect(out.modelUsed).toBe('serv:serv-nano');
+
+    // (b) Breaker state reflects ONLY the concurrent trip — no additional
+    // sample from the stale-success recordOutcome. Before the outer call,
+    // the concurrent side-channel accumulated exactly 2 failure samples
+    // and the 2nd tripped the breaker. The stale-success outcome must
+    // NOT add a 3rd sample and must NOT bump stateRevision further.
+    const snap = client.circuitSnapshot();
+    expect(snap['serv-nano']?.state).toBe('OPEN');
+    expect(snap['serv-nano']?.sampleCount).toBe(2);
+    expect(snap['serv-nano']?.tripGeneration).toBe(1);
+    // The trip advanced stateRevision to 1. The stale recordOutcome must
+    // NOT have bumped it further.
+    expect(snap['serv-nano']?.stateRevision).toBe(1);
+  });
 });
