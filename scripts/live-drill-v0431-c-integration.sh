@@ -32,6 +32,15 @@ VERCEL_TOKEN="${VERCEL_TOKEN:?}"                            # K7-BIND: Inspect-A
 # G3: eindeutiger, nicht-produktiver Marker im D6-Test-Key — wird dem Offline-Verifier
 # separat übergeben und darf NIE im redigierten Manifest oder in Artefakten stehen.
 D6_KEY_MARKER="${D6_KEY_MARKER:?}"
+# Optional: Vercel "Protection Bypass for Automation" — nötig, wenn das Projekt
+# SSO-Deployment-Protection aktiv hat (Stand 2026-07-12: all_except_custom_domains).
+# Wird NUR als Request-Header gesendet; landet in keinem archivierten Artefakt
+# (request.json = Body, headers = RESPONSE-Header). Leer = kein Header (Altverhalten).
+VERCEL_BYPASS_SECRET="${VERCEL_BYPASS_SECRET:-}"
+BYPASS_ARGS=()
+if [[ -n "$VERCEL_BYPASS_SECRET" ]]; then
+  BYPASS_ARGS=(-H "x-vercel-protection-bypass: $VERCEL_BYPASS_SECRET")
+fi
 
 # Pro Szenario: URL des dedizierten immutable Preview-Deploys (Review-§4: auch D2c/D3 eigene Deploys).
 declare -A URLS=(
@@ -266,7 +275,7 @@ PY
   # 1) F1: Health-Body UND HTTP-Status atomar erfassen. Kein `|| true`: Transportfehler = INFRA_FAIL.
   local health_status
   #    SM-R3: --max-time — ein hängender Deploy wird begrenzter INFRA_FAIL, kein Endlos-Hänger.
-  health_status=$(curl -sS --max-time 30 -o "$OUT/$name/health.json" -w '%{http_code}' "$url/dql/health") \
+  health_status=$(curl -sS --max-time 30 ${BYPASS_ARGS[@]+"${BYPASS_ARGS[@]}"} -o "$OUT/$name/health.json" -w '%{http_code}' "$url/dql/health") \
     || infra_fail "$name" "health nicht erreichbar (curl exit $?)"
   printf '%s\n' "$health_status" > "$OUT/$name/health_status"
   local deployed_sha config_hash endpoint_id
@@ -288,7 +297,7 @@ PY
   #    Exitcode separat sichern — kein `|| true`, das Transportfehler in Artefakte verwandeln würde.
   local rc=0
   #    SM-R3: 300 s Deckel — D3 (fünf Achsen, echte LLM-Calls) braucht Luft; Timeout = INFRA_FAIL.
-  curl -sS --max-time 300 -D "$OUT/$name/headers" -o "$OUT/$name/body.json" \
+  curl -sS --max-time 300 ${BYPASS_ARGS[@]+"${BYPASS_ARGS[@]}"} -D "$OUT/$name/headers" -o "$OUT/$name/body.json" \
     -H "Content-Type: application/json" -H "Expect:" \
     -X POST "$url/dql/verify" \
     --data-binary "$body" || rc=$?
