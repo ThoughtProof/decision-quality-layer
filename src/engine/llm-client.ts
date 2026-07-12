@@ -349,14 +349,33 @@ export class HttpLlmClient implements LlmClient {
   }
 
   /**
-   * Test-only accessor: return the live CircuitBreaker for an alias.
-   * Intentionally not private so integration tests can drive the state
-   * machine directly (e.g. simulate a mid-fetch trip for stale-success
-   * assertions). Production callers must not use this — hold no stable
-   * references to per-client CircuitBreaker instances.
+   * @internal Test-only accessor: return the live CircuitBreaker for an
+   * alias. Not part of the public production API. Integration tests use
+   * this to drive the state machine directly (e.g. simulate a mid-fetch
+   * trip for stale-success assertions). Production callers must not use
+   * this — hold no stable references to per-client CircuitBreaker
+   * instances.
    */
   _testOnlyGetBreaker(alias: string): CircuitBreaker {
     return this.getBreaker(alias);
+  }
+
+  /**
+   * K5 admission-safety precondition: fail synchronously if the binding's
+   * apiKey env var is missing. Must be called BEFORE breaker.admit() so a
+   * local configuration error never appears as a provider failure sample.
+   * Contract: throws Error with 'missing env var' in the message; does not
+   * touch any circuit breaker; caller is responsible for calling this on
+   * the exact binding it is about to attempt (primary or fallback).
+   */
+  private requireApiKey(binding: ModelBinding): string {
+    const value = this.env[binding.apiKeyEnv];
+    if (!value) {
+      throw new Error(
+        `[llm-client] missing env var '${binding.apiKeyEnv}' for provider '${binding.provider}'`
+      );
+    }
+    return value;
   }
 
   /** Snapshot of every alias circuit — for telemetry / test assertions. */
@@ -385,6 +404,13 @@ export class HttpLlmClient implements LlmClient {
       const out = await this.callWithRetry(binding, input);
       return { ...out, providerRoute: 'primary' };
     }
+
+    // K5 admission-safety: verify preconditions BEFORE admit(). A missing
+    // API key is a local configuration error, not a provider failure. If
+    // we admitted first and then discovered the missing key, a small
+    // minSamples could trip the circuit on config errors. Throw here so
+    // no token is issued and no sample is recorded.
+    this.requireApiKey(binding);
 
     // Try primary. If its circuit is OPEN, route to fallback alias —
     // UNLESS we're in capital-path mode, where fail-closed is mandatory
@@ -536,6 +562,11 @@ export class HttpLlmClient implements LlmClient {
         `[llm-client] fallbackAlias '${fallbackAlias}' for '${primaryAlias}' not in modelMap`
       );
     }
+    // K5 admission-safety for the fallback binding too. Same reasoning:
+    // fail-fast on a missing fallback API key rather than letting an
+    // admission→config-error→sample sequence occur.
+    this.requireApiKey(fallbackBinding);
+
     const fallbackBreaker = this.getBreaker(fallbackAlias);
     let fallbackAdmission;
     try {
