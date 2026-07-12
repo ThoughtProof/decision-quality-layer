@@ -348,6 +348,17 @@ export class HttpLlmClient implements LlmClient {
     return cb;
   }
 
+  /**
+   * Test-only accessor: return the live CircuitBreaker for an alias.
+   * Intentionally not private so integration tests can drive the state
+   * machine directly (e.g. simulate a mid-fetch trip for stale-success
+   * assertions). Production callers must not use this — hold no stable
+   * references to per-client CircuitBreaker instances.
+   */
+  _testOnlyGetBreaker(alias: string): CircuitBreaker {
+    return this.getBreaker(alias);
+  }
+
   /** Snapshot of every alias circuit — for telemetry / test assertions. */
   circuitSnapshot(): Record<string, ReturnType<CircuitBreaker['snapshot']>> {
     const out: Record<string, ReturnType<CircuitBreaker['snapshot']>> = {};

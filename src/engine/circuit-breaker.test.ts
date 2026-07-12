@@ -516,6 +516,57 @@ describe('CircuitBreaker — token identity & stale results', () => {
     expect(stales[0]!.reason).toBe('wrong_epoch');
   });
 
+  it('T26 (CB layer): stale-success — wrong_epoch outcome does NOT mutate window/state', () => {
+    // Beweist die CB-seitige Hälfte von T26: Wenn ein normal-Token mit
+    // ok=true, aber wrong_epoch eintrifft, darf die Mutation weder ins
+    // sliding window noch in state/epochs eingreifen. Die Client-seitige
+    // "Response wird served"-Hälfte lebt in llm-client.test.ts unter T26.
+    const clock = makeClock();
+    const cb = new CircuitBreaker('serv-nano', {
+      now: clock.now,
+      minSamples: 3,
+      tripFailureRate: 0.5,
+      cooldownMs: 30_000,
+      probeMaxLatencyMs: 5_000,
+    });
+    // Admit CLOSED normal token BUT hold its outcome back.
+    const stale = cb.admit();
+    expect(stale.kind).toBe('normal');
+
+    // Force a trip and full recovery so closedEpoch advances to 1.
+    for (let i = 0; i < 3; i++) failure(cb, 500);
+    expect(cb.snapshot().state).toBe('OPEN');
+    clock.advance(31_000);
+    const probe = cb.admit();
+    cb.recordOutcome(probe.token, { ok: true, netLatencyMs: 500 });
+    // After close, samples are cleared. Add ONE healthy sample so we have
+    // a non-empty window to compare against.
+    success(cb, 400);
+    const before = cb.snapshot();
+    expect(before.state).toBe('CLOSED');
+    expect(before.closedEpoch).toBe(1);
+    expect(before.sampleCount).toBe(1);
+
+    // Now deliver the stale ok=true outcome from the previous epoch.
+    const late = cb.recordOutcome(stale.token, { ok: true, netLatencyMs: 500 });
+    expect(late.accepted).toBe(false);
+    const stales = late.events.filter(
+      (e): e is CircuitStaleResultEvent => e.kind === 'stale_result',
+    );
+    expect(stales).toHaveLength(1);
+    expect(stales[0]!.reason).toBe('wrong_epoch');
+
+    // The invariant: NOTHING about state/window changed.
+    const after = cb.snapshot();
+    expect(after.state).toBe(before.state);
+    expect(after.sampleCount).toBe(before.sampleCount);
+    expect(after.failureRate).toBe(before.failureRate);
+    expect(after.closedEpoch).toBe(before.closedEpoch);
+    expect(after.tripGeneration).toBe(before.tripGeneration);
+    expect(after.recoveryEpoch).toBe(before.recoveryEpoch);
+    expect(after.stateRevision).toBe(before.stateRevision);
+  });
+
   it('T13: policy fingerprint — snapshot exposes epochs and stateRevision', () => {
     const cb = new CircuitBreaker('serv-nano', { minSamples: 100 });
     const s0 = cb.snapshot();
