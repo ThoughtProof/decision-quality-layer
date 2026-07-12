@@ -180,8 +180,8 @@ describe('M7 + M8 — /dql/health handler contract', () => {
     process.env.DQL_V0431_ACTIVE = '1';
     process.env.DQL_RUNTIME_DIAGNOSTICS = '1';
     process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
-      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
     // VERCEL_GIT_COMMIT_SHA intentionally unset.
     const mod = await import('./health.js');
@@ -200,8 +200,8 @@ describe('M7 + M8 — /dql/health handler contract', () => {
     process.env.DQL_V0431_ACTIVE = '1';
     process.env.DQL_RUNTIME_DIAGNOSTICS = '1';
     process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
-      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
     process.env.VERCEL_GIT_COMMIT_SHA = 'abc1234def5678';
     const mod = await import('./health.js');
@@ -231,8 +231,8 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
     process.env.DQL_RUNTIME_DIAGNOSTICS = '1';
     process.env.DQL_DISABLE_CIRCUIT_BREAKER = '0';
     process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
-      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
     process.env.VERCEL_GIT_COMMIT_SHA = 'abc1234def5678';
   }
@@ -396,7 +396,7 @@ describe('H2 — v0431_active rejects empty / partial per-alias CB entries', () 
     primeActiveCanaryMinusAliasCfg();
     process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
       'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5 },
-      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
     const mod = await import('./health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
@@ -408,8 +408,8 @@ describe('H2 — v0431_active rejects empty / partial per-alias CB entries', () 
   it('all fields present per alias → 200 (positive control)', async () => {
     primeActiveCanaryMinusAliasCfg();
     process.env.DQL_CB_CONFIG_BY_ALIAS = JSON.stringify({
-      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+      'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
+      'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
     const mod = await import('./health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');

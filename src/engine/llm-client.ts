@@ -378,9 +378,17 @@ export class HttpLlmClient implements LlmClient {
     // Try primary. If its circuit is OPEN, route to fallback alias —
     // UNLESS we're in capital-path mode, where fail-closed is mandatory
     // until v0.4.3 recertifies the fallback alias on the full 100-case suite.
+    //
+    // v0.4.3.1 §E: admit() returns a token; recordOutcome(token, …) reports
+    // the outcome. K5 admission-safety: the recordOutcome call sits inside
+    // the try{} after the retry loop so its mutation result is available to
+    // the routing decision; a completed-flag catch reports a defensive
+    // failure only on pathological throws (e.g. bugs, aborts outside the
+    // retry loop) so the probe cannot strand HALF_OPEN.
     const primaryBreaker = this.getBreaker(modelAlias);
+    let primaryAdmission;
     try {
-      primaryBreaker.canProceed();
+      primaryAdmission = primaryBreaker.admit();
     } catch (err) {
       if (err instanceof CircuitOpenError) {
         if (this.capitalPathMode) {
@@ -398,40 +406,66 @@ export class HttpLlmClient implements LlmClient {
       throw err;
     }
 
-    // Circuit is CLOSED (or HALF_OPEN probe was granted) — primary attempt.
+    // Circuit admitted (CLOSED, or HALF_OPEN probe was granted) — primary attempt.
     const started = Date.now();
+    let completed = false;
     try {
-      const out = await this.callWithRetry(binding, input);
-      // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
-      // circuit-breaker, not wall-clock. Backoff waits are retry-policy
-      // delay, not provider processing time. Successful retry clusters
-      // must not inflate the latency signal; exhausted retry loops are
-      // independently represented by the failure-rate path (throw path
-      // below), which feeds recordFailure() only once the retry loop is
-      // exhausted — successful retry clusters emit no failure sample.
-      const wallClock = Date.now() - started;
-      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
-      primaryBreaker.recordSuccess(netLatency);
-      return { ...out, providerRoute: 'primary' };
-    } catch (err) {
-      // Wall-clock elapsed for failures — the retry loop exhausted, so the
-      // TOTAL time is the meaningful signal for the failure_rate window.
-      // (There is no LlmCallOutput to read backoffWaitedMs from on this path.)
-      primaryBreaker.recordFailure(Date.now() - started);
-      // If the circuit just tripped from this failure, try fallback for the
-      // very SAME call — the caller shouldn't eat one "cold" failure per trip.
-      // In capital-path mode, fail-closed instead of routing to fallback.
-      if (primaryBreaker.snapshot().state === 'OPEN') {
+      let out;
+      let ok: boolean;
+      let netLatency: number;
+      let retryErr: unknown = null;
+      try {
+        out = await this.callWithRetry(binding, input);
+        const wallClock = Date.now() - started;
+        // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
+        // circuit-breaker, not wall-clock. Backoff waits are retry-policy
+        // delay, not provider processing time.
+        netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+        ok = true;
+      } catch (err) {
+        retryErr = err;
+        // Wall-clock elapsed for failures. There is no LlmCallOutput here.
+        // For symmetry with the success path we cannot subtract backoff we
+        // did not accumulate; wall-clock is the meaningful signal for the
+        // failure_rate window at this layer.
+        netLatency = Date.now() - started;
+        ok = false;
+        out = undefined;
+      }
+
+      // K5: recordOutcome runs inside the try{} so the routing decision
+      // below can read the post-mutation state (i.e. whether this outcome
+      // just tripped the breaker). We deliberately drop the events return
+      // in E-core; C+integration wires them through the diagnostics
+      // collector.
+      primaryBreaker.recordOutcome(primaryAdmission.token, {
+        ok,
+        netLatencyMs: netLatency,
+      });
+      completed = true;
+
+      if (ok && out) {
+        // Stale-success (mutation.accepted === false, e.g. wrong_state): the
+        // baseline contract is to serve the successful primary response and
+        // leave state unchanged. The mutation events themselves are dropped
+        // here in E-core; C+integration will route them through the
+        // per-request diagnostics collector.
+        return { ...out, providerRoute: 'primary' };
+      }
+
+      // Failure path: decide fallback vs rethrow based on breaker state
+      // AFTER the mutation. This mirrors the pre-§E behavior — the caller
+      // shouldn't eat one "cold" failure per trip when the fallback is
+      // available and CPM=false.
+      const postState = primaryBreaker.snapshot().state;
+      if (postState === 'OPEN' || postState === 'HALF_OPEN') {
         if (this.capitalPathMode) {
-          // Primary fetch was actually attempted (and failed), which is what
-          // just tripped the breaker. CPM disables fallback → fail-closed,
-          // but attemptedRoutes MUST record the primary fetch attempt.
           throw new CircuitAllOpenError(
             modelAlias,
             null,
             primaryBreaker.snapshot().lastTripReason,
             'capital-path-mode: fallback disabled until v0.4.3 recertification',
-            ['primary'] // attemptedRoutes
+            ['primary']
           );
         }
         return await this.callViaFallback(
@@ -442,7 +476,24 @@ export class HttpLlmClient implements LlmClient {
           true // primaryAttempted
         );
       }
-      throw err;
+      // Breaker still CLOSED after ordinary failure → rethrow original error.
+      throw retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+    } catch (unexpected) {
+      // K5 defensive path: recordOutcome did not run (pathological throw
+      // before we could reach it). Emit a defensive failure-outcome so the
+      // token is consumed and the probe slot is released. This is a
+      // last-resort guard; production paths are expected to complete=true.
+      if (!completed) {
+        try {
+          primaryBreaker.recordOutcome(primaryAdmission.token, {
+            ok: false,
+            netLatencyMs: 0,
+          });
+        } catch {
+          // Even the defensive report failing must not mutate the response.
+        }
+      }
+      throw unexpected;
     }
   }
 
@@ -475,8 +526,9 @@ export class HttpLlmClient implements LlmClient {
       );
     }
     const fallbackBreaker = this.getBreaker(fallbackAlias);
+    let fallbackAdmission;
     try {
-      fallbackBreaker.canProceed();
+      fallbackAdmission = fallbackBreaker.admit();
     } catch (err) {
       if (err instanceof CircuitOpenError) {
         // Fallback breaker was already OPEN → no fallback fetch attempted.
@@ -493,16 +545,44 @@ export class HttpLlmClient implements LlmClient {
     }
 
     const started = Date.now();
+    let completed = false;
     try {
-      const out = await this.callWithRetry(fallbackBinding, input);
-      // v0.4.3 CB-latency-fix (PR #11): see primary path for rationale.
-      const wallClock = Date.now() - started;
-      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
-      fallbackBreaker.recordSuccess(netLatency);
-      return { ...out, providerRoute: 'fallback' };
-    } catch (err) {
-      fallbackBreaker.recordFailure(Date.now() - started);
-      throw err;
+      let out;
+      let ok: boolean;
+      let netLatency: number;
+      let retryErr: unknown = null;
+      try {
+        out = await this.callWithRetry(fallbackBinding, input);
+        const wallClock = Date.now() - started;
+        netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
+        ok = true;
+      } catch (err) {
+        retryErr = err;
+        netLatency = Date.now() - started;
+        ok = false;
+        out = undefined;
+      }
+      fallbackBreaker.recordOutcome(fallbackAdmission.token, {
+        ok,
+        netLatencyMs: netLatency,
+      });
+      completed = true;
+      if (ok && out) {
+        return { ...out, providerRoute: 'fallback' };
+      }
+      throw retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+    } catch (unexpected) {
+      if (!completed) {
+        try {
+          fallbackBreaker.recordOutcome(fallbackAdmission.token, {
+            ok: false,
+            netLatencyMs: 0,
+          });
+        } catch {
+          // best-effort
+        }
+      }
+      throw unexpected;
     }
   }
 

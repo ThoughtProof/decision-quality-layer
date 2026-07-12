@@ -224,8 +224,8 @@ describe('B6 — Full v0.4.3.1 schema', () => {
       DQL_V0431_ACTIVE: '1',
       DQL_RUNTIME_DIAGNOSTICS: '1',
       DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
-        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-        'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
+        'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
       }),
     });
     const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });
@@ -419,7 +419,7 @@ describe('B2 — v0431_active requires explicit per-alias CB config', () => {
       DQL_V0431_ACTIVE: '1',
       DQL_RUNTIME_DIAGNOSTICS: '1',
       DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
-        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
       }),
     });
     let caught: unknown = null;
@@ -441,8 +441,8 @@ describe('B2 — v0431_active requires explicit per-alias CB config', () => {
       DQL_V0431_ACTIVE: '1',
       DQL_RUNTIME_DIAGNOSTICS: '1',
       DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
-        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-        'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+        'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
+        'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
       }),
     });
     const c = resolveProductionConfig(env, { requiredMode: 'pot-cli' });

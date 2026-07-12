@@ -54,6 +54,14 @@ export interface AliasCircuitBreakerConfig {
   tripFailureRate: number;
   /** cooldown in ms before HALF_OPEN probe. */
   cooldownMs: number;
+  /** Max samples in the sliding window. */
+  windowSize: number;
+  /** Max age of a sample in ms. */
+  windowAgeMs: number;
+  /** Min samples required before either threshold can trip. */
+  minSamples: number;
+  /** Max latency for the HALF_OPEN probe request. */
+  probeMaxLatencyMs: number;
 }
 
 /** Product-side latency ceiling (kept separate from CB trip). */
@@ -275,8 +283,27 @@ export function endpointIdFor(url: string | null): 'openserv-default' | 'custom'
  * with the canary flag OFF. That violated the shadow-mode principle.
  */
 const DEFAULT_CB_BY_ALIAS: Record<KnownAlias, AliasCircuitBreakerConfig> = {
-  'serv-nano': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
-  'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000 },
+  'serv-nano': {
+    tripP90LatencyMs: 15_000,
+    tripFailureRate: 0.5,
+    cooldownMs: 30_000,
+    // v0.4.3.1 §E: these default to the CircuitBreaker defaults so OFF-mode
+    // behaviour stays byte-identical to pre-§E. ACTIVE mode requires them
+    // to be explicit — see readCbByAlias().
+    windowSize: 20,
+    windowAgeMs: 60_000,
+    minSamples: 5,
+    probeMaxLatencyMs: 15_000,
+  },
+  'serv-swift': {
+    tripP90LatencyMs: 15_000,
+    tripFailureRate: 0.5,
+    cooldownMs: 30_000,
+    windowSize: 20,
+    windowAgeMs: 60_000,
+    minSamples: 5,
+    probeMaxLatencyMs: 15_000,
+  },
 };
 
 const DEFAULT_LATENCY_CEILING_BY_ALIAS: Record<KnownAlias, AliasLatencyCeiling> = {
@@ -291,10 +318,29 @@ const DEFAULT_LATENCY_CEILING_BY_ALIAS: Record<KnownAlias, AliasLatencyCeiling> 
  *   tripFailureRate  in [0,1]
  *   cooldownMs      >= 0
  */
-const CB_ALIAS_KEYS = ['tripP90LatencyMs', 'tripFailureRate', 'cooldownMs'] as const;
+const CB_ALIAS_KEYS = [
+  'tripP90LatencyMs',
+  'tripFailureRate',
+  'cooldownMs',
+  'windowSize',
+  'windowAgeMs',
+  'minSamples',
+  'probeMaxLatencyMs',
+] as const;
 type CbAliasKey = (typeof CB_ALIAS_KEYS)[number];
 
-function validateCbNumber(key: CbAliasKey, value: number): string | null {
+/**
+ * ACTIVE mode requires all four new §E fields to be explicitly set in the
+ * DQL_CB_CONFIG_BY_ALIAS override. OFF mode inherits the defaults above.
+ */
+const CB_ALIAS_ACTIVE_REQUIRED_KEYS = [
+  'windowSize',
+  'windowAgeMs',
+  'minSamples',
+  'probeMaxLatencyMs',
+] as const;
+
+function validateCbNumber(key: CbAliasKey, value: number, ctx: { windowSize?: number } = {}): string | null {
   if (key === 'tripP90LatencyMs' && !(value > 0)) {
     return `must be > 0 (got ${value})`;
   }
@@ -303,6 +349,26 @@ function validateCbNumber(key: CbAliasKey, value: number): string | null {
   }
   if (key === 'cooldownMs' && !(value >= 0)) {
     return `must be >= 0 (got ${value})`;
+  }
+  if (key === 'windowSize') {
+    if (!Number.isInteger(value) || value < 1 || value > 1000) {
+      return `must be an integer in [1, 1000] (got ${value})`;
+    }
+  }
+  if (key === 'windowAgeMs' && !(value > 0)) {
+    return `must be > 0 (got ${value})`;
+  }
+  if (key === 'minSamples') {
+    if (!Number.isInteger(value) || value < 1) {
+      return `must be an integer ≥ 1 (got ${value})`;
+    }
+    const ws = ctx.windowSize;
+    if (ws !== undefined && value > ws) {
+      return `must be ≤ windowSize (${ws}) (got ${value})`;
+    }
+  }
+  if (key === 'probeMaxLatencyMs' && !(value > 0)) {
+    return `must be > 0 (got ${value})`;
   }
   return null;
 }
@@ -359,7 +425,10 @@ function readCbByAlias(
         );
       }
     }
+    // Two passes: read windowSize first so minSamples validation can
+    // cross-check against the final effective windowSize for this alias.
     for (const key of CB_ALIAS_KEYS) {
+      if (key === 'minSamples') continue; // deferred to pass 2
       if (spec[key] === undefined) continue;
       if (typeof spec[key] !== 'number' || !Number.isFinite(spec[key])) {
         reasons.push(
@@ -374,6 +443,26 @@ function readCbByAlias(
         continue;
       }
       cur[key] = n;
+    }
+    // Pass 2: minSamples with cross-check against effective windowSize.
+    if (spec['minSamples'] !== undefined) {
+      const n = spec['minSamples'];
+      if (typeof n !== 'number' || !Number.isFinite(n)) {
+        reasons.push(
+          `DQL_CB_CONFIG_BY_ALIAS[${alias}].minSamples must be a finite number`,
+        );
+      } else {
+        const boundErr = validateCbNumber('minSamples', n, {
+          windowSize: cur.windowSize,
+        });
+        if (boundErr) {
+          reasons.push(
+            `DQL_CB_CONFIG_BY_ALIAS[${alias}].minSamples ${boundErr}`,
+          );
+        } else {
+          cur.minSamples = n;
+        }
+      }
     }
   }
   return out;
@@ -551,6 +640,10 @@ export function resolveProductionConfig(
     'tripP90LatencyMs',
     'tripFailureRate',
     'cooldownMs',
+    'windowSize',
+    'windowAgeMs',
+    'minSamples',
+    'probeMaxLatencyMs',
   ] as const;
   if (v0431Active && mode === 'pot-cli') {
     const raw = env.DQL_CB_CONFIG_BY_ALIAS;
