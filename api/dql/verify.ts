@@ -103,10 +103,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     collector = new RuntimeDiagnosticsCollector(requestId);
   }
 
-  let response: import('../../src/types.js').DqlResponse | null = null;
-  let statusCode = 200;
-  let errorPayload: Record<string, unknown> | null = null;
-  let flushed = false;
+  // v0.4.3.1 §C+integration H4: prepare (status, payload) inside try/catch,
+  // then send exactly once via sendJsonWithDiagnostics() OUTSIDE the
+  // try/catch. The helper flushes the diagnostics header FIRST
+  // (setHeader is safe as long as no body has been written) THEN calls
+  // res.status(...).json(...). This guarantees the header is wire-effective
+  // on BOTH success and error paths, closing the gap where the previous
+  // implementation flushed only in the 200 branch.
+  let status = 200;
+  let payload: unknown = null;
 
   try {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -116,111 +121,82 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader('X-Request-Id', requestId);
 
     if (req.method === 'OPTIONS') {
+      // No diagnostics on preflight — collector is not populated for OPTIONS.
       return res.status(200).end();
     }
 
     if (req.method !== 'POST') {
-      return res.status(405).json({
-        error: 'Method not allowed',
-        code: 'METHOD_NOT_ALLOWED',
-        allowed: ['POST'],
-      });
+      status = 405;
+      payload = { error: 'Method not allowed', code: 'METHOD_NOT_ALLOWED', allowed: ['POST'] };
+    } else {
+      const contentType = req.headers['content-type'];
+      if (contentType && !contentType.includes('application/json')) {
+        status = 415;
+        payload = { error: 'Content-Type must be application/json', code: 'UNSUPPORTED_MEDIA_TYPE' };
+      } else if (req.body && JSON.stringify(req.body).length > MAX_BODY_SIZE) {
+        status = 413;
+        payload = { error: 'Request too large', code: 'PAYLOAD_TOO_LARGE', max_bytes: MAX_BODY_SIZE };
+      } else {
+        const validation = validateVerifyRequest(req.body);
+        if (!validation.valid) {
+          status = 400;
+          payload = { error: 'Validation failed', code: 'INVALID_REQUEST', details: validation.errors };
+        } else if (RUNTIME.kind === 'error') {
+          // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
+          // resolver failed for a Live-configured deploy, EVERY POST
+          // returns 503, including sandbox=true.
+          status = 503;
+          payload = {
+            error: 'Runtime not initialised',
+            code: 'CONFIG_INVALID',
+            reasons: RUNTIME.reason.reasons,
+          };
+        } else {
+          const response = await runVerification({
+            request: validation.request,
+            cascade: RUNTIME.cascade,
+            sandboxCascade,
+            requestId,
+            version: VERSION,
+            collector: collector ?? undefined,
+          });
+          status = 200;
+          payload = response;
+        }
+      }
     }
-
-    const contentType = req.headers['content-type'];
-    if (contentType && !contentType.includes('application/json')) {
-      return res.status(415).json({
-        error: 'Content-Type must be application/json',
-        code: 'UNSUPPORTED_MEDIA_TYPE',
-      });
-    }
-
-    if (req.body && JSON.stringify(req.body).length > MAX_BODY_SIZE) {
-      return res.status(413).json({
-        error: 'Request too large',
-        code: 'PAYLOAD_TOO_LARGE',
-        max_bytes: MAX_BODY_SIZE,
-      });
-    }
-
-    const validation = validateVerifyRequest(req.body);
-    if (!validation.valid) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        code: 'INVALID_REQUEST',
-        details: validation.errors,
-      });
-    }
-
-    // TODO(phase-1): payment / dev-access gate goes here.
-    //   - X-DQL-Key present + valid + dev_access → skip charge
-    //   - X-DQL-Key present + valid + billable  → record Stripe meter event
-    //   - PAYMENT-SIGNATURE present              → x402 verify + settle
-    //   - Sandbox request                        → skip charge (free)
-    //   - Otherwise                              → 402 Payment Required with both options
-
-    // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start resolver
-    // failed for a Live-configured deploy, EVERY POST returns 503, including
-    // sandbox=true. A mis-configured DQL_CASCADE=pot-cli process must not be
-    // able to answer 200 via the sandbox path — that would let a broken
-    // deploy appear healthy to callers who probe with sandbox first.
-    if (RUNTIME.kind === 'error') {
-      statusCode = 503;
-      errorPayload = {
-        error: 'Runtime not initialised',
-        code: 'CONFIG_INVALID',
-        reasons: RUNTIME.reason.reasons,
-      };
-      return res.status(statusCode).json(errorPayload);
-    }
-
-    response = await runVerification({
-      request: validation.request,
-      cascade: RUNTIME.cascade,
-      sandboxCascade,
-      requestId,
-      version: VERSION,
-      collector: collector ?? undefined,
-    });
-
-    // v0.4.3.1 §C+integration: flush BEFORE res.json() so the header lands
-    // on the wire. This is the primary observability channel for the
-    // canary. Wrapped in try/finally-safe swallow so a diagnostics failure
-    // cannot break the 200. Duplicate flush in the outer `finally` is a
-    // no-op guarded by `flushed`.
-    flushDiagnosticsHeader(collector, res);
-    flushed = true;
-
-    return res.status(200).json(response);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
-    statusCode = 500;
-    errorPayload = {
-      error: 'Internal server error',
-      code: 'INTERNAL_ERROR',
-      details: message,
-    };
-    return res.status(statusCode).json(errorPayload);
-  } finally {
-    // v0.4.3.1 §C+integration: bounded structured flush of the diagnostics
-    // snapshot. Two attachment paths:
-    //   1. Success (status 200 + response is a full DqlResponse) — attach as
-    //      `response.diagnostics`. The response has already been sent above,
-    //      so this mutation is best-effort observability. In the primary
-    //      success path we mutate BEFORE `res.json()` completes via a small
-    //      structured header instead (avoids racing with the socket).
-    //   2. Error path or 503 — attach the snapshot as an `X-DQL-Diagnostics`
-    //      response header (bounded, structured JSON). If headers are already
-    //      sent, we silently drop the header attach; the collector still
-    //      persists inside this closure and would surface via server logs
-    //      elsewhere in production.
-    //
-    // Never throws. Any failure inside the flush is swallowed — diagnostics
-    // must not turn a 200 response into a 500.
-    if (collector && !flushed) {
-      flushDiagnosticsHeader(collector, res);
-    }
+    status = 500;
+    payload = { error: 'Internal server error', code: 'INTERNAL_ERROR', details: message };
   }
+
+  return sendJsonWithDiagnostics(res, collector, status, payload);
+}
+
+/**
+ * v0.4.3.1 §C+integration H4: send status+body in one hop, but ALWAYS
+ * attempt the diagnostics header flush FIRST so it lands on the wire.
+ * Because setHeader is legal until the first body write, this ordering
+ * guarantees the `X-DQL-Diagnostics` (or the truncated-counts pair) is
+ * present on ALL response paths — 200, 400, 405, 413, 415, 500, 503 —
+ * whenever the collector observed activity.
+ *
+ * Never throws. A failure inside the flush is swallowed; the (status,
+ * body) pair is delivered unchanged.
+ */
+export function sendJsonWithDiagnostics(
+  res: VercelResponse,
+  collector: RuntimeDiagnosticsCollector | null,
+  status: number,
+  payload: unknown,
+): void {
+  try {
+    flushDiagnosticsHeader(collector, res);
+  } catch {
+    // Diagnostics must never poison the live response.
+  }
+  res.status(status).json(payload);
 }
 
 /**
@@ -246,7 +222,11 @@ function flushDiagnosticsHeader(
     // Cap header value at 8 KB to stay well below Vercel's 16 KB per-header
     // limit. When over-cap, emit compact counts instead so operators still
     // know the request produced diagnostics that could not fit on the wire.
-    if (serialized.length <= 8_192) {
+    // v0.4.3.1 §C+integration M2: use Buffer.byteLength so we cap on wire
+    // bytes (UTF-8) rather than JavaScript string length. Multi-byte
+    // characters would otherwise sneak past the string-length cap and
+    // push the header over Vercel's 16 KB per-header limit.
+    if (Buffer.byteLength(serialized, 'utf8') <= 8_192) {
       res.setHeader('X-DQL-Diagnostics', serialized);
     } else {
       res.setHeader('X-DQL-Diagnostics-Truncated', '1');

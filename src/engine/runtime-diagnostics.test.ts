@@ -25,7 +25,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   RuntimeDiagnosticsCollector,
   DEFAULT_DIAGNOSTICS_CAPS,
-  type AttemptAttribution,
+  type AttemptEvent,
 } from './runtime-diagnostics.js';
 import { HttpLlmClient, CircuitAllOpenError } from './llm-client.js';
 import type { CallContext } from './call-context.js';
@@ -186,11 +186,16 @@ describe('C-INT-3 Attribution — attemptAlias matches the served alias', () => 
 
     const snap = collector.flush();
     expect(snap.attempts.items.length).toBe(1);
-    const row = snap.attempts.items[0] as AttemptAttribution;
+    const row = snap.attempts.items[0] as AttemptEvent;
     expect(row.requestedAlias).toBe('serv-nano');
     expect(row.attemptAlias).toBe('serv-nano');
     expect(row.route).toBe('primary');
     expect(row.ok).toBe(true);
+    expect(row.iteration).toBe(1);
+    // BindingSummary invariant: one aggregated row per completed retry loop.
+    expect(snap.binding_summaries.items.length).toBe(1);
+    const sum0 = snap.binding_summaries.items[0]!;
+    expect(sum0.attemptCount).toBe(1);
   });
 
   it('primary open → fallback success: attemptAlias === fallbackAlias', async () => {
@@ -215,11 +220,15 @@ describe('C-INT-3 Attribution — attemptAlias matches the served alias', () => 
     // Exactly one attempt row — the fallback fetch. No primary fetch was
     // started because the primary breaker was already OPEN at admit().
     expect(snap.attempts.items.length).toBe(1);
-    const row = snap.attempts.items[0] as AttemptAttribution;
+    const row = snap.attempts.items[0] as AttemptEvent;
     expect(row.requestedAlias).toBe('serv-nano');
     expect(row.attemptAlias).toBe('serv-swift');
     expect(row.route).toBe('fallback');
     expect(row.ok).toBe(true);
+    expect(row.iteration).toBe(1);
+    expect(snap.binding_summaries.items.length).toBe(1);
+    const sum1 = snap.binding_summaries.items[0]!;
+    expect(sum1.route).toBe('fallback');
   });
 });
 
@@ -234,6 +243,7 @@ describe('C-INT-4 Fetch-Budget — bounded caps + drop counters', () => {
       maxStaleResults: 2,
       maxInvalidOutcomes: 2,
       maxAttempts: 100,
+      maxBindingSummaries: 50,
     });
     // Push 5 transitions into a cap-of-2 stream.
     for (let i = 0; i < 5; i++) {
@@ -406,5 +416,63 @@ describe('C-INT-5 Cyclic — collector failure never poisons the client', () => 
     await expect(
       client.call('serv-nano', { system: 's', user: 'u' }, ctx),
     ).rejects.toBeInstanceOf(CircuitAllOpenError);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// v0.4.3.1 §C+integration H3 — snapshot immutability.
+// A consumer that mutates a flushed snapshot MUST NOT be able to see that
+// mutation in the next snapshot, and MUST NOT be able to splice/push into
+// the returned array.
+// -----------------------------------------------------------------------------
+
+describe('H3 — snapshot immutability closes the reference leak', () => {
+  it('per-item freeze: mutating a flushed AttemptEvent throws (strict) or is silently ignored, next flush unchanged', async () => {
+    const collector = new RuntimeDiagnosticsCollector('req-h3');
+    collector.recordAttempt({
+      requestId: 'req-h3',
+      requestedAlias: 'a',
+      attemptAlias: 'a',
+      route: 'primary',
+      iteration: 1,
+      ok: true,
+      elapsedMs: 42,
+    });
+    const snap1 = collector.flush();
+    expect(snap1.attempts.items.length).toBe(1);
+    const item = snap1.attempts.items[0]!;
+    expect(Object.isFrozen(item)).toBe(true);
+    // Attempted mutation is either a TypeError (strict) or a no-op.
+    try { (item as { ok: boolean }).ok = false; } catch { /* strict */ }
+    const snap2 = collector.flush();
+    // Next snapshot reports the original ok=true regardless of the caller's
+    // mutation attempt.
+    expect(snap2.attempts.items[0]!.ok).toBe(true);
+  });
+
+  it('array-level freeze: cannot push/splice into snapshot.items', async () => {
+    const collector = new RuntimeDiagnosticsCollector('req-h3b');
+    collector.recordAttempt({
+      requestId: 'req-h3b', requestedAlias: 'a', attemptAlias: 'a',
+      route: 'primary', iteration: 1, ok: true, elapsedMs: 1,
+    });
+    const snap = collector.flush();
+    expect(Object.isFrozen(snap.attempts.items)).toBe(true);
+    // push/splice raise in strict; the array must remain length=1 either way.
+    try { (snap.attempts.items as unknown as AttemptEvent[]).push({
+      requestId: 'x', requestedAlias: 'a', attemptAlias: 'a',
+      route: 'primary', iteration: 2, ok: false, elapsedMs: 0,
+    }); } catch { /* strict */ }
+    expect(snap.attempts.items.length).toBe(1);
+    // The next snapshot must also still have length=1 — a caller's failed
+    // mutation must not have leaked into the internal buffer.
+    const snap2 = collector.flush();
+    expect(snap2.attempts.items.length).toBe(1);
+  });
+
+  it('snapshot container itself is frozen', async () => {
+    const collector = new RuntimeDiagnosticsCollector('req-h3c');
+    const snap = collector.flush();
+    expect(Object.isFrozen(snap)).toBe(true);
   });
 });

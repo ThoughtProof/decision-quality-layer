@@ -66,7 +66,8 @@
 
 import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError, type CircuitDomainEvent } from './circuit-breaker.js';
 import type { CallContext } from './call-context.js';
-import type { AttemptAttribution } from './runtime-diagnostics.js';
+import type { AttemptEvent, BindingSummary } from './runtime-diagnostics.js';
+import { categorizeFailure } from './runtime-diagnostics.js';
 
 export interface LlmCallInput {
   system: string;
@@ -272,6 +273,23 @@ export interface HttpLlmClientConfig {
    */
   disableCircuitBreaker?: boolean;
   /**
+   * v0.4.3.1 §C+integration H1: require a request-scoped diagnostics
+   * collector on every `call()`. Set by the factory when the resolver
+   * activates the v0431_active canary AND diagnostics_on=true. When set:
+   *   - `ctx.collector` MUST be present or the call is rejected before
+   *     admission and before any provider fetch is attempted.
+   *   - `ctx.collector.requestId` MUST equal `ctx.requestId` (attribution
+   *     guarantee). Mismatch is rejected before admission.
+   * The check runs BEFORE the disableCircuitBreaker fast path, so a caller
+   * cannot bypass diagnostics by opting out of the breaker.
+   *
+   * This is a factory-side safety option — the factory sets it, tests may
+   * NOT override it via clientOptionsOverride (the factory re-spreads it
+   * after the override, same policy as disableCircuitBreaker /
+   * capitalPathMode).
+   */
+  requireDiagnostics?: boolean;
+  /**
    * Capital-path mode: when a Primary circuit is OPEN, DO NOT route to the
    * SERV-internal fallback alias. Instead throw CircuitAllOpenError so the
    * engine emits UNCERTAIN@0 (fail-closed).
@@ -293,7 +311,7 @@ export interface HttpLlmClientConfig {
   capitalPathMode?: boolean;
 }
 
-const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode'>> = {
+const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics'>> = {
   timeoutMs: 60_000,
   maxAttempts: 6,
   backoffBaseMs: 800,
@@ -357,7 +375,7 @@ function readRetryTelemetry(err: unknown): RetryTelemetry | null {
 // -----------------------------------------------------------------------------
 
 export class HttpLlmClient implements LlmClient {
-  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode'>>;
+  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics'>>;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
   private readonly circuitBreakers: Map<string, CircuitBreaker> = new Map();
@@ -367,6 +385,7 @@ export class HttpLlmClient implements LlmClient {
     | undefined;
   private readonly disableCircuitBreaker: boolean;
   private readonly capitalPathMode: boolean;
+  private readonly requireDiagnostics: boolean;
 
   constructor(
     private readonly modelMap: Record<string, ModelBinding> = DEFAULT_MODEL_MAP,
@@ -385,6 +404,7 @@ export class HttpLlmClient implements LlmClient {
     this.circuitBreakerConfigByAlias = config.circuitBreakerConfigByAlias;
     this.disableCircuitBreaker = config.disableCircuitBreaker ?? false;
     this.capitalPathMode = config.capitalPathMode ?? false;
+    this.requireDiagnostics = config.requireDiagnostics ?? false;
   }
 
   /**
@@ -456,32 +476,74 @@ export class HttpLlmClient implements LlmClient {
       throw new Error(`[llm-client] unknown model alias: ${modelAlias}`);
     }
 
+    // v0.4.3.1 §C+integration H1: enforce diagnostics precondition BEFORE
+    // admission and BEFORE any provider fetch. Runs before disableCircuitBreaker
+    // so a caller cannot bypass diagnostics by opting out of the breaker.
+    //
+    // Two invariants:
+    //   1. When requireDiagnostics=true (factory-set on the v0431_active
+    //      canary), ctx.collector MUST be present. Otherwise reject.
+    //   2. When ctx.collector is present, its requestId MUST equal
+    //      ctx.requestId. A mismatch means the collector was cross-wired
+    //      between requests — attribution would be silently wrong.
+    //
+    // Rejection at this point emits ZERO breaker mutations and ZERO fetches:
+    // the throw happens before `getBreaker(...).admit()` and before the
+    // fast-path fetch call.
+    if (this.requireDiagnostics && !ctx?.collector) {
+      throw new Error('[llm-client] diagnostics collector required (v0431_active canary precondition)');
+    }
+    if (ctx?.collector && ctx.collector.requestId !== ctx.requestId) {
+      throw new Error(
+        `[llm-client] diagnostics collector/request mismatch: collector.requestId=${ctx.collector.requestId} ctx.requestId=${ctx.requestId}`,
+      );
+    }
+
     // Fast path: circuit-breaker disabled (tests, or explicit opt-out for
     // legacy baseline runs). Behavior identical to pre-PR-10.
     if (this.disableCircuitBreaker) {
       const started = Date.now();
+      // v0.4.3.1 §C+integration H2: per-iteration AttemptEvents flow via
+      // the callWithRetry hook; the aggregated BindingSummary is recorded
+      // after the retry loop resolves.
+      const emit = (iter: number, ok: boolean, elapsed: number, err: unknown) => {
+        this.recordAttemptEvent(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          iteration: iter,
+          ok,
+          elapsedMs: elapsed,
+          errorCategory: ok ? undefined : categorizeFailure(err),
+        });
+      };
       try {
-        const out = await this.callWithRetry(binding, input);
-        this.recordAttempt(ctx, {
+        const out = await this.callWithRetry(binding, input, emit);
+        const wallClock = Date.now() - started;
+        const backoff = out.backoffWaitedMs ?? 0;
+        this.recordBindingSummary(ctx, {
           requestedAlias: modelAlias,
           attemptAlias: modelAlias,
           route: 'primary',
           ok: true,
-          netLatencyMs: Math.max(0, (Date.now() - started) - (out.backoffWaitedMs ?? 0)),
-          backoffWaitedMs: out.backoffWaitedMs ?? 0,
+          netLatencyMs: Math.max(0, wallClock - backoff),
+          backoffWaitedMs: backoff,
+          wallClockMs: wallClock,
           attemptCount: out.attemptCount ?? 1,
         });
         return { ...out, providerRoute: 'primary', attemptAlias: modelAlias };
       } catch (err) {
         const telemetry = readRetryTelemetry(err);
         const wallClock = Date.now() - started;
-        this.recordAttempt(ctx, {
+        const backoff = telemetry?.backoffWaitedMs ?? 0;
+        this.recordBindingSummary(ctx, {
           requestedAlias: modelAlias,
           attemptAlias: modelAlias,
           route: 'primary',
           ok: false,
-          netLatencyMs: Math.max(0, wallClock - (telemetry?.backoffWaitedMs ?? 0)),
-          backoffWaitedMs: telemetry?.backoffWaitedMs ?? 0,
+          netLatencyMs: Math.max(0, wallClock - backoff),
+          backoffWaitedMs: backoff,
+          wallClockMs: wallClock,
           attemptCount: telemetry?.attemptCount ?? 1,
         });
         throw err;
@@ -539,8 +601,21 @@ export class HttpLlmClient implements LlmClient {
       let attemptCount = 1;
       let backoffWaitedMs = 0;
       let retryErr: unknown = null;
+      // v0.4.3.1 §C+integration H2: per-iteration AttemptEvents on the
+      // primary path.
+      const emitPrimary = (iter: number, iterOk: boolean, elapsed: number, iterErr: unknown) => {
+        this.recordAttemptEvent(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          iteration: iter,
+          ok: iterOk,
+          elapsedMs: elapsed,
+          errorCategory: iterOk ? undefined : categorizeFailure(iterErr),
+        });
+      };
       try {
-        out = await this.callWithRetry(binding, input);
+        out = await this.callWithRetry(binding, input, emitPrimary);
         const wallClock = Date.now() - started;
         // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
         // circuit-breaker, not wall-clock. Backoff waits are retry-policy
@@ -574,15 +649,17 @@ export class HttpLlmClient implements LlmClient {
       this.recordEventsToCtx(ctx, mutation.events);
       completed = true;
 
-      // Record an attempt-attribution row for THIS primary fetch. Every
-      // fetch (success or failure) yields exactly one row.
-      this.recordAttempt(ctx, {
+      // v0.4.3.1 §C+integration H2: BindingSummary for the primary binding
+      // (one row per completed callWithRetry, regardless of iteration count).
+      const wallClockPrimary = Date.now() - started;
+      this.recordBindingSummary(ctx, {
         requestedAlias: modelAlias,
         attemptAlias: modelAlias,
         route: 'primary',
         ok,
         netLatencyMs: netLatency,
         backoffWaitedMs,
+        wallClockMs: wallClockPrimary,
         attemptCount,
       });
 
@@ -705,8 +782,21 @@ export class HttpLlmClient implements LlmClient {
       let attemptCount = 1;
       let backoffWaitedMs = 0;
       let retryErr: unknown = null;
+      // v0.4.3.1 §C+integration H2: per-iteration AttemptEvents on the
+      // fallback path.
+      const emitFallback = (iter: number, iterOk: boolean, elapsed: number, iterErr: unknown) => {
+        this.recordAttemptEvent(ctx, {
+          requestedAlias: primaryAlias,
+          attemptAlias: fallbackAlias,
+          route: 'fallback',
+          iteration: iter,
+          ok: iterOk,
+          elapsedMs: elapsed,
+          errorCategory: iterOk ? undefined : categorizeFailure(iterErr),
+        });
+      };
       try {
-        out = await this.callWithRetry(fallbackBinding, input);
+        out = await this.callWithRetry(fallbackBinding, input, emitFallback);
         const wallClock = Date.now() - started;
         backoffWaitedMs = out.backoffWaitedMs ?? 0;
         attemptCount = out.attemptCount ?? 1;
@@ -729,13 +819,15 @@ export class HttpLlmClient implements LlmClient {
       });
       this.recordEventsToCtx(ctx, mutation.events);
       completed = true;
-      this.recordAttempt(ctx, {
+      const wallClockFallback = Date.now() - started;
+      this.recordBindingSummary(ctx, {
         requestedAlias: primaryAlias,
         attemptAlias: fallbackAlias,
         route: 'fallback',
         ok,
         netLatencyMs: netLatency,
         backoffWaitedMs,
+        wallClockMs: wallClockFallback,
         attemptCount,
       });
       if (ok && out) {
@@ -778,13 +870,14 @@ export class HttpLlmClient implements LlmClient {
   }
 
   /**
-   * v0.4.3.1 §C+integration: record one attempt-attribution row per
-   * provider FETCH attempted during this call. The row is scoped to the
-   * handler-owned requestId (with optional axis/callId).
+   * v0.4.3.1 §C+integration H2: record ONE per-iteration attempt row per
+   * singleCall() iteration. Called from inside callWithRetry's per-iteration
+   * hook — both on success and on transient/terminal failure. The row is
+   * scoped to the handler-owned requestId (with optional axis/callId).
    */
-  private recordAttempt(
+  private recordAttemptEvent(
     ctx: CallContext | undefined,
-    row: Omit<AttemptAttribution, 'requestId' | 'axis' | 'callId'>,
+    row: Omit<AttemptEvent, 'requestId' | 'axis' | 'callId'>,
   ): void {
     const collector = ctx?.collector;
     if (!collector) return;
@@ -801,13 +894,44 @@ export class HttpLlmClient implements LlmClient {
   }
 
   /**
+   * v0.4.3.1 §C+integration H2: record one per-binding aggregated summary
+   * per completed callWithRetry(). Complementary to recordAttemptEvent —
+   * attempts give iteration detail, this gives binding totals.
+   */
+  private recordBindingSummary(
+    ctx: CallContext | undefined,
+    row: Omit<BindingSummary, 'requestId' | 'axis' | 'callId'>,
+  ): void {
+    const collector = ctx?.collector;
+    if (!collector) return;
+    try {
+      collector.recordBindingSummary({
+        requestId: ctx.requestId,
+        axis: ctx.axis,
+        callId: ctx.callId,
+        ...row,
+      });
+    } catch {
+      // Never throw from diagnostics.
+    }
+  }
+
+  /**
    * The original retry-loop, extracted so both primary and fallback paths
    * share behavior. Does NOT touch any circuit breaker — caller records
    * outcome on the appropriate breaker.
    */
+  /**
+   * v0.4.3.1 §C+integration H2: per-iteration hook. Called once per
+   * singleCall() iteration inside the retry loop — both on success and
+   * on transient/terminal failure. The hook is no-throw at the caller
+   * boundary: any throw inside is swallowed to preserve the client's
+   * response semantics.
+   */
   private async callWithRetry(
     binding: ModelBinding,
-    input: LlmCallInput
+    input: LlmCallInput,
+    onIteration?: (iteration: number, ok: boolean, elapsedMs: number, err: unknown) => void,
   ): Promise<LlmCallOutput> {
     const apiKey = this.env[binding.apiKeyEnv];
     if (!apiKey) {
@@ -825,8 +949,14 @@ export class HttpLlmClient implements LlmClient {
     let attemptCount = 0;
     for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
       attemptCount = attempt;
+      const iterStarted = Date.now();
       try {
         const out = await this.singleCall(binding, apiKey, input);
+        // Per-iteration hook: success case.
+        if (onIteration) {
+          try { onIteration(attempt, true, Date.now() - iterStarted, null); }
+          catch { /* diagnostics must never poison the caller */ }
+        }
         return {
           ...out,
           attemptCount: attempt,
@@ -834,6 +964,11 @@ export class HttpLlmClient implements LlmClient {
           retryReasons,
         };
       } catch (err) {
+        // Per-iteration hook: failure case (transient or terminal).
+        if (onIteration) {
+          try { onIteration(attempt, false, Date.now() - iterStarted, err); }
+          catch { /* diagnostics must never poison the caller */ }
+        }
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
         const retryable = RETRYABLE_PATTERN.test(msg);

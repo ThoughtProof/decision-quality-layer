@@ -35,6 +35,7 @@ import {
   resolveProductionConfig,
 } from './production-config.js';
 import type { CallContext } from './call-context.js';
+import { RuntimeDiagnosticsCollector } from './runtime-diagnostics.js';
 import type { DqlRequest } from '../types.js';
 
 const req: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> = {
@@ -665,6 +666,18 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     return runtime.client as HttpLlmClient;
   }
 
+  // v0.4.3.1 §C+integration H1: sevenField suite runs with v0431_active=1
+  // AND diagnostics_on=1 (config rule), so every client.call() must carry
+  // a ctx with a real RuntimeDiagnosticsCollector. Otherwise the H1
+  // precondition rejects before admit. This helper mints a per-call ctx
+  // with a fresh unique requestId — the CB behaviour under test is
+  // orthogonal to diagnostics, we just need the precondition satisfied.
+  let __ctxSeq = 0;
+  function mkTestCtx(): CallContext {
+    const id = `req-seven-${++__ctxSeq}`;
+    return { requestId: id, collector: new RuntimeDiagnosticsCollector(id) };
+  }
+
   function makeCbResponse(): Response {
     return new Response(
       JSON.stringify({
@@ -696,12 +709,12 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     expect(hashOf(envLow)).not.toBe(hashOf(envHigh));
 
     const clientLow = buildFactoryClient(envLow, slowFetchMs(500));
-    for (let i = 0; i < 2; i++) await clientLow.call('serv-nano', { system: 's', user: 'u' });
+    for (let i = 0; i < 2; i++) await clientLow.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx());
     expect(clientLow.circuitSnapshot()['serv-nano']!.state).toBe('OPEN');
 
     vi.setSystemTime(1_000_000);
     const clientHigh = buildFactoryClient(envHigh, slowFetchMs(500));
-    for (let i = 0; i < 2; i++) await clientHigh.call('serv-nano', { system: 's', user: 'u' });
+    for (let i = 0; i < 2; i++) await clientHigh.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx());
     expect(clientHigh.circuitSnapshot()['serv-nano']!.state).toBe('CLOSED');
   });
 
@@ -724,7 +737,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
       const client = buildFactoryClient(env, fetchImpl);
       for (let i = 0; i < 5; i++) {
         try {
-          await client.call('serv-nano', { system: 's', user: 'u' });
+          await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx());
         } catch {
           // expected for the failing ones — CPM=true isolates from fallback
         }
@@ -748,7 +761,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
       // 2 failures trip the primary.
       for (let i = 0; i < 2; i++) {
         try {
-          await client.call('serv-nano', { system: 's', user: 'u' });
+          await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx());
         } catch {
           // expected
         }
@@ -798,7 +811,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
       }) as unknown as typeof fetch;
       const client = buildFactoryClient(env, fetchImpl);
       for (let i = 0; i < 4; i++) {
-        try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* first call fails */ }
+        try { await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx()); } catch { /* first call fails */ }
       }
       const s = client.circuitSnapshot()['serv-nano']!;
       return { state: s.state, sampleCount: s.sampleCount };
@@ -830,11 +843,11 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
       }) as unknown as typeof fetch;
       const client = buildFactoryClient(env, fetchImpl);
       // 1 failure sample
-      try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* expected */ }
+      try { await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx()); } catch { /* expected */ }
       // 30 seconds elapse
       vi.setSystemTime(Date.now() + 30_000);
       // 1 success sample — evicts old failure only if windowAgeMs<30_000
-      await client.call('serv-nano', { system: 's', user: 'u' });
+      await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx());
       return client.circuitSnapshot()['serv-nano']!.sampleCount;
     }
 
@@ -856,7 +869,7 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     async function threeFailures(env: NodeJS.ProcessEnv): Promise<string> {
       const client = buildFactoryClient(env, failingFetch());
       for (let i = 0; i < 3; i++) {
-        try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* expected */ }
+        try { await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx()); } catch { /* expected */ }
       }
       return client.circuitSnapshot()['serv-nano']!.state;
     }
@@ -884,14 +897,14 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
       const client = buildFactoryClient(env, fetchImpl);
       // Trip: 2 failures.
       for (let i = 0; i < 2; i++) {
-        try { await client.call('serv-nano', { system: 's', user: 'u' }); } catch { /* expected */ }
+        try { await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx()); } catch { /* expected */ }
       }
       expect(client.circuitSnapshot()['serv-nano']!.state).toBe('OPEN');
       // Advance past cooldown so admit returns a probe.
       vi.setSystemTime(Date.now() + 11_000);
       // Probe call takes 500ms of synthetic net latency.
       try {
-        await client.call('serv-nano', { system: 's', user: 'u' });
+        await client.call('serv-nano', { system: 's', user: 'u' }, mkTestCtx());
       } catch { /* CPM=true rethrows on trip; fine */ }
       return client.circuitSnapshot()['serv-nano']!.state;
     }
@@ -901,5 +914,136 @@ describe('Hermes E-core H3 — seven-field policy fingerprint via factory wiring
     expect(await tripThenProbeWith500ms(envTight)).toBe('OPEN');
     vi.setSystemTime(1_000_000);
     expect(await tripThenProbeWith500ms(envLoose)).toBe('CLOSED');
+  });
+});
+
+// -----------------------------------------------------------------------------
+// v0.4.3.1 §C+integration H1 — Factory-safety of requireDiagnostics.
+//
+// Contract: when v0431_active=true AND diagnostics_on=true the factory-built
+// client MUST reject any call() that arrives without a request-scoped
+// RuntimeDiagnosticsCollector. Two structural invariants:
+//
+//   (a) A call without ctx.collector rejects BEFORE any fetch and BEFORE any
+//       CircuitBreaker admit/recordOutcome — so no wire I/O leaks under
+//       misconfigured control planes.
+//   (b) The safety flag is NOT overridable via clientOptionsOverride —
+//       the factory re-spreads baseClientOptions after the override, so a
+//       test that tries to pass `requireDiagnostics: false` still ends up
+//       with true.
+//
+// Discrimination checks (mutation counter-proofs) are documented in the
+// commit message that carries this file: removing the precondition in
+// llm-client.ts:call() flips these tests from red→green.
+// -----------------------------------------------------------------------------
+
+describe('H1 — requireDiagnostics factory safety (v0431_active canary)', () => {
+  const CB_STANDARD = {
+    tripP90LatencyMs: 10_000,
+    tripFailureRate: 0.5,
+    cooldownMs: 30_000,
+    windowSize: 20,
+    windowAgeMs: 60_000,
+    minSamples: 5,
+    probeMaxLatencyMs: 15_000,
+  };
+
+  const canaryEnv = (): NodeJS.ProcessEnv =>
+    ({
+      SERV_API_KEY: 'sk-test',
+      DQL_CAPITAL_PATH_MODE: '1',
+      DQL_V0431_ACTIVE: '1',
+      DQL_RUNTIME_DIAGNOSTICS: '1',
+      DQL_CB_CONFIG_BY_ALIAS: JSON.stringify({
+        'serv-nano': CB_STANDARD,
+        'serv-swift': CB_STANDARD,
+      }),
+    }) as unknown as NodeJS.ProcessEnv;
+
+  function factoryClient(env: NodeJS.ProcessEnv, fetchImpl: typeof fetch, override: Record<string, unknown> = {}): HttpLlmClient {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const runtime = createProductionRuntime(env, {
+      clientOptionsOverride: { fetchImpl, sleep: async () => {}, ...override } as any,
+    });
+    return runtime.client as HttpLlmClient;
+  }
+
+  function okFetch(): typeof fetch {
+    return (async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ verdict: 'PASS', confidence: 0.9, reasoning: 'ok', objection: '' }) } }],
+        }),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+  }
+
+  it('H1-1: v0431_active+diagnostics_on and NO collector on ctx → reject BEFORE any fetch or breaker mutation', async () => {
+    const fetchImpl = vi.fn(okFetch());
+    const client = factoryClient(canaryEnv(), fetchImpl as unknown as typeof fetch);
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /diagnostics collector required/,
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // Breaker state should still be CLOSED (or unallocated) — the
+    // precondition rejected BEFORE admit(), so no CircuitBreaker was ever
+    // lazily instantiated for this alias, and no failure counter was mutated.
+    const snap = client.circuitSnapshot();
+    if (snap['serv-nano']) {
+      expect(snap['serv-nano'].state).toBe('CLOSED');
+    } else {
+      // Preferred outcome: no breaker instance created.
+      expect(snap['serv-nano']).toBeUndefined();
+    }
+  });
+
+  it('H1-2: collector present + requestId match → normal fetch proceeds', async () => {
+    const fetchImpl = vi.fn(okFetch());
+    const client = factoryClient(canaryEnv(), fetchImpl as unknown as typeof fetch);
+    const collector = new RuntimeDiagnosticsCollector('req-h1-ok');
+    const ctx: CallContext = { requestId: 'req-h1-ok', collector };
+    const out = await client.call('serv-nano', { system: 's', user: 'u' }, ctx);
+    expect(out.providerRoute).toBe('primary');
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const snap = collector.flush();
+    // H2 invariant: one AttemptEvent per iteration AND one BindingSummary.
+    expect(snap.attempts.items.length).toBe(1);
+    expect(snap.binding_summaries.items.length).toBe(1);
+  });
+
+  it('H1-3: collector.requestId mismatch with ctx.requestId → reject BEFORE any fetch', async () => {
+    const fetchImpl = vi.fn(okFetch());
+    const client = factoryClient(canaryEnv(), fetchImpl as unknown as typeof fetch);
+    const collector = new RuntimeDiagnosticsCollector('req-xxx');
+    const ctx: CallContext = { requestId: 'req-yyy', collector };
+    await expect(client.call('serv-nano', { system: 's', user: 'u' }, ctx)).rejects.toThrow(
+      /collector\/request mismatch/,
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('H1-4: clientOptionsOverride cannot flip requireDiagnostics=false on the canary env', async () => {
+    // Try to pass requireDiagnostics:false through the override channel.
+    // The typed whitelist should reject the field at the type layer, and the
+    // factory re-spreads baseClientOptions AFTER the override at runtime too.
+    const fetchImpl = vi.fn(okFetch());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client = factoryClient(canaryEnv(), fetchImpl as unknown as typeof fetch, {
+      // Cast so the test can attempt the mutation; the runtime re-spread wins.
+      requireDiagnostics: false,
+    } as any);
+    await expect(client.call('serv-nano', { system: 's', user: 'u' })).rejects.toThrow(
+      /diagnostics collector required/,
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('H1-5: canary OFF (v0431_active=0) → no precondition, call proceeds without collector', async () => {
+    const offEnv = { SERV_API_KEY: 'sk-test', DQL_CAPITAL_PATH_MODE: '1' } as unknown as NodeJS.ProcessEnv;
+    const fetchImpl = vi.fn(okFetch());
+    const client = factoryClient(offEnv, fetchImpl as unknown as typeof fetch);
+    const out = await client.call('serv-nano', { system: 's', user: 'u' });
+    expect(out.providerRoute).toBe('primary');
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 });
