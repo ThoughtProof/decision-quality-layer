@@ -82,3 +82,28 @@ Option A ist strukturell sauberer; Option B ist die kleinere Änderung. Entschei
 - Dieses Dokument ist ein **lokaler Entwurf**. Das **öffentliche** Issue anzulegen ist **Approval-pflichtig** (siehe `docs/drill/canary-calibration-v0431.md` §F).
 - **Vor** `Draft→Ready` von PR #12 ist dieser Fail-Open zu adressieren (Fix + Tests) oder als bewusste, dokumentierte Politik zu bestätigen.
 - Für die reine **Preview-Canary (Schritt 3)** ist er **nicht** blockierend: die Beobachtung genau solcher Provider-Fehler ist Zweck der Canary, und der Drill hat ihn als Nicht-Blocker eingestuft.
+
+---
+
+## 9. FIX-NOTIZ (lokal implementiert 2026-07-13 — **VERTRAGSÄNDERUNG**, NICHT gepusht)
+
+> Status: lokaler Commit auf `v0431-recovery-code`. **Kein Push, kein Deploy, keine GitHub-/Vercel-Änderung.** Das öffentliche Issue #13 bleibt **unberührt** (nicht geschlossen, nicht kommentiert).
+
+**Unabhängige Re-Verifikation gegen HEAD `39d69d5`** (nicht gegen das von Hermes genannte `d7a8ff6`): Die Kette aus §1 wurde am aktuellen Code bestätigt. Der Kern-Gap: ein HTTP-401 ist ein **generischer** `Error` (kein `CircuitAllOpenError`), tript den Breaker bei Einzel-Achse **nicht** und wird in `llm-client.ts call()` (Primary-Pfad, Breaker bleibt CLOSED) **roh weitergeworfen** → Engine-`catch` setzt **kein** `provider_outcome` → Aggregat Regel-5-Fallthrough → **ALLOW**.
+
+**Gewählter Ansatz: strukturierte Provenienz (Doc §6 Option A), keine `confidence`-Überladung, kein Message-Parsing.**
+
+1. **`src/engine/llm-client.ts`** — neue typisierte Klasse `ProviderCallError extends Error` (trägt `provider`, optional `httpStatus`, `cause`). Die zwei **provider-stämmigen** Wurfstellen in `singleCall()` werfen jetzt `ProviderCallError` statt eines nackten `Error`:
+   - `!response.ok` (HTTP-Status, u.a. 401/403/5xx),
+   - Transport-`catch` (fetch-Fehler; AbortError→Timeout-Message).
+   Die **Message bleibt wortgleich** erhalten ⇒ `RETRYABLE_PATTERN`, `categorizeFailure()` und alle bestehenden Message-Regex-Tests bleiben unverändert. **Nicht** umgewickelt: lokale Konfig-Fehler (fehlender API-Key, unbekannter Alias) — diese liegen **außerhalb** von `singleCall()` und bleiben generische `Error`, also **kein** Provider-Verdikt.
+2. **`src/engine/index.ts`** — der Per-Achsen-`catch` klassifiziert zusätzlich `err instanceof ProviderCallError → provider_outcome='provider_error'` (aus dem **Typ**, nicht aus der Message). `CircuitAllOpenError`-Logik unverändert; generische Fehler bekommen weiterhin **kein** `provider_outcome`. Wahrheitsgemäße `reasoning` für Provider-Fehler; die sichtbare `objection`/Message bleibt erhalten. Der Fail-Closed-Kommentar `:54-61` wurde mit dem Code in Übereinstimmung gebracht (er behauptete zuvor fälschlich „never ALLOW“).
+3. **`src/aggregation.ts` (VERTRAGSÄNDERUNG)** — **neue Regel 2** direkt unter BLOCK: jede Achse mit `provider_outcome ∈ {provider_error, circuit_rejected}` ⇒ **REVIEW**, **unabhängig von `confidence`**. `'served'` wird **ausgeschlossen**. Wahrheitsgemäße Rationale („… could not be evaluated — provider/auth failure …“) statt „All evaluated axes pass.“. Alte Regeln 2–4 → 3–5 nur **umnummeriert**, Verhalten unverändert.
+
+**Exaktes Verhaltens-Delta:** Vorher fiel eine **einzelne** provider-fehlerhafte Achse (`UNCERTAIN`@0, egal ob 401-Roh-Error oder `CircuitAllOpenError`) auf **ALLOW**. Nachher ⇒ **REVIEW** (oder BLOCK, falls eine andere Achse einen High-Conf-FAIL hat). **Bewusst NICHT geändert:** eine einzelne `UNCERTAIN`@0 **ohne** Provider-Provenienz (z. B. Parser-/Logikfehler) fällt weiterhin auf ALLOW — die bestehende Politik bleibt erhalten (negativer Diskriminierungstest pinnt das).
+
+**Enum/OpenAPI:** **Keine** Schema-Erweiterung. `AxisResult.provider_outcome` enthielt `provider_error` und `circuit_rejected` bereits. Nur die **Laufzeit-Emission** ändert sich (401 emittiert jetzt `provider_error`); der Enum ist unverändert.
+
+**Neue/erweiterte Tests:** `src/aggregation.test.ts` (single `provider_error`/`circuit_rejected` → REVIEW + wahre Rationale; Negativ: `UNCERTAIN`@0 ohne Provenienz bleibt ALLOW; `served` eskaliert nicht; BLOCK-Präzedenz). `src/engine/engine-provider-outcome.test.ts` (Engine↔Aggregat: HTTP-401-`ProviderCallError` und beide `CircuitAllOpen`-Varianten ⇒ Aggregat REVIEW; Negativ: nicht-Provider-Plain-Error ⇒ ALLOW).
+
+**Offen / Approval-pflichtig (NICHT hier):** `Draft→Ready`, Merge, Alias-Wechsel, Deploy sowie jede Änderung am öffentlichen Issue #13 bleiben ausstehend.

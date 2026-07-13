@@ -34,7 +34,7 @@ import { runVerification } from './index.js';
 import { PotCliCascade } from './cascade-pot.js';
 import { StubCascade } from './cascade.js';
 import { SandboxCascade } from './sandbox-cascade.js';
-import { CircuitAllOpenError } from './llm-client.js';
+import { CircuitAllOpenError, ProviderCallError } from './llm-client.js';
 import type {
   LlmClient,
   LlmCallInput,
@@ -60,7 +60,11 @@ const REQ: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> =
  */
 type ScriptedOutcome =
   | { kind: 'ok'; providerRoute: 'primary' | 'fallback' }
-  | { kind: 'fail-closed'; attemptedRoutes: AttemptedRoute[] };
+  | { kind: 'fail-closed'; attemptedRoutes: AttemptedRoute[] }
+  // Simulates a single provider interaction that failed (e.g. HTTP 401) WITHOUT
+  // tripping the breaker — the exact D6 case. A real HttpLlmClient rethrows a
+  // ProviderCallError here; the cascade propagates it to the engine.
+  | { kind: 'provider-error'; httpStatus?: number; message?: string };
 
 class ScriptedClient implements LlmClient {
   private index = 0;
@@ -88,6 +92,13 @@ class ScriptedClient implements LlmClient {
         'scripted-primary-open',
         'scripted-fallback-open',
         step.attemptedRoutes,
+      );
+    }
+    if (step.kind === 'provider-error') {
+      throw new ProviderCallError(
+        step.message ?? `[llm-client] serv ${step.httpStatus ?? 401}: scripted provider error`,
+        'serv',
+        step.httpStatus ?? 401,
       );
     }
     // ok case: parseable PASS response.
@@ -252,5 +263,78 @@ describe('PR #12 §C.3-fix — engine maps CircuitAllOpenError provenance to pro
     expect(axis.confidence).toBe(0);
     expect(axis.provider_outcome).toBeUndefined();
     expect(axis.provider_route).toBeUndefined();
+  });
+});
+
+describe('§D6-fix — engine↔aggregation: a single provider-failed axis fails CLOSED (never ALLOW)', () => {
+  it('HTTP 401 (ProviderCallError, breaker NOT tripped) → axis provider_error AND aggregate REVIEW', async () => {
+    const { cascade } = makeCascade([
+      { kind: 'provider-error', httpStatus: 401 },
+    ]);
+    const response = await runVerification({
+      request: REQ,
+      cascade,
+      sandboxCascade: new SandboxCascade(),
+      requestId: 'dql_d6_http401',
+      version: '0.4.3.1-test',
+    });
+
+    const axis = response.axes[0]!;
+    expect(axis.verdict).toBe('UNCERTAIN');
+    expect(axis.confidence).toBe(0);
+    expect(axis.provider_outcome).toBe('provider_error');
+    // The regression this fix closes: the aggregate MUST NOT be ALLOW.
+    expect(response.aggregate.verdict).toBe('REVIEW');
+    expect(response.aggregate.triggered_by).toEqual(['intent']);
+    expect(response.aggregate.rationale).not.toBe('All evaluated axes pass.');
+  });
+
+  it('CircuitAllOpen provider_error variant (attemptedRoutes=[primary]) → aggregate REVIEW', async () => {
+    const { cascade } = makeCascade([
+      { kind: 'fail-closed', attemptedRoutes: ['primary'] },
+    ]);
+    const response = await runVerification({
+      request: REQ,
+      cascade,
+      sandboxCascade: new SandboxCascade(),
+      requestId: 'dql_d6_cao_provider',
+      version: '0.4.3.1-test',
+    });
+    expect(response.axes[0]!.provider_outcome).toBe('provider_error');
+    expect(response.aggregate.verdict).toBe('REVIEW');
+  });
+
+  it('CircuitAllOpen circuit_rejected variant (attemptedRoutes=[]) → aggregate REVIEW', async () => {
+    const { cascade } = makeCascade([
+      { kind: 'fail-closed', attemptedRoutes: [] },
+    ]);
+    const response = await runVerification({
+      request: REQ,
+      cascade,
+      sandboxCascade: new SandboxCascade(),
+      requestId: 'dql_d6_cao_rejected',
+      version: '0.4.3.1-test',
+    });
+    expect(response.axes[0]!.provider_outcome).toBe('circuit_rejected');
+    expect(response.aggregate.verdict).toBe('REVIEW');
+  });
+
+  it('NEGATIVE: a non-provider plain-Error axis still aggregates to ALLOW (deliberate policy preserved)', async () => {
+    class ThrowingCascade extends StubCascade {
+      override async run(_input: import('./cascade.js').CascadeInput): Promise<import('./cascade.js').CascadeOutput> {
+        throw new Error('unrelated non-provider failure');
+      }
+    }
+    const response = await runVerification({
+      request: REQ,
+      cascade: new ThrowingCascade(),
+      sandboxCascade: new SandboxCascade(),
+      requestId: 'dql_d6_negative',
+      version: '0.4.3.1-test',
+    });
+    expect(response.axes[0]!.provider_outcome).toBeUndefined();
+    // No provider provenance → Rule 2 does not fire; single UNCERTAIN@0 falls
+    // through to ALLOW exactly as before the fix.
+    expect(response.aggregate.verdict).toBe('ALLOW');
   });
 });

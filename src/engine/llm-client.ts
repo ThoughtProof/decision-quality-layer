@@ -179,6 +179,32 @@ export class CircuitAllOpenError extends Error {
 }
 
 /**
+ * A failure that originates from an actual provider interaction inside
+ * singleCall() — a non-OK HTTP response (e.g. 401/403/5xx) or a transport
+ * error (fetch failed, timeout/abort, connection reset). It is deliberately
+ * DISTINCT from local configuration errors (missing API key, unknown alias),
+ * which are plain Errors thrown OUTSIDE singleCall and must NOT be classified
+ * as provider failures.
+ *
+ * v0.4.3.1 §D6-fix: this typed class lets the engine attribute structured
+ * `provider_outcome: 'provider_error'` provenance WITHOUT parsing Error.message
+ * strings. The `message` is preserved verbatim from the underlying failure so
+ * RETRYABLE_PATTERN classification, categorizeFailure(), and existing
+ * message-regex test assertions remain unchanged.
+ */
+export class ProviderCallError extends Error {
+  constructor(
+    message: string,
+    public readonly provider: string,
+    public readonly httpStatus?: number,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options as ErrorOptions);
+    this.name = 'ProviderCallError';
+  }
+}
+
+/**
  * Map alias → concrete backend. Keys are the aliases used by the cascade
  * (`serv-nano` = fast/cheap primary; `serv-swift` = stronger secondary).
  *
@@ -1035,20 +1061,33 @@ export class HttpLlmClient implements LlmClient {
         signal: controller.signal,
       });
     } catch (err) {
-      // AbortError from our own timeout should surface as a retryable
+      // A failed fetch is a provider-interaction failure. Preserve the
+      // original message verbatim so RETRYABLE_PATTERN / categorizeFailure /
+      // existing message-regex tests behave exactly as before; only the error
+      // TYPE changes (→ ProviderCallError) so the engine can attribute
+      // structured provider provenance without string-parsing.
+      // AbortError from our own timeout still surfaces as a retryable
       // "timeout" message so RETRYABLE_PATTERN picks it up.
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new Error(`[llm-client] request timeout after ${this.config.timeoutMs}ms (aborted)`);
+        throw new ProviderCallError(
+          `[llm-client] request timeout after ${this.config.timeoutMs}ms (aborted)`,
+          binding.provider,
+          undefined,
+          { cause: err },
+        );
       }
-      throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new ProviderCallError(msg, binding.provider, undefined, { cause: err });
     } finally {
       clearTimeout(timeout);
     }
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw new Error(
-        `[llm-client] ${binding.provider} ${response.status}: ${body.slice(0, 500)}`
+      throw new ProviderCallError(
+        `[llm-client] ${binding.provider} ${response.status}: ${body.slice(0, 500)}`,
+        binding.provider,
+        response.status,
       );
     }
 

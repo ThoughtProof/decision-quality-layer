@@ -15,7 +15,7 @@ import type { DqlRequest, DqlResponse, AxisResult, Axis } from '../types.js';
 import { AXIS_PROMPT_BUILDERS } from './axes/index.js';
 import { aggregate } from '../aggregation.js';
 import type { Cascade } from './cascade.js';
-import { CircuitAllOpenError } from './llm-client.js';
+import { CircuitAllOpenError, ProviderCallError } from './llm-client.js';
 import { generateCallId, type CallContext } from './call-context.js';
 import type { RuntimeDiagnosticsCollector } from './runtime-diagnostics.js';
 
@@ -51,14 +51,20 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   // Run all axes in parallel. Any axis error is caught and mapped to an
   // UNCERTAIN result so a single-axis failure does not fail the whole request.
   //
-  // PR #10 fail-closed contract:
+  // PR #10 fail-closed contract (corrected v0.4.3.1 §D6-fix 2026-07-13):
   // A CircuitAllOpenError from the llm-client means BOTH SERV aliases are
-  // OPEN — typically an openserv.ai host-level outage. We deliberately do
-  // NOT retry with an uncalibrated foreign vendor here (Groq/OpenAI); for a
-  // safety product, the correct default under provider outage is to escalate
-  // to a human, not to consult an unvetted model. The UNCERTAIN@0 result
-  // below propagates that decision to the aggregator, which will emit a
-  // REVIEW or worse — never ALLOW — because UNCERTAIN cannot upgrade to PASS.
+  // OPEN — typically an openserv.ai host-level outage. A ProviderCallError
+  // means a single provider interaction failed (HTTP 401/5xx or transport)
+  // without tripping the breaker. We deliberately do NOT retry with an
+  // uncalibrated foreign vendor here (Groq/OpenAI); for a safety product, the
+  // correct default under provider failure is to escalate to a human, not to
+  // consult an unvetted model. Both cases below set a structured
+  // `provider_outcome` ('circuit_rejected' | 'provider_error') on the
+  // UNCERTAIN@0 axis result; the aggregator (aggregation.ts Rule 2) escalates
+  // ANY axis carrying such provenance to REVIEW-or-stricter — never ALLOW —
+  // INDEPENDENT of confidence. (Before the §D6-fix a single UNCERTAIN@0 with
+  // no provenance fell through to ALLOW; this comment previously overstated
+  // the guarantee.)
   // v0.4.3.1 §C.1: build a child CallContext per axis from the handler-owned
   // requestId. The engine NEVER generates a requestId itself.
   const perAxis = await Promise.all(
@@ -74,6 +80,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
         return await cascade.run({ axis, prompt, ctx });
       } catch (err) {
         const isCircuitAllOpen = err instanceof CircuitAllOpenError;
+        const isProviderError = err instanceof ProviderCallError;
         const objection = isCircuitAllOpen
           ? `Provider outage — both SERV aliases (primary + fallback) circuit-open. Escalated to human per fail-closed policy. Detail: ${err.message.slice(0, 400)}`
           : err instanceof Error
@@ -81,12 +88,20 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
             : String(err).slice(0, 500);
         const reasoning = isCircuitAllOpen
           ? `Axis evaluation could not be performed — SERV provider is unavailable on both primary and fallback aliases. Fail-closed: verdict is UNCERTAIN, escalate to human review.`
-          : `Axis evaluation failed with an error — treated as UNCERTAIN.`;
-        // v0.4.3.1 §C.3-fix (Hermes 2026-07-11): distinguish the two
-        // fail-closed sub-cases from the error's STRUCTURED provenance,
-        // never from Error.message string parsing.
-        //   attemptedRoutes.length === 0 → no provider fetch was made
-        //   attemptedRoutes.length ≥  1 → at least one provider fetch was made
+          : isProviderError
+            ? `Axis evaluation could not be performed — the SERV provider returned an error${err.httpStatus ? ` (HTTP ${err.httpStatus})` : ''}. Fail-closed: verdict is UNCERTAIN, escalate to human review.`
+            : `Axis evaluation failed with an error — treated as UNCERTAIN.`;
+        // v0.4.3.1 §C.3-fix (Hermes 2026-07-11) + §D6-fix (2026-07-13):
+        // attribute the fail-closed provenance from the error's STRUCTURED
+        // TYPE, never from Error.message string parsing.
+        //   CircuitAllOpenError, attemptedRoutes.length === 0 → no provider
+        //     fetch was made                     → 'circuit_rejected'
+        //   CircuitAllOpenError, attemptedRoutes.length ≥ 1  → at least one
+        //     provider fetch was made            → 'provider_error'
+        //   ProviderCallError (single-axis HTTP/transport failure that did
+        //     NOT trip the breaker, e.g. HTTP 401) → 'provider_error'
+        //   Any OTHER error (local config: missing key, unknown alias, or an
+        //     unexpected bug) → no provider_outcome; retains prior policy.
         let providerOutcome:
           | 'circuit_rejected'
           | 'provider_error'
@@ -96,6 +111,8 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
             (err as CircuitAllOpenError).attemptedRoutes.length === 0
               ? 'circuit_rejected'
               : 'provider_error';
+        } else if (isProviderError) {
+          providerOutcome = 'provider_error';
         }
         const result: AxisResult = {
           axis,
