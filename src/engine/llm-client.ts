@@ -64,7 +64,10 @@
  * that work is tracked separately.
  */
 
-import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError } from './circuit-breaker.js';
+import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError, type CircuitDomainEvent } from './circuit-breaker.js';
+import type { CallContext } from './call-context.js';
+import type { AttemptEvent, BindingSummary } from './runtime-diagnostics.js';
+import { categorizeFailure } from './runtime-diagnostics.js';
 
 export interface LlmCallInput {
   system: string;
@@ -87,6 +90,21 @@ export interface LlmCallOutput {
    */
   providerRoute?: 'primary' | 'fallback';
   /**
+   * v0.4.3.1 §C+integration — flat attribution field.
+   *
+   * The alias that actually served this response. Equal to the alias the
+   * cascade requested when `providerRoute === 'primary'`; equal to the
+   * primary's `fallbackAlias` when `providerRoute === 'fallback'`. This is
+   * the flattened form of what earlier commits derived by inspecting
+   * `providerRoute` + the cascade's alias request — it is exposed here so
+   * diagnostics and the engine can attribute a response to a concrete
+   * SERV model without re-deriving the mapping.
+   *
+   * Optional for backwards compatibility with older LlmClient impls
+   * (StubLlmClient tests that predate the flag).
+   */
+  attemptAlias?: string;
+  /**
    * v0.4.3 recert instrumentation — optional, non-breaking.
    *
    * attemptCount: 1 if the call succeeded on the first try; N if N-1 retries
@@ -107,7 +125,13 @@ export interface LlmCallOutput {
 }
 
 export interface LlmClient {
-  call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput>;
+  /**
+   * `ctx` (v0.4.3.1 §C.1) is an optional forward-compatible slot for the
+   * handler-owned CallContext. Existing callers may omit it; future
+   * commits attach a RuntimeDiagnosticsCollector to it for state-transition
+   * events. This interface change is additive — no existing test breaks.
+   */
+  call(modelAlias: string, input: LlmCallInput, ctx?: CallContext): Promise<LlmCallOutput>;
 }
 
 /**
@@ -115,13 +139,30 @@ export interface LlmClient {
  * are OPEN. The engine (src/engine/index.ts) maps this to a fail-closed
  * UNCERTAIN@0 verdict with an explicit objection — for a safety product,
  * "escalate to human" is the correct default under provider outage.
+ *
+ * v0.4.3.1 §C.3-fix (Hermes 2026-07-11): the error carries structured
+ * provenance of which routes (if any) were actually attempted against the
+ * upstream provider in the current axis call. The engine uses this to
+ * distinguish `circuit_rejected` (no fetch was made) from `provider_error`
+ * (at least one fetch was attempted but failed). This must NEVER be derived
+ * from Error.message string parsing.
+ *
+ * Contract:
+ *   attemptedRoutes = []                    → no provider fetch was started
+ *   attemptedRoutes = ['primary']           → primary was fetched (and failed)
+ *   attemptedRoutes = ['primary','fallback']→ both fetched (both failed)
+ *   attemptedRoutes = ['fallback']          → primary skipped (already OPEN),
+ *                                              fallback was fetched (failed)
  */
+export type AttemptedRoute = 'primary' | 'fallback';
 export class CircuitAllOpenError extends Error {
+  public readonly attemptedRoutes: readonly AttemptedRoute[];
   constructor(
     public readonly primaryAlias: string,
     public readonly fallbackAlias: string | null,
     public readonly primaryReason: string,
-    public readonly fallbackReason: string | null
+    public readonly fallbackReason: string | null,
+    attemptedRoutes: readonly AttemptedRoute[] = []
   ) {
     super(
       fallbackAlias
@@ -131,6 +172,35 @@ export class CircuitAllOpenError extends Error {
           : `[llm-client] circuit open and no fallback configured: ${primaryAlias} (${primaryReason})`
     );
     this.name = 'CircuitAllOpenError';
+    // Defensive copy — callers must not be able to mutate provenance after
+    // the error is thrown.
+    this.attemptedRoutes = Object.freeze([...attemptedRoutes]);
+  }
+}
+
+/**
+ * A failure that originates from an actual provider interaction inside
+ * singleCall() — a non-OK HTTP response (e.g. 401/403/5xx) or a transport
+ * error (fetch failed, timeout/abort, connection reset). It is deliberately
+ * DISTINCT from local configuration errors (missing API key, unknown alias),
+ * which are plain Errors thrown OUTSIDE singleCall and must NOT be classified
+ * as provider failures.
+ *
+ * v0.4.3.1 §D6-fix: this typed class lets the engine attribute structured
+ * `provider_outcome: 'provider_error'` provenance WITHOUT parsing Error.message
+ * strings. The `message` is preserved verbatim from the underlying failure so
+ * RETRYABLE_PATTERN classification, categorizeFailure(), and existing
+ * message-regex test assertions remain unchanged.
+ */
+export class ProviderCallError extends Error {
+  constructor(
+    message: string,
+    public readonly provider: string,
+    public readonly httpStatus?: number,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options as ErrorOptions);
+    this.name = 'ProviderCallError';
   }
 }
 
@@ -207,14 +277,44 @@ export interface HttpLlmClientConfig {
   /**
    * Config passed to every CircuitBreaker instance the client creates.
    * Leave undefined to accept CircuitBreaker defaults.
+   *
+   * v0.4.3.1 hardening: prefer `circuitBreakerConfigByAlias` for per-alias
+   * knobs. When both are set, per-alias overrides win for the aliases they
+   * name; the global config applies to any unnamed alias.
    */
   circuitBreakerConfig?: CircuitBreakerConfig;
+  /**
+   * Per-alias CircuitBreaker knobs. When an alias appears here, its
+   * breaker is instantiated with the merged (perAlias over global)
+   * config. When absent, the global config (or CB defaults) applies.
+   *
+   * v0.4.3.1 §D-hardening: required for capital-path deploys because
+   * nano and swift target different SLA envelopes.
+   */
+  circuitBreakerConfigByAlias?: Record<string, CircuitBreakerConfig>;
   /**
    * Disable circuit-breaker routing entirely. Every call goes straight to
    * its requested alias; no failover, no fail-closed. Intended for tests
    * and for the specific baseline runs that predate PR #10. Default: false.
    */
   disableCircuitBreaker?: boolean;
+  /**
+   * v0.4.3.1 §C+integration H1: require a request-scoped diagnostics
+   * collector on every `call()`. Set by the factory when the resolver
+   * activates the v0431_active canary AND diagnostics_on=true. When set:
+   *   - `ctx.collector` MUST be present or the call is rejected before
+   *     admission and before any provider fetch is attempted.
+   *   - `ctx.collector.requestId` MUST equal `ctx.requestId` (attribution
+   *     guarantee). Mismatch is rejected before admission.
+   * The check runs BEFORE the disableCircuitBreaker fast path, so a caller
+   * cannot bypass diagnostics by opting out of the breaker.
+   *
+   * This is a factory-side safety option — the factory sets it, tests may
+   * NOT override it via clientOptionsOverride (the factory re-spreads it
+   * after the override, same policy as disableCircuitBreaker /
+   * capitalPathMode).
+   */
+  requireDiagnostics?: boolean;
   /**
    * Capital-path mode: when a Primary circuit is OPEN, DO NOT route to the
    * SERV-internal fallback alias. Instead throw CircuitAllOpenError so the
@@ -237,7 +337,7 @@ export interface HttpLlmClientConfig {
   capitalPathMode?: boolean;
 }
 
-const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'disableCircuitBreaker' | 'capitalPathMode'>> = {
+const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics'>> = {
   timeoutMs: 60_000,
   maxAttempts: 6,
   backoffBaseMs: 800,
@@ -254,17 +354,64 @@ const RETRYABLE_PATTERN =
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // -----------------------------------------------------------------------------
+// Retry-failure telemetry (v0.4.3.1 §C M1)
+//
+// callWithRetry annotates the thrown error with the running attemptCount,
+// backoffWaitedMs, and retryReasons so the caller's failure branch can
+// compute netLatency symmetrically with the success branch. The annotation
+// lives on a NON-ENUMERABLE symbol property so it does not leak into logs
+// or JSON serialization by accident.
+// -----------------------------------------------------------------------------
+
+const RETRY_TELEMETRY = Symbol.for('dql.llm.retryTelemetry');
+
+interface RetryTelemetry {
+  attemptCount: number;
+  backoffWaitedMs: number;
+  retryReasons: readonly string[];
+}
+
+function annotateRetryFailure<E>(err: E, telemetry: RetryTelemetry): E {
+  if (err && typeof err === 'object') {
+    try {
+      Object.defineProperty(err as object, RETRY_TELEMETRY, {
+        value: Object.freeze({ ...telemetry, retryReasons: Object.freeze([...telemetry.retryReasons]) }),
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+    } catch {
+      // If the error object is frozen or an exotic value, fall through —
+      // caller will use the wall-clock latency (safe upper bound).
+    }
+  }
+  return err;
+}
+
+function readRetryTelemetry(err: unknown): RetryTelemetry | null {
+  if (err && typeof err === 'object' && RETRY_TELEMETRY in err) {
+    const raw = (err as { [k: symbol]: unknown })[RETRY_TELEMETRY];
+    if (raw && typeof raw === 'object') return raw as RetryTelemetry;
+  }
+  return null;
+}
+
+// -----------------------------------------------------------------------------
 // Real (fetch-based) client
 // -----------------------------------------------------------------------------
 
 export class HttpLlmClient implements LlmClient {
-  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'disableCircuitBreaker' | 'capitalPathMode'>>;
+  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics'>>;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
   private readonly circuitBreakers: Map<string, CircuitBreaker> = new Map();
   private readonly circuitBreakerConfig: CircuitBreakerConfig | undefined;
+  private readonly circuitBreakerConfigByAlias:
+    | Record<string, CircuitBreakerConfig>
+    | undefined;
   private readonly disableCircuitBreaker: boolean;
   private readonly capitalPathMode: boolean;
+  private readonly requireDiagnostics: boolean;
 
   constructor(
     private readonly modelMap: Record<string, ModelBinding> = DEFAULT_MODEL_MAP,
@@ -280,8 +427,10 @@ export class HttpLlmClient implements LlmClient {
     this.sleep = config.sleep ?? defaultSleep;
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.circuitBreakerConfig = config.circuitBreakerConfig;
+    this.circuitBreakerConfigByAlias = config.circuitBreakerConfigByAlias;
     this.disableCircuitBreaker = config.disableCircuitBreaker ?? false;
     this.capitalPathMode = config.capitalPathMode ?? false;
+    this.requireDiagnostics = config.requireDiagnostics ?? false;
   }
 
   /**
@@ -291,10 +440,47 @@ export class HttpLlmClient implements LlmClient {
   private getBreaker(alias: string): CircuitBreaker {
     let cb = this.circuitBreakers.get(alias);
     if (!cb) {
-      cb = new CircuitBreaker(alias, this.circuitBreakerConfig);
+      // v0.4.3.1 hardening: per-alias config wins over global. Shallow
+      // merge so unspecified per-alias fields fall back to global then
+      // CB defaults. This is the wiring point Hermes Blocker 6 requires.
+      const perAlias = this.circuitBreakerConfigByAlias?.[alias];
+      const merged: CircuitBreakerConfig | undefined = perAlias
+        ? { ...(this.circuitBreakerConfig ?? {}), ...perAlias }
+        : this.circuitBreakerConfig;
+      cb = new CircuitBreaker(alias, merged);
       this.circuitBreakers.set(alias, cb);
     }
     return cb;
+  }
+
+  /**
+   * @internal Test-only accessor: return the live CircuitBreaker for an
+   * alias. Not part of the public production API. Integration tests use
+   * this to drive the state machine directly (e.g. simulate a mid-fetch
+   * trip for stale-success assertions). Production callers must not use
+   * this — hold no stable references to per-client CircuitBreaker
+   * instances.
+   */
+  _testOnlyGetBreaker(alias: string): CircuitBreaker {
+    return this.getBreaker(alias);
+  }
+
+  /**
+   * K5 admission-safety precondition: fail synchronously if the binding's
+   * apiKey env var is missing. Must be called BEFORE breaker.admit() so a
+   * local configuration error never appears as a provider failure sample.
+   * Contract: throws Error with 'missing env var' in the message; does not
+   * touch any circuit breaker; caller is responsible for calling this on
+   * the exact binding it is about to attempt (primary or fallback).
+   */
+  private requireApiKey(binding: ModelBinding): string {
+    const value = this.env[binding.apiKeyEnv];
+    if (!value) {
+      throw new Error(
+        `[llm-client] missing env var '${binding.apiKeyEnv}' for provider '${binding.provider}'`
+      );
+    }
+    return value;
   }
 
   /** Snapshot of every alias circuit — for telemetry / test assertions. */
@@ -306,75 +492,256 @@ export class HttpLlmClient implements LlmClient {
     return out;
   }
 
-  async call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput> {
+  async call(
+    modelAlias: string,
+    input: LlmCallInput,
+    ctx?: CallContext,
+  ): Promise<LlmCallOutput> {
     const binding = this.modelMap[modelAlias];
     if (!binding) {
       throw new Error(`[llm-client] unknown model alias: ${modelAlias}`);
     }
 
+    // v0.4.3.1 §C+integration H1: enforce diagnostics precondition BEFORE
+    // admission and BEFORE any provider fetch. Runs before disableCircuitBreaker
+    // so a caller cannot bypass diagnostics by opting out of the breaker.
+    //
+    // Two invariants:
+    //   1. When requireDiagnostics=true (factory-set on the v0431_active
+    //      canary), ctx.collector MUST be present. Otherwise reject.
+    //   2. When ctx.collector is present, its requestId MUST equal
+    //      ctx.requestId. A mismatch means the collector was cross-wired
+    //      between requests — attribution would be silently wrong.
+    //
+    // Rejection at this point emits ZERO breaker mutations and ZERO fetches:
+    // the throw happens before `getBreaker(...).admit()` and before the
+    // fast-path fetch call.
+    if (this.requireDiagnostics && !ctx?.collector) {
+      throw new Error('[llm-client] diagnostics collector required (v0431_active canary precondition)');
+    }
+    if (ctx?.collector && ctx.collector.requestId !== ctx.requestId) {
+      throw new Error(
+        `[llm-client] diagnostics collector/request mismatch: collector.requestId=${ctx.collector.requestId} ctx.requestId=${ctx.requestId}`,
+      );
+    }
+
     // Fast path: circuit-breaker disabled (tests, or explicit opt-out for
     // legacy baseline runs). Behavior identical to pre-PR-10.
     if (this.disableCircuitBreaker) {
-      const out = await this.callWithRetry(binding, input);
-      return { ...out, providerRoute: 'primary' };
+      const started = Date.now();
+      // v0.4.3.1 §C+integration H2: per-iteration AttemptEvents flow via
+      // the callWithRetry hook; the aggregated BindingSummary is recorded
+      // after the retry loop resolves.
+      const emit = (iter: number, ok: boolean, elapsed: number, err: unknown) => {
+        this.recordAttemptEvent(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          iteration: iter,
+          ok,
+          elapsedMs: elapsed,
+          errorCategory: ok ? undefined : categorizeFailure(err),
+        });
+      };
+      try {
+        const out = await this.callWithRetry(binding, input, emit);
+        const wallClock = Date.now() - started;
+        const backoff = out.backoffWaitedMs ?? 0;
+        this.recordBindingSummary(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          ok: true,
+          netLatencyMs: Math.max(0, wallClock - backoff),
+          backoffWaitedMs: backoff,
+          wallClockMs: wallClock,
+          attemptCount: out.attemptCount ?? 1,
+        });
+        return { ...out, providerRoute: 'primary', attemptAlias: modelAlias };
+      } catch (err) {
+        const telemetry = readRetryTelemetry(err);
+        const wallClock = Date.now() - started;
+        const backoff = telemetry?.backoffWaitedMs ?? 0;
+        this.recordBindingSummary(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          ok: false,
+          netLatencyMs: Math.max(0, wallClock - backoff),
+          backoffWaitedMs: backoff,
+          wallClockMs: wallClock,
+          attemptCount: telemetry?.attemptCount ?? 1,
+        });
+        throw err;
+      }
     }
+
+    // K5 admission-safety: verify preconditions BEFORE admit(). A missing
+    // API key is a local configuration error, not a provider failure. If
+    // we admitted first and then discovered the missing key, a small
+    // minSamples could trip the circuit on config errors. Throw here so
+    // no token is issued and no sample is recorded.
+    this.requireApiKey(binding);
 
     // Try primary. If its circuit is OPEN, route to fallback alias —
     // UNLESS we're in capital-path mode, where fail-closed is mandatory
     // until v0.4.3 recertifies the fallback alias on the full 100-case suite.
+    //
+    // v0.4.3.1 §E: admit() returns a token; recordOutcome(token, …) reports
+    // the outcome. K5 admission-safety: the recordOutcome call sits inside
+    // the try{} after the retry loop so its mutation result is available to
+    // the routing decision; a completed-flag catch reports a defensive
+    // failure only on pathological throws (e.g. bugs, aborts outside the
+    // retry loop) so the probe cannot strand HALF_OPEN.
     const primaryBreaker = this.getBreaker(modelAlias);
+    let primaryAdmission;
     try {
-      primaryBreaker.canProceed();
+      primaryAdmission = primaryBreaker.admit();
     } catch (err) {
       if (err instanceof CircuitOpenError) {
         if (this.capitalPathMode) {
-          throw new CircuitAllOpenError(modelAlias, null, err.reason, 'capital-path-mode: fallback disabled until v0.4.3 recertification');
+          // Primary was already OPEN, CPM=true → no fetch attempted at all.
+          throw new CircuitAllOpenError(
+            modelAlias, null, err.reason,
+            'capital-path-mode: fallback disabled until v0.4.3 recertification',
+            [] // attemptedRoutes: no provider fetch was started
+          );
         }
-        return await this.callViaFallback(modelAlias, binding, input, err.reason);
+        // Primary was already OPEN; hand off to fallback without a primary
+        // fetch. `primaryAttempted=false` propagates through callViaFallback.
+        return await this.callViaFallback(modelAlias, binding, input, err.reason, false, ctx);
       }
       throw err;
     }
+    // v0.4.3.1 §C: forward any admission-time events (open_to_half_open) to
+    // the diagnostics collector before the fetch begins.
+    this.recordEventsToCtx(ctx, primaryAdmission.events);
 
-    // Circuit is CLOSED (or HALF_OPEN probe was granted) — primary attempt.
+    // Circuit admitted (CLOSED, or HALF_OPEN probe was granted) — primary attempt.
     const started = Date.now();
+    let completed = false;
     try {
-      const out = await this.callWithRetry(binding, input);
-      // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
-      // circuit-breaker, not wall-clock. Backoff waits are retry-policy
-      // delay, not provider processing time. Successful retry clusters
-      // must not inflate the latency signal; exhausted retry loops are
-      // independently represented by the failure-rate path (throw path
-      // below), which feeds recordFailure() only once the retry loop is
-      // exhausted — successful retry clusters emit no failure sample.
-      const wallClock = Date.now() - started;
-      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
-      primaryBreaker.recordSuccess(netLatency);
-      return { ...out, providerRoute: 'primary' };
-    } catch (err) {
-      // Wall-clock elapsed for failures — the retry loop exhausted, so the
-      // TOTAL time is the meaningful signal for the failure_rate window.
-      // (There is no LlmCallOutput to read backoffWaitedMs from on this path.)
-      primaryBreaker.recordFailure(Date.now() - started);
-      // If the circuit just tripped from this failure, try fallback for the
-      // very SAME call — the caller shouldn't eat one "cold" failure per trip.
-      // In capital-path mode, fail-closed instead of routing to fallback.
-      if (primaryBreaker.snapshot().state === 'OPEN') {
+      let out;
+      let ok: boolean;
+      let netLatency: number;
+      let attemptCount = 1;
+      let backoffWaitedMs = 0;
+      let retryErr: unknown = null;
+      // v0.4.3.1 §C+integration H2: per-iteration AttemptEvents on the
+      // primary path.
+      const emitPrimary = (iter: number, iterOk: boolean, elapsed: number, iterErr: unknown) => {
+        this.recordAttemptEvent(ctx, {
+          requestedAlias: modelAlias,
+          attemptAlias: modelAlias,
+          route: 'primary',
+          iteration: iter,
+          ok: iterOk,
+          elapsedMs: elapsed,
+          errorCategory: iterOk ? undefined : categorizeFailure(iterErr),
+        });
+      };
+      try {
+        out = await this.callWithRetry(binding, input, emitPrimary);
+        const wallClock = Date.now() - started;
+        // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
+        // circuit-breaker, not wall-clock. Backoff waits are retry-policy
+        // delay, not provider processing time.
+        backoffWaitedMs = out.backoffWaitedMs ?? 0;
+        attemptCount = out.attemptCount ?? 1;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
+        ok = true;
+      } catch (err) {
+        retryErr = err;
+        // v0.4.3.1 §C M1 (latency symmetry): read the annotated telemetry
+        // from the retry loop so failure path subtracts backoff waits too.
+        const telemetry = readRetryTelemetry(err);
+        backoffWaitedMs = telemetry?.backoffWaitedMs ?? 0;
+        attemptCount = telemetry?.attemptCount ?? 1;
+        const wallClock = Date.now() - started;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
+        ok = false;
+        out = undefined;
+      }
+
+      // K5: recordOutcome runs inside the try{} so the routing decision
+      // below can read the post-mutation state (i.e. whether this outcome
+      // just tripped the breaker). v0.4.3.1 §C: mutation events (transitions,
+      // stale_result, invalid_outcome) are forwarded to the diagnostics
+      // collector.
+      const mutation = primaryBreaker.recordOutcome(primaryAdmission.token, {
+        ok,
+        netLatencyMs: netLatency,
+      });
+      this.recordEventsToCtx(ctx, mutation.events);
+      completed = true;
+
+      // v0.4.3.1 §C+integration H2: BindingSummary for the primary binding
+      // (one row per completed callWithRetry, regardless of iteration count).
+      const wallClockPrimary = Date.now() - started;
+      this.recordBindingSummary(ctx, {
+        requestedAlias: modelAlias,
+        attemptAlias: modelAlias,
+        route: 'primary',
+        ok,
+        netLatencyMs: netLatency,
+        backoffWaitedMs,
+        wallClockMs: wallClockPrimary,
+        attemptCount,
+      });
+
+      if (ok && out) {
+        // Stale-success (mutation.accepted === false, e.g. wrong_state): the
+        // baseline contract is to serve the successful primary response and
+        // leave state unchanged. Events were already forwarded above.
+        return { ...out, providerRoute: 'primary', attemptAlias: modelAlias };
+      }
+
+      // Failure path: decide fallback vs rethrow based on breaker state
+      // AFTER the mutation. This mirrors the pre-§E behavior — the caller
+      // shouldn't eat one "cold" failure per trip when the fallback is
+      // available and CPM=false.
+      const postState = primaryBreaker.snapshot().state;
+      if (postState === 'OPEN' || postState === 'HALF_OPEN') {
         if (this.capitalPathMode) {
           throw new CircuitAllOpenError(
             modelAlias,
             null,
             primaryBreaker.snapshot().lastTripReason,
-            'capital-path-mode: fallback disabled until v0.4.3 recertification'
+            'capital-path-mode: fallback disabled until v0.4.3 recertification',
+            ['primary']
           );
         }
         return await this.callViaFallback(
           modelAlias,
           binding,
           input,
-          primaryBreaker.snapshot().lastTripReason
+          primaryBreaker.snapshot().lastTripReason,
+          true, // primaryAttempted
+          ctx,
         );
       }
-      throw err;
+      // Breaker still CLOSED after ordinary failure → rethrow original error.
+      throw retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+    } catch (unexpected) {
+      // K5 defensive path: recordOutcome did not run (pathological throw
+      // before we could reach it). Emit a defensive failure-outcome so the
+      // token is consumed and the probe slot is released. This is a
+      // last-resort guard; production paths are expected to complete=true.
+      if (!completed) {
+        try {
+          const mutation = primaryBreaker.recordOutcome(primaryAdmission.token, {
+            ok: false,
+            netLatencyMs: 0,
+          });
+          // Forward events from the defensive report too — the diagnostics
+          // collector never causes control flow, and swallow-on-error is
+          // enforced inside recordEventsToCtx.
+          this.recordEventsToCtx(ctx, mutation.events);
+        } catch {
+          // Even the defensive report failing must not mutate the response.
+        }
+      }
+      throw unexpected;
     }
   }
 
@@ -387,11 +754,19 @@ export class HttpLlmClient implements LlmClient {
     primaryAlias: string,
     primaryBinding: ModelBinding,
     input: LlmCallInput,
-    primaryReason: string
+    primaryReason: string,
+    primaryAttempted: boolean,
+    ctx?: CallContext,
   ): Promise<LlmCallOutput> {
     const fallbackAlias = primaryBinding.fallbackAlias ?? null;
     if (!fallbackAlias) {
-      throw new CircuitAllOpenError(primaryAlias, null, primaryReason, null);
+      // No fallback configured → fail-closed. Provenance mirrors whether
+      // the primary was actually attempted or the primary breaker was
+      // already OPEN.
+      throw new CircuitAllOpenError(
+        primaryAlias, null, primaryReason, null,
+        primaryAttempted ? ['primary'] : []
+      );
     }
     const fallbackBinding = this.modelMap[fallbackAlias];
     if (!fallbackBinding) {
@@ -399,32 +774,171 @@ export class HttpLlmClient implements LlmClient {
         `[llm-client] fallbackAlias '${fallbackAlias}' for '${primaryAlias}' not in modelMap`
       );
     }
+    // K5 admission-safety for the fallback binding too. Same reasoning:
+    // fail-fast on a missing fallback API key rather than letting an
+    // admission→config-error→sample sequence occur.
+    this.requireApiKey(fallbackBinding);
+
     const fallbackBreaker = this.getBreaker(fallbackAlias);
+    let fallbackAdmission;
     try {
-      fallbackBreaker.canProceed();
+      fallbackAdmission = fallbackBreaker.admit();
     } catch (err) {
       if (err instanceof CircuitOpenError) {
+        // Fallback breaker was already OPEN → no fallback fetch attempted.
+        // attemptedRoutes reflects only the primary fetch (if any).
         throw new CircuitAllOpenError(
           primaryAlias,
           fallbackAlias,
           primaryReason,
-          err.reason
+          err.reason,
+          primaryAttempted ? ['primary'] : []
         );
       }
       throw err;
     }
+    this.recordEventsToCtx(ctx, fallbackAdmission.events);
 
     const started = Date.now();
+    let completed = false;
     try {
-      const out = await this.callWithRetry(fallbackBinding, input);
-      // v0.4.3 CB-latency-fix (PR #11): see primary path for rationale.
-      const wallClock = Date.now() - started;
-      const netLatency = Math.max(0, wallClock - (out.backoffWaitedMs ?? 0));
-      fallbackBreaker.recordSuccess(netLatency);
-      return { ...out, providerRoute: 'fallback' };
-    } catch (err) {
-      fallbackBreaker.recordFailure(Date.now() - started);
-      throw err;
+      let out;
+      let ok: boolean;
+      let netLatency: number;
+      let attemptCount = 1;
+      let backoffWaitedMs = 0;
+      let retryErr: unknown = null;
+      // v0.4.3.1 §C+integration H2: per-iteration AttemptEvents on the
+      // fallback path.
+      const emitFallback = (iter: number, iterOk: boolean, elapsed: number, iterErr: unknown) => {
+        this.recordAttemptEvent(ctx, {
+          requestedAlias: primaryAlias,
+          attemptAlias: fallbackAlias,
+          route: 'fallback',
+          iteration: iter,
+          ok: iterOk,
+          elapsedMs: elapsed,
+          errorCategory: iterOk ? undefined : categorizeFailure(iterErr),
+        });
+      };
+      try {
+        out = await this.callWithRetry(fallbackBinding, input, emitFallback);
+        const wallClock = Date.now() - started;
+        backoffWaitedMs = out.backoffWaitedMs ?? 0;
+        attemptCount = out.attemptCount ?? 1;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
+        ok = true;
+      } catch (err) {
+        retryErr = err;
+        // v0.4.3.1 §C M1 (latency symmetry) on the fallback path too.
+        const telemetry = readRetryTelemetry(err);
+        backoffWaitedMs = telemetry?.backoffWaitedMs ?? 0;
+        attemptCount = telemetry?.attemptCount ?? 1;
+        const wallClock = Date.now() - started;
+        netLatency = Math.max(0, wallClock - backoffWaitedMs);
+        ok = false;
+        out = undefined;
+      }
+      const mutation = fallbackBreaker.recordOutcome(fallbackAdmission.token, {
+        ok,
+        netLatencyMs: netLatency,
+      });
+      this.recordEventsToCtx(ctx, mutation.events);
+      completed = true;
+      const wallClockFallback = Date.now() - started;
+      this.recordBindingSummary(ctx, {
+        requestedAlias: primaryAlias,
+        attemptAlias: fallbackAlias,
+        route: 'fallback',
+        ok,
+        netLatencyMs: netLatency,
+        backoffWaitedMs,
+        wallClockMs: wallClockFallback,
+        attemptCount,
+      });
+      if (ok && out) {
+        return { ...out, providerRoute: 'fallback', attemptAlias: fallbackAlias };
+      }
+      throw retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+    } catch (unexpected) {
+      if (!completed) {
+        try {
+          const mutation = fallbackBreaker.recordOutcome(fallbackAdmission.token, {
+            ok: false,
+            netLatencyMs: 0,
+          });
+          this.recordEventsToCtx(ctx, mutation.events);
+        } catch {
+          // best-effort
+        }
+      }
+      throw unexpected;
+    }
+  }
+
+  /**
+   * v0.4.3.1 §C+integration: forward CircuitBreaker domain events to the
+   * request-scoped RuntimeDiagnosticsCollector, if attached. Fully guarded:
+   * a missing collector, a null event array, or a throw inside the
+   * collector MUST NOT alter the response path.
+   */
+  private recordEventsToCtx(
+    ctx: CallContext | undefined,
+    events: readonly CircuitDomainEvent[] | undefined,
+  ): void {
+    const collector = ctx?.collector;
+    if (!collector || !events || events.length === 0) return;
+    try {
+      collector.recordEvents(events);
+    } catch {
+      // Diagnostics are observation only — never poison the caller.
+    }
+  }
+
+  /**
+   * v0.4.3.1 §C+integration H2: record ONE per-iteration attempt row per
+   * singleCall() iteration. Called from inside callWithRetry's per-iteration
+   * hook — both on success and on transient/terminal failure. The row is
+   * scoped to the handler-owned requestId (with optional axis/callId).
+   */
+  private recordAttemptEvent(
+    ctx: CallContext | undefined,
+    row: Omit<AttemptEvent, 'requestId' | 'axis' | 'callId'>,
+  ): void {
+    const collector = ctx?.collector;
+    if (!collector) return;
+    try {
+      collector.recordAttempt({
+        requestId: ctx.requestId,
+        axis: ctx.axis,
+        callId: ctx.callId,
+        ...row,
+      });
+    } catch {
+      // Never throw from diagnostics.
+    }
+  }
+
+  /**
+   * v0.4.3.1 §C+integration H2: record one per-binding aggregated summary
+   * per completed callWithRetry(). Complementary to recordAttemptEvent —
+   * attempts give iteration detail, this gives binding totals.
+   */
+  private recordBindingSummary(
+    ctx: CallContext | undefined,
+    row: Omit<BindingSummary, 'requestId' | 'axis' | 'callId'>,
+  ): void {
+    const collector = ctx?.collector;
+    if (!collector) return;
+    try {
+      collector.recordBindingSummary({
+        requestId: ctx.requestId,
+        axis: ctx.axis,
+        callId: ctx.callId,
+        ...row,
+      });
+    } catch {
+      // Never throw from diagnostics.
     }
   }
 
@@ -433,9 +947,17 @@ export class HttpLlmClient implements LlmClient {
    * share behavior. Does NOT touch any circuit breaker — caller records
    * outcome on the appropriate breaker.
    */
+  /**
+   * v0.4.3.1 §C+integration H2: per-iteration hook. Called once per
+   * singleCall() iteration inside the retry loop — both on success and
+   * on transient/terminal failure. The hook is no-throw at the caller
+   * boundary: any throw inside is swallowed to preserve the client's
+   * response semantics.
+   */
   private async callWithRetry(
     binding: ModelBinding,
-    input: LlmCallInput
+    input: LlmCallInput,
+    onIteration?: (iteration: number, ok: boolean, elapsedMs: number, err: unknown) => void,
   ): Promise<LlmCallOutput> {
     const apiKey = this.env[binding.apiKeyEnv];
     if (!apiKey) {
@@ -447,9 +969,20 @@ export class HttpLlmClient implements LlmClient {
     let lastErr: unknown;
     let backoffWaitedMs = 0;
     const retryReasons: string[] = [];
+    // v0.4.3.1 §C M1 (latency symmetry): count attempts even on the failure
+    // path so callers can subtract backoff waits from wall-clock and report
+    // a meaningful netLatency to the CircuitBreaker on failure too.
+    let attemptCount = 0;
     for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
+      attemptCount = attempt;
+      const iterStarted = Date.now();
       try {
         const out = await this.singleCall(binding, apiKey, input);
+        // Per-iteration hook: success case.
+        if (onIteration) {
+          try { onIteration(attempt, true, Date.now() - iterStarted, null); }
+          catch { /* diagnostics must never poison the caller */ }
+        }
         return {
           ...out,
           attemptCount: attempt,
@@ -457,11 +990,23 @@ export class HttpLlmClient implements LlmClient {
           retryReasons,
         };
       } catch (err) {
+        // Per-iteration hook: failure case (transient or terminal).
+        if (onIteration) {
+          try { onIteration(attempt, false, Date.now() - iterStarted, err); }
+          catch { /* diagnostics must never poison the caller */ }
+        }
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
         const retryable = RETRYABLE_PATTERN.test(msg);
         if (!retryable || attempt === this.config.maxAttempts) {
-          throw err;
+          // v0.4.3.1 §C M1: annotate the thrown error with the retry-loop
+          // instrumentation so the caller can compute netLatency
+          // symmetrically with the success path.
+          throw annotateRetryFailure(err, {
+            attemptCount,
+            backoffWaitedMs,
+            retryReasons: [...retryReasons],
+          });
         }
         if (retryReasons.length < 4) retryReasons.push(msg.slice(0, 120));
         const wait =
@@ -516,20 +1061,33 @@ export class HttpLlmClient implements LlmClient {
         signal: controller.signal,
       });
     } catch (err) {
-      // AbortError from our own timeout should surface as a retryable
+      // A failed fetch is a provider-interaction failure. Preserve the
+      // original message verbatim so RETRYABLE_PATTERN / categorizeFailure /
+      // existing message-regex tests behave exactly as before; only the error
+      // TYPE changes (→ ProviderCallError) so the engine can attribute
+      // structured provider provenance without string-parsing.
+      // AbortError from our own timeout still surfaces as a retryable
       // "timeout" message so RETRYABLE_PATTERN picks it up.
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new Error(`[llm-client] request timeout after ${this.config.timeoutMs}ms (aborted)`);
+        throw new ProviderCallError(
+          `[llm-client] request timeout after ${this.config.timeoutMs}ms (aborted)`,
+          binding.provider,
+          undefined,
+          { cause: err },
+        );
       }
-      throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new ProviderCallError(msg, binding.provider, undefined, { cause: err });
     } finally {
       clearTimeout(timeout);
     }
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw new Error(
-        `[llm-client] ${binding.provider} ${response.status}: ${body.slice(0, 500)}`
+      throw new ProviderCallError(
+        `[llm-client] ${binding.provider} ${response.status}: ${body.slice(0, 500)}`,
+        binding.provider,
+        response.status,
       );
     }
 
@@ -554,7 +1112,12 @@ export type MockResponder = (modelAlias: string, input: LlmCallInput) => LlmCall
 export class MockLlmClient implements LlmClient {
   constructor(private readonly responder: MockResponder) {}
 
-  async call(modelAlias: string, input: LlmCallInput): Promise<LlmCallOutput> {
+  async call(
+    modelAlias: string,
+    input: LlmCallInput,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _ctx?: CallContext,
+  ): Promise<LlmCallOutput> {
     return await this.responder(modelAlias, input);
   }
 }

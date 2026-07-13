@@ -12,10 +12,21 @@
 
 import type { AxisPrompt } from './axes/types.js';
 import type { AxisResult, Axis } from '../types.js';
+import type { CallContext } from './call-context.js';
 
 export interface CascadeInput {
   axis: Axis;
   prompt: AxisPrompt;
+  /**
+   * v0.4.3.1 §C.1: optional per-call context propagated from the handler.
+   * When populated, `ctx.requestId` is the handler-owned canonical id and
+   * MUST match `DqlResponse.id`. `ctx.axis` mirrors this input's `axis`
+   * (redundant but useful for logging). `ctx.callId` identifies this
+   * specific parallel call within the request.
+   *
+   * Cascades that do not need it (StubCascade, SandboxCascade) may ignore.
+   */
+  ctx?: CallContext;
 }
 
 export interface CascadeOutput {

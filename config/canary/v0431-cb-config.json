@@ -1,0 +1,20 @@
+{
+  "serv-nano": {
+    "tripP90LatencyMs": 10000,
+    "tripFailureRate": 0.5,
+    "cooldownMs": 30000,
+    "windowSize": 20,
+    "windowAgeMs": 60000,
+    "minSamples": 5,
+    "probeMaxLatencyMs": 15000
+  },
+  "serv-swift": {
+    "tripP90LatencyMs": 15000,
+    "tripFailureRate": 0.5,
+    "cooldownMs": 30000,
+    "windowSize": 20,
+    "windowAgeMs": 60000,
+    "minSamples": 5,
+    "probeMaxLatencyMs": 15000
+  }
+}

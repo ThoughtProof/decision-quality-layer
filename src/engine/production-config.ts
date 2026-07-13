@@ -1,0 +1,822 @@
+/**
+ * ProductionConfig — resolved, validated, hashable (v0.4.3.1 Hardening).
+ *
+ * Hardening addresses Hermes Review on `8c7bba6`:
+ *   B3  SERV_BASE_URL is validated (https, no creds/query/fragment) and
+ *       normalised; Health redacts to endpoint_id, hash uses normalised URL.
+ *   B4  Strict boolean: any set-but-invalid literal throws (no silent
+ *       false). Unset → documented default per mode.
+ *   B5  parseRuntimeMode enumerates allowed values; unknown → error.
+ *       Health + Verify SHARE this parser (single source of truth).
+ *   B6  Full v0.4.3.1 schema: DQL_V0431_ACTIVE, disableCircuitBreaker,
+ *       circuitBreakerConfigByAlias (nano+swift), productLatencyCeiling
+ *       MsByAlias, requiredHealthyHeadroom. Canary rule: active && live
+ *       ⇒ diagnostics MUST be ON.
+ *   B7  Recursive canonicalisation for nested config. Deterministic
+ *       SHA-256 regardless of object-key order at any depth.
+ *   M8  Error contract: ProductionConfigError.code = 'CONFIG_INVALID';
+ *       Health status 'config_invalid'; Verify 503 CONFIG_INVALID.
+ *   M9  Build-identity fields (commit_sha, config_schema_version) are
+ *       surfaced by Health but NOT included in the config hash.
+ *
+ * SECURITY:
+ *   • Secret VALUES never enter the config object. `serv_api_key_bound`
+ *     is the only observable signal about the key's presence.
+ *   • URLs with userinfo/query/fragment are rejected at resolution time.
+ *   • Reasons never contain raw env VALUES for JSON/URL fields (CPM value
+ *     is echoed because it is a boolean literal).
+ */
+
+import crypto from 'node:crypto';
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+export type RuntimeMode = 'stub' | 'pot-cli';
+
+/** Fixed monotonic schema version. Bump when the resolved shape changes. */
+export const CONFIG_SCHEMA_VERSION = '0.4.3.1-hardening-1';
+
+/** Aliases the v0.4.3.1 resolver knows about. Wired in per-alias config. */
+export const KNOWN_ALIASES = ['serv-nano', 'serv-swift'] as const;
+export type KnownAlias = (typeof KNOWN_ALIASES)[number];
+
+/**
+ * Per-alias CircuitBreaker knobs. Mirrors CircuitBreakerConfig from
+ * circuit-breaker.ts but kept independent so the Config module doesn't
+ * depend on the CB module.
+ */
+export interface AliasCircuitBreakerConfig {
+  /** p90 network latency (ms) above which the breaker trips. */
+  tripP90LatencyMs: number;
+  /** failure rate in the sliding window above which the breaker trips. */
+  tripFailureRate: number;
+  /** cooldown in ms before HALF_OPEN probe. */
+  cooldownMs: number;
+  /** Max samples in the sliding window. */
+  windowSize: number;
+  /** Max age of a sample in ms. */
+  windowAgeMs: number;
+  /** Min samples required before either threshold can trip. */
+  minSamples: number;
+  /** Max latency for the HALF_OPEN probe request. */
+  probeMaxLatencyMs: number;
+}
+
+/** Product-side latency ceiling (kept separate from CB trip). */
+export interface AliasLatencyCeiling {
+  /** Product SLA ceiling in ms; used by RuntimeDiagnosticsCollector. */
+  p90CeilingMs: number;
+}
+
+export interface ProductionConfig {
+  /** Which mode this config was resolved for. */
+  runtime_mode: RuntimeMode;
+  /** v0.4.3.1 canary switch: hardened path enabled iff true. */
+  v0431_active: boolean;
+  /** Whether capital-path calls fail closed. */
+  capital_path_mode: boolean;
+  /** When true, every CB is bypassed (baseline / diagnostic runs only). */
+  disable_circuit_breaker: boolean;
+  /**
+   * Normalised, credential-free SERV base URL. Null in stub mode with
+   * no explicit override.
+   */
+  serv_base_url: string | null;
+  /**
+   * Presence flag for SERV_API_KEY. Never the value.
+   */
+  serv_api_key_bound: boolean;
+  /** cascade shape flag. */
+  confirm_fail: boolean;
+  /** telemetry toggle (env: DQL_RUNTIME_DIAGNOSTICS). */
+  diagnostics_on: boolean;
+  /** Per-alias CB knobs — validated, complete for KNOWN_ALIASES. */
+  circuit_breaker_config_by_alias: Record<KnownAlias, AliasCircuitBreakerConfig>;
+  /** Per-alias product latency ceiling — validated, complete. */
+  product_latency_ceiling_by_alias: Record<KnownAlias, AliasLatencyCeiling>;
+  /**
+   * Fraction of KNOWN_ALIASES that must remain healthy for Gate 2 to admit
+   * a request. Range: [0,1]. Renamed per Hermes 2026-07-11 review — the
+   * previous name `required_healthy_headroom` was ambiguous (latency
+   * headroom vs. alias fraction). Semantic here is EXPLICITLY:
+   *   #healthy_aliases / |KNOWN_ALIASES| >= required_healthy_alias_fraction
+   * With two aliases and default 0.5, this means "at least one of two
+   * must be healthy". This must NOT be confused with a latency-ceiling
+   * safety margin — see product_latency_ceiling_by_alias for that.
+   */
+  required_healthy_alias_fraction: number;
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class ProductionConfigError extends Error {
+  public readonly code = 'CONFIG_INVALID' as const;
+  constructor(
+    public readonly mode: RuntimeMode | 'unknown',
+    public readonly reasons: readonly string[],
+  ) {
+    super(
+      `[production-config] ${mode} mode: config resolution failed — ` +
+        reasons.map((r, i) => `(${i + 1}) ${r}`).join(' | '),
+    );
+    this.name = 'ProductionConfigError';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Primitive parsers
+// ---------------------------------------------------------------------------
+
+const TRUTHY = new Set(['1', 'true', 'yes', 'on', 'TRUE', 'YES', 'ON']);
+const FALSY = new Set(['0', 'false', 'no', 'off', 'FALSE', 'NO', 'OFF']);
+
+/** unset | true | false | 'invalid' */
+export function parseBool(raw: string | undefined): boolean | 'unset' | 'invalid' {
+  if (raw === undefined || raw === '') return 'unset';
+  if (TRUTHY.has(raw)) return true;
+  if (FALSY.has(raw)) return false;
+  return 'invalid';
+}
+
+/**
+ * STRICT bool. Any set-but-invalid literal is a fatal ConfigError reason.
+ * Unset → returns `defaultValue`. Callers push a reason into `reasons`
+ * when the literal is invalid.
+ */
+function readStrictBool(
+  raw: string | undefined,
+  envName: string,
+  defaultValue: boolean,
+  reasons: string[],
+): boolean {
+  const parsed = parseBool(raw);
+  if (parsed === 'invalid') {
+    reasons.push(
+      `${envName} has invalid value ${JSON.stringify(raw)}; expected boolean literal (1/0/true/false/yes/no/on/off)`,
+    );
+    return defaultValue;
+  }
+  if (parsed === 'unset') return defaultValue;
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-mode parser (B5) — single source of truth
+// ---------------------------------------------------------------------------
+
+const MODE_ALIASES: Record<string, RuntimeMode> = {
+  stub: 'stub',
+  'pot-cli': 'pot-cli',
+  potcli: 'pot-cli',
+  live: 'pot-cli',
+};
+
+/**
+ * Parse DQL_CASCADE (or equivalent) into a canonical RuntimeMode.
+ *
+ * Contract:
+ *   • unset → 'stub' (documented default).
+ *   • one of the known aliases → canonical mode.
+ *   • anything else → throws ProductionConfigError immediately. No silent
+ *     downgrade to stub — a typo like `pot-clii` used to succeed with mode
+ *     stub. Now it fails loudly.
+ */
+export function parseRuntimeMode(raw: string | undefined): RuntimeMode {
+  if (raw === undefined || raw === '') return 'stub';
+  const canonical = MODE_ALIASES[raw.trim().toLowerCase()];
+  if (canonical) return canonical;
+  throw new ProductionConfigError('unknown', [
+    `DQL_CASCADE has invalid value ${JSON.stringify(raw)}; expected one of stub|pot-cli|potcli|live`,
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// SERV_BASE_URL validator (B3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate and normalise a SERV provider URL. Rejects URLs that could
+ * carry secrets or ambient state; returns a stable, redactable form.
+ *
+ * Rules:
+ *   • Scheme MUST be https:// (Prod). In stub mode http://localhost is
+ *     also permitted for local testing.
+ *   • username/password MUST NOT be present.
+ *   • query MUST NOT be present.
+ *   • fragment MUST NOT be present.
+ *   • pathname is preserved verbatim.
+ *   • trailing slash is REMOVED (canonical form has no trailing slash).
+ *
+ * Errors are pushed onto `reasons`. Returns `null` on failure so the
+ * caller can gate on `reasons.length > 0` for final throw.
+ */
+export function normaliseServBaseUrl(
+  raw: string,
+  mode: RuntimeMode,
+  reasons: string[],
+): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    reasons.push('SERV_BASE_URL is not a valid absolute URL');
+    return null;
+  }
+  const isHttps = parsed.protocol === 'https:';
+  const isLocalhostHttp =
+    mode === 'stub' &&
+    parsed.protocol === 'http:' &&
+    (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1');
+  if (!isHttps && !isLocalhostHttp) {
+    reasons.push(
+      'SERV_BASE_URL must use https:// (stub mode may use http://localhost)',
+    );
+    return null;
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    reasons.push('SERV_BASE_URL must not contain userinfo (username:password@)');
+    return null;
+  }
+  if (parsed.search !== '') {
+    reasons.push('SERV_BASE_URL must not contain a query string');
+    return null;
+  }
+  if (parsed.hash !== '') {
+    reasons.push('SERV_BASE_URL must not contain a fragment');
+    return null;
+  }
+  // Normalise: strip trailing slash from pathname if present and pathname > '/'.
+  let path = parsed.pathname;
+  if (path.length > 1 && path.endsWith('/')) path = path.replace(/\/+$/, '');
+  const normalised = `${parsed.protocol}//${parsed.host}${path}`;
+  return normalised;
+}
+
+/**
+ * Given a normalised URL, return an endpoint-id for Health surfaces.
+ * Callers should prefer this over shipping the raw host.
+ */
+export function endpointIdFor(url: string | null): 'openserv-default' | 'custom' | 'unset' {
+  if (url === null) return 'unset';
+  if (url === 'https://inference-api.openserv.ai/v1') return 'openserv-default';
+  return 'custom';
+}
+
+// ---------------------------------------------------------------------------
+// Alias config parser (B6)
+// ---------------------------------------------------------------------------
+
+/**
+ * v0.4.3-baseline CB knobs. Kept per-alias for schema uniformity, but
+ * EVERY alias gets the same PR #10 global default (15s / 0.5 / 30s) so
+ * that `v0431_active=false` reproduces baseline behaviour byte-identically
+ * — no new unkalibrated per-alias trip thresholds are introduced by this
+ * schema alone. Explicit per-alias tuning requires `v0431_active=true` +
+ * `DQL_CB_CONFIG_BY_ALIAS` for both known aliases.
+ *
+ * Rationale (Hermes 2026-07-11 review): the previous defaults (nano=8s /
+ * swift=15s) silently changed nano behaviour before calibration — even
+ * with the canary flag OFF. That violated the shadow-mode principle.
+ */
+const DEFAULT_CB_BY_ALIAS: Record<KnownAlias, AliasCircuitBreakerConfig> = {
+  'serv-nano': {
+    tripP90LatencyMs: 15_000,
+    tripFailureRate: 0.5,
+    cooldownMs: 30_000,
+    // v0.4.3.1 §E: these default to the CircuitBreaker defaults so OFF-mode
+    // behaviour stays byte-identical to pre-§E. ACTIVE mode requires them
+    // to be explicit — see readCbByAlias().
+    windowSize: 20,
+    windowAgeMs: 60_000,
+    minSamples: 5,
+    probeMaxLatencyMs: 15_000,
+  },
+  'serv-swift': {
+    tripP90LatencyMs: 15_000,
+    tripFailureRate: 0.5,
+    cooldownMs: 30_000,
+    windowSize: 20,
+    windowAgeMs: 60_000,
+    minSamples: 5,
+    probeMaxLatencyMs: 15_000,
+  },
+};
+
+const DEFAULT_LATENCY_CEILING_BY_ALIAS: Record<KnownAlias, AliasLatencyCeiling> = {
+  'serv-nano': { p90CeilingMs: 6_000 },
+  'serv-swift': { p90CeilingMs: 12_000 },
+};
+
+/**
+ * Known keys accepted per alias in DQL_CB_CONFIG_BY_ALIAS. Any other key
+ * within a known-alias object is a hard error (typo protection). Bounds:
+ *   tripP90LatencyMs > 0
+ *   tripFailureRate  in [0,1]
+ *   cooldownMs      >= 0
+ */
+const CB_ALIAS_KEYS = [
+  'tripP90LatencyMs',
+  'tripFailureRate',
+  'cooldownMs',
+  'windowSize',
+  'windowAgeMs',
+  'minSamples',
+  'probeMaxLatencyMs',
+] as const;
+type CbAliasKey = (typeof CB_ALIAS_KEYS)[number];
+
+/**
+ * ACTIVE mode requires all four new §E fields to be explicitly set in the
+ * DQL_CB_CONFIG_BY_ALIAS override. OFF mode inherits the defaults above.
+ */
+const CB_ALIAS_ACTIVE_REQUIRED_KEYS = [
+  'windowSize',
+  'windowAgeMs',
+  'minSamples',
+  'probeMaxLatencyMs',
+] as const;
+
+function validateCbNumber(key: CbAliasKey, value: number, ctx: { windowSize?: number } = {}): string | null {
+  if (key === 'tripP90LatencyMs' && !(value > 0)) {
+    return `must be > 0 (got ${value})`;
+  }
+  if (key === 'tripFailureRate' && !(value >= 0 && value <= 1)) {
+    return `must be in [0,1] (got ${value})`;
+  }
+  if (key === 'cooldownMs' && !(value >= 0)) {
+    return `must be >= 0 (got ${value})`;
+  }
+  if (key === 'windowSize') {
+    if (!Number.isInteger(value) || value < 1 || value > 1000) {
+      return `must be an integer in [1, 1000] (got ${value})`;
+    }
+  }
+  if (key === 'windowAgeMs' && !(value > 0)) {
+    return `must be > 0 (got ${value})`;
+  }
+  if (key === 'minSamples') {
+    if (!Number.isInteger(value) || value < 1) {
+      return `must be an integer ≥ 1 (got ${value})`;
+    }
+    const ws = ctx.windowSize;
+    if (ws !== undefined && value > ws) {
+      return `must be ≤ windowSize (${ws}) (got ${value})`;
+    }
+  }
+  if (key === 'probeMaxLatencyMs' && !(value > 0)) {
+    return `must be > 0 (got ${value})`;
+  }
+  return null;
+}
+
+/**
+ * Optional overrides via a single JSON env: DQL_CB_CONFIG_BY_ALIAS.
+ * If present, must parse to a partial map keyed by KnownAlias with
+ * numeric fields in valid ranges (see validateCbNumber). Unknown aliases,
+ * unknown per-alias keys, non-numeric values, or out-of-range numbers
+ * all produce ConfigError — nothing is silently defaulted.
+ */
+function readCbByAlias(
+  raw: string | undefined,
+  reasons: string[],
+): Record<KnownAlias, AliasCircuitBreakerConfig> {
+  const out: Record<KnownAlias, AliasCircuitBreakerConfig> = {
+    'serv-nano': { ...DEFAULT_CB_BY_ALIAS['serv-nano'] },
+    'serv-swift': { ...DEFAULT_CB_BY_ALIAS['serv-swift'] },
+  };
+  if (raw === undefined || raw === '') return out;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    reasons.push('DQL_CB_CONFIG_BY_ALIAS is not valid JSON');
+    return out;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    reasons.push('DQL_CB_CONFIG_BY_ALIAS must be a JSON object keyed by alias');
+    return out;
+  }
+  const obj = parsed as Record<string, unknown>;
+  for (const alias of Object.keys(obj)) {
+    if (!(KNOWN_ALIASES as readonly string[]).includes(alias)) {
+      reasons.push(
+        `DQL_CB_CONFIG_BY_ALIAS contains unknown alias ${JSON.stringify(alias)}`,
+      );
+      continue;
+    }
+    const v = obj[alias];
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+      reasons.push(
+        `DQL_CB_CONFIG_BY_ALIAS[${alias}] must be an object`,
+      );
+      continue;
+    }
+    const cur = out[alias as KnownAlias];
+    const spec = v as Record<string, unknown>;
+    // Reject typos and unknown fields BEFORE reading known ones.
+    for (const k of Object.keys(spec)) {
+      if (!(CB_ALIAS_KEYS as readonly string[]).includes(k)) {
+        reasons.push(
+          `DQL_CB_CONFIG_BY_ALIAS[${alias}] has unknown key ${JSON.stringify(k)}; allowed keys: ${CB_ALIAS_KEYS.join(', ')}`,
+        );
+      }
+    }
+    // Two passes: read windowSize first so minSamples validation can
+    // cross-check against the final effective windowSize for this alias.
+    for (const key of CB_ALIAS_KEYS) {
+      if (key === 'minSamples') continue; // deferred to pass 2
+      if (spec[key] === undefined) continue;
+      if (typeof spec[key] !== 'number' || !Number.isFinite(spec[key])) {
+        reasons.push(
+          `DQL_CB_CONFIG_BY_ALIAS[${alias}].${key} must be a finite number`,
+        );
+        continue;
+      }
+      const n = spec[key] as number;
+      const boundErr = validateCbNumber(key, n);
+      if (boundErr) {
+        reasons.push(`DQL_CB_CONFIG_BY_ALIAS[${alias}].${key} ${boundErr}`);
+        continue;
+      }
+      cur[key] = n;
+    }
+    // Pass 2: minSamples with cross-check against effective windowSize.
+    if (spec['minSamples'] !== undefined) {
+      const n = spec['minSamples'];
+      if (typeof n !== 'number' || !Number.isFinite(n)) {
+        reasons.push(
+          `DQL_CB_CONFIG_BY_ALIAS[${alias}].minSamples must be a finite number`,
+        );
+      } else {
+        const boundErr = validateCbNumber('minSamples', n, {
+          windowSize: cur.windowSize,
+        });
+        if (boundErr) {
+          reasons.push(
+            `DQL_CB_CONFIG_BY_ALIAS[${alias}].minSamples ${boundErr}`,
+          );
+        } else {
+          cur.minSamples = n;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+const LATENCY_CEILING_KEYS = ['p90CeilingMs'] as const;
+
+function readLatencyCeilingByAlias(
+  raw: string | undefined,
+  reasons: string[],
+): Record<KnownAlias, AliasLatencyCeiling> {
+  const out: Record<KnownAlias, AliasLatencyCeiling> = {
+    'serv-nano': { ...DEFAULT_LATENCY_CEILING_BY_ALIAS['serv-nano'] },
+    'serv-swift': { ...DEFAULT_LATENCY_CEILING_BY_ALIAS['serv-swift'] },
+  };
+  if (raw === undefined || raw === '') return out;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    reasons.push('DQL_LATENCY_CEILING_BY_ALIAS is not valid JSON');
+    return out;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    reasons.push(
+      'DQL_LATENCY_CEILING_BY_ALIAS must be a JSON object keyed by alias',
+    );
+    return out;
+  }
+  const obj = parsed as Record<string, unknown>;
+  for (const alias of Object.keys(obj)) {
+    if (!(KNOWN_ALIASES as readonly string[]).includes(alias)) {
+      reasons.push(
+        `DQL_LATENCY_CEILING_BY_ALIAS contains unknown alias ${JSON.stringify(alias)}`,
+      );
+      continue;
+    }
+    const v = obj[alias];
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+      reasons.push(`DQL_LATENCY_CEILING_BY_ALIAS[${alias}] must be an object`);
+      continue;
+    }
+    const spec = v as Record<string, unknown>;
+    // Reject typos and unknown fields.
+    for (const k of Object.keys(spec)) {
+      if (!(LATENCY_CEILING_KEYS as readonly string[]).includes(k)) {
+        reasons.push(
+          `DQL_LATENCY_CEILING_BY_ALIAS[${alias}] has unknown key ${JSON.stringify(k)}; allowed keys: ${LATENCY_CEILING_KEYS.join(', ')}`,
+        );
+      }
+    }
+    if (spec.p90CeilingMs !== undefined) {
+      if (typeof spec.p90CeilingMs !== 'number' || !Number.isFinite(spec.p90CeilingMs)) {
+        reasons.push(
+          `DQL_LATENCY_CEILING_BY_ALIAS[${alias}].p90CeilingMs must be a finite number`,
+        );
+      } else if (!(spec.p90CeilingMs > 0)) {
+        reasons.push(
+          `DQL_LATENCY_CEILING_BY_ALIAS[${alias}].p90CeilingMs must be > 0 (got ${spec.p90CeilingMs})`,
+        );
+      } else {
+        out[alias as KnownAlias].p90CeilingMs = spec.p90CeilingMs;
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Resolver
+// ---------------------------------------------------------------------------
+
+export interface ResolveOptions {
+  requiredMode: RuntimeMode;
+}
+
+/**
+ * Resolve the full v0.4.3.1 ProductionConfig from `env`.
+ *
+ * pot-cli contract:
+ *   • SERV_API_KEY required.
+ *   • DQL_CAPITAL_PATH_MODE explicit (no default).
+ *   • SERV_BASE_URL defaults to https://inference-api.openserv.ai/v1
+ *     if unset; if set, validated by normaliseServBaseUrl.
+ *   • Canary rule (B6): v0431_active && runtime_mode==='pot-cli' →
+ *     DQL_RUNTIME_DIAGNOSTICS MUST be '1'.
+ */
+export function resolveProductionConfig(
+  env: NodeJS.ProcessEnv,
+  opts: ResolveOptions,
+): ProductionConfig {
+  const reasons: string[] = [];
+  const mode = opts.requiredMode;
+
+  // --- capital_path_mode (safety-relevant → explicit in pot-cli) ---------
+  const cpmParsed = parseBool(env.DQL_CAPITAL_PATH_MODE);
+  let capitalPathMode = false;
+  if (cpmParsed === 'invalid') {
+    reasons.push(
+      `DQL_CAPITAL_PATH_MODE has invalid value ${JSON.stringify(env.DQL_CAPITAL_PATH_MODE)}; expected boolean literal`,
+    );
+  } else if (cpmParsed === 'unset') {
+    if (mode === 'pot-cli') {
+      reasons.push(
+        'DQL_CAPITAL_PATH_MODE is required in pot-cli mode; must be set explicitly to "1" or "0"',
+      );
+    }
+  } else {
+    capitalPathMode = cpmParsed;
+  }
+
+  // --- SERV_API_KEY presence --------------------------------------------
+  const servApiKey = env.SERV_API_KEY;
+  const servApiKeyBound = typeof servApiKey === 'string' && servApiKey.length > 0;
+  if (mode === 'pot-cli' && !servApiKeyBound) {
+    reasons.push('SERV_API_KEY is required in pot-cli mode');
+  }
+
+  // --- SERV_BASE_URL (B3) -----------------------------------------------
+  let servBaseUrl: string | null = null;
+  const rawUrl = env.SERV_BASE_URL;
+  if (rawUrl !== undefined && rawUrl !== '') {
+    servBaseUrl = normaliseServBaseUrl(rawUrl, mode, reasons);
+  } else if (mode === 'pot-cli') {
+    servBaseUrl = 'https://inference-api.openserv.ai/v1';
+  }
+
+  // --- v0431_active + disable_circuit_breaker ---------------------------
+  const v0431Active = readStrictBool(env.DQL_V0431_ACTIVE, 'DQL_V0431_ACTIVE', false, reasons);
+  const disableCb = readStrictBool(
+    env.DQL_DISABLE_CIRCUIT_BREAKER,
+    'DQL_DISABLE_CIRCUIT_BREAKER',
+    false,
+    reasons,
+  );
+
+  // --- confirm_fail + diagnostics ---------------------------------------
+  const confirmFail = readStrictBool(env.DQL_CONFIRM_FAIL, 'DQL_CONFIRM_FAIL', false, reasons);
+  const diagnosticsOn = readStrictBool(
+    env.DQL_RUNTIME_DIAGNOSTICS,
+    'DQL_RUNTIME_DIAGNOSTICS',
+    false,
+    reasons,
+  );
+
+  // --- Canary rule: active && pot-cli → diagnostics ON ------------------
+  if (v0431Active && mode === 'pot-cli' && !diagnosticsOn) {
+    reasons.push(
+      'DQL_V0431_ACTIVE=true in pot-cli mode requires DQL_RUNTIME_DIAGNOSTICS=1',
+    );
+  }
+
+  // --- per-alias CB + latency ceilings ----------------------------------
+  const cbByAlias = readCbByAlias(env.DQL_CB_CONFIG_BY_ALIAS, reasons);
+  const latencyByAlias = readLatencyCeilingByAlias(
+    env.DQL_LATENCY_CEILING_BY_ALIAS,
+    reasons,
+  );
+
+  // --- v0431-active shadow-mode invariant (B2 + Hermes H2 fix) ---------
+  // If v0431_active=true in pot-cli, per-alias CB overrides MUST be
+  // provided explicitly for EVERY known alias AND every alias object MUST
+  // explicitly set every policy-relevant CB field. This forbids the
+  // "canary ON but relying on baseline defaults" configuration — which
+  // would silently apply v0.4.3 knobs while looking calibrated. Empty
+  // or partial objects (e.g. { 'serv-nano': {} }) are rejected here.
+  //
+  // Required fields per alias (policy-relevant knobs the resolver hashes):
+  //   - tripP90LatencyMs
+  //   - tripFailureRate
+  //   - cooldownMs
+  // If further CB knobs become resolver-visible in a later commit, add
+  // them here so ACTIVE keeps requiring an EXPLICIT value for each.
+  const V0431_REQUIRED_CB_FIELDS = [
+    'tripP90LatencyMs',
+    'tripFailureRate',
+    'cooldownMs',
+    'windowSize',
+    'windowAgeMs',
+    'minSamples',
+    'probeMaxLatencyMs',
+  ] as const;
+  if (v0431Active && mode === 'pot-cli') {
+    const raw = env.DQL_CB_CONFIG_BY_ALIAS;
+    if (raw === undefined || raw === '') {
+      reasons.push(
+        'DQL_V0431_ACTIVE=true in pot-cli mode requires DQL_CB_CONFIG_BY_ALIAS with an explicit entry for every known alias',
+      );
+    } else {
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const missing = (KNOWN_ALIASES as readonly string[]).filter(
+          (a) => !(a in parsed),
+        );
+        if (missing.length > 0) {
+          reasons.push(
+            `DQL_V0431_ACTIVE=true requires DQL_CB_CONFIG_BY_ALIAS entries for [${missing.join(', ')}]; got ${JSON.stringify(Object.keys(parsed))}`,
+          );
+        }
+        // Hermes H2: every alias entry must be a NON-EMPTY object that
+        // explicitly sets each policy-relevant field. Empty {} or partial
+        // objects that would silently inherit baseline defaults are
+        // rejected here so a canary deploy cannot look "calibrated"
+        // while actually running defaults.
+        for (const alias of KNOWN_ALIASES) {
+          if (!(alias in parsed)) continue; // already reported above
+          const entry = parsed[alias];
+          if (
+            entry === null ||
+            typeof entry !== 'object' ||
+            Array.isArray(entry)
+          ) {
+            reasons.push(
+              `DQL_V0431_ACTIVE=true requires DQL_CB_CONFIG_BY_ALIAS['${alias}'] to be a non-null object`,
+            );
+            continue;
+          }
+          const entryObj = entry as Record<string, unknown>;
+          const missingFields = V0431_REQUIRED_CB_FIELDS.filter(
+            (f) => !(f in entryObj),
+          );
+          if (missingFields.length > 0) {
+            reasons.push(
+              `DQL_V0431_ACTIVE=true requires DQL_CB_CONFIG_BY_ALIAS['${alias}'] to explicitly set [${missingFields.join(', ')}]; got ${JSON.stringify(Object.keys(entryObj))}`,
+            );
+          }
+        }
+      } catch {
+        // JSON parse error already reported by readCbByAlias.
+      }
+    }
+  }
+
+  // --- required_healthy_alias_fraction ----------------------------------
+  // Env var name kept STABLE for operator continuity: DQL_REQUIRED_HEALTHY_
+  // ALIAS_FRACTION. Legacy DQL_REQUIRED_HEALTHY_HEADROOM env is still
+  // accepted for one release with an explicit deprecation reason if it is
+  // used alongside the new one (conflict → error).
+  const newRaw = env.DQL_REQUIRED_HEALTHY_ALIAS_FRACTION;
+  const legacyRaw = env.DQL_REQUIRED_HEALTHY_HEADROOM;
+  let requiredHealthyAliasFraction = 0.5;
+  const pickedRaw =
+    newRaw !== undefined && newRaw !== ''
+      ? { source: 'DQL_REQUIRED_HEALTHY_ALIAS_FRACTION', value: newRaw }
+      : legacyRaw !== undefined && legacyRaw !== ''
+        ? { source: 'DQL_REQUIRED_HEALTHY_HEADROOM', value: legacyRaw }
+        : null;
+  if (newRaw !== undefined && newRaw !== '' && legacyRaw !== undefined && legacyRaw !== '') {
+    reasons.push(
+      'DQL_REQUIRED_HEALTHY_ALIAS_FRACTION and legacy DQL_REQUIRED_HEALTHY_HEADROOM both set; pick exactly one (prefer the new name).',
+    );
+  } else if (pickedRaw) {
+    const n = Number(pickedRaw.value);
+    if (!Number.isFinite(n) || n < 0 || n > 1) {
+      reasons.push(
+        `${pickedRaw.source} must be a number in [0,1]; got ${JSON.stringify(pickedRaw.value)}`,
+      );
+    } else {
+      requiredHealthyAliasFraction = n;
+    }
+  }
+
+  if (reasons.length > 0) {
+    throw new ProductionConfigError(mode, reasons);
+  }
+
+  return {
+    runtime_mode: mode,
+    v0431_active: v0431Active,
+    capital_path_mode: capitalPathMode,
+    disable_circuit_breaker: disableCb,
+    serv_base_url: servBaseUrl,
+    serv_api_key_bound: servApiKeyBound,
+    confirm_fail: confirmFail,
+    diagnostics_on: diagnosticsOn,
+    circuit_breaker_config_by_alias: cbByAlias,
+    product_latency_ceiling_by_alias: latencyByAlias,
+    required_healthy_alias_fraction: requiredHealthyAliasFraction,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Recursive canonical hash (B7)
+// ---------------------------------------------------------------------------
+
+/**
+ * Return a canonical JSON string for any JSON-safe value.
+ *
+ * Rules:
+ *   • primitives: JSON.stringify verbatim.
+ *   • arrays: `[e0,e1,...]` — order preserved, each element canonicalised.
+ *   • objects: `{k0:v0,k1:v1,...}` with keys sorted ascending, each
+ *     value canonicalised recursively.
+ *   • undefined values on objects are omitted (mirroring JSON.stringify).
+ *
+ * The output is a deterministic byte-string. Two structurally-equal
+ * inputs produce identical output regardless of insertion order at ANY
+ * depth. This replaces the shallow `JSON.stringify(x, sortedTopKeys)`
+ * pattern which silently dropped nested keys not listed at the top.
+ */
+export function canonicaliseJson(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      // JSON.stringify would emit `null`; canonicalisation must be explicit.
+      return 'null';
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (Array.isArray(value)) {
+    return '[' + value.map((v) => canonicaliseJson(v)).join(',') + ']';
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj)
+      .filter((k) => obj[k] !== undefined)
+      .sort();
+    return (
+      '{' +
+      keys
+        .map((k) => JSON.stringify(k) + ':' + canonicaliseJson(obj[k]))
+        .join(',') +
+      '}'
+    );
+  }
+  // functions / symbols / undefined at the top level → null (defensive)
+  return 'null';
+}
+
+/**
+ * Deterministic SHA-256 fingerprint of the resolved config.
+ *
+ * The hash MUST NOT include:
+ *   • secret values (SERV_API_KEY value; only `serv_api_key_bound` is hashed).
+ *   • build identity (commit_sha, config_schema_version).
+ * The hash MUST include:
+ *   • every runtime-behaviour-affecting field of ProductionConfig.
+ */
+export function computeConfigHash(config: ProductionConfig): string {
+  const canonical = {
+    capital_path_mode: config.capital_path_mode,
+    circuit_breaker_config_by_alias: config.circuit_breaker_config_by_alias,
+    confirm_fail: config.confirm_fail,
+    diagnostics_on: config.diagnostics_on,
+    disable_circuit_breaker: config.disable_circuit_breaker,
+    product_latency_ceiling_by_alias: config.product_latency_ceiling_by_alias,
+    required_healthy_alias_fraction: config.required_healthy_alias_fraction,
+    runtime_mode: config.runtime_mode,
+    serv_api_key_bound: config.serv_api_key_bound,
+    serv_base_url: config.serv_base_url,
+    v0431_active: config.v0431_active,
+  };
+  const payload = canonicaliseJson(canonical);
+  return crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+}
