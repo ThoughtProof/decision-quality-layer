@@ -121,13 +121,26 @@ export interface AxisResult {
    *   'circuit_rejected' — NO provider fetch was started for this call. The
    *                        circuit-breaker rejected before any network I/O.
    *                        `provider_route` is absent.
-   *   'provider_error'   — AT LEAST ONE provider fetch was started for this
-   *                        call but no route ultimately served a response.
-   *                        `provider_route` is absent.
+   *   'provider_error'   — a required provider draw for this axis failed with a
+   *                        started-but-unserved fetch. Two shapes qualify:
+   *                        (1) single-draw: at least one fetch was started but
+   *                        NO route served (the §C.3-fix / whole-cascade case);
+   *                        (2) composite/degraded (VERTRAGSÄNDERUNG, issue #14):
+   *                        the primary draw SERVED but a required secondary draw
+   *                        failed with a started fetch, so the axis could not be
+   *                        cross-verified. In BOTH shapes `provider_route` is
+   *                        absent — a partially-served axis may NOT claim a route.
    *
    * v0.4.3.1 §C.3-fix (Hermes 2026-07-11): the third value disambiguates
    * fail-closed-with-fetch from fail-closed-without-fetch. Report aggregators
    * MUST use the structured field, never derive from an error-message string.
+   *
+   * Metrics note (issue #14): because 'provider_error' now also covers the
+   * composite/degraded case above, a "fail-closed after fetch" tally counts
+   * both fully-unserved axes AND degraded axes whose primary served but whose
+   * secondary failed. Both are correctly fail-closed (REVIEW-or-stricter); the
+   * distinction, if a dashboard needs it, is that degraded axes carry a
+   * non-zero primary confidence while whole-cascade failures are confidence=0.
    *
    * Optional. Omitted when the field is not applicable (e.g. sandbox path,
    * legacy responses). Report aggregators should count:

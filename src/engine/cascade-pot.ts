@@ -38,7 +38,7 @@ import type { AxisResult, Axis, AxisVerdict } from '../types.js';
 import type { Cascade, CascadeInput, CascadeOutput } from './cascade.js';
 import { parseAxisResponse } from './cascade.js';
 import type { LlmClient } from './llm-client.js';
-import { HttpLlmClient } from './llm-client.js';
+import { HttpLlmClient, CircuitAllOpenError, ProviderCallError } from './llm-client.js';
 import type { CallContext } from './call-context.js';
 
 export interface PotCliCascadeConfig {
@@ -115,15 +115,43 @@ export class PotCliCascade implements Cascade {
       secondary = await this.callAxis(this.config.secondaryModel, axis, prompt, ctx);
       modelsUsed.push(secondary.modelId);
     } catch (err) {
-      // Degraded mode: secondary unavailable → be conservative.
-      // Primary=PASS → downgrade to UNCERTAIN. Primary=FAIL → keep FAIL
+      // Degraded mode: secondary unavailable → be conservative on the verdict
+      // AND emit truthful structured provenance so the aggregator can fail
+      // closed. Primary=PASS → downgrade to UNCERTAIN. Primary=FAIL → keep FAIL
       // (secondary can never rescue FAIL under our rules). Primary=UNCERTAIN
       // stays UNCERTAIN.
+      //
+      // VERTRAGSÄNDERUNG (issue #14, 2026-07-13): this branch previously spread
+      // `...primary.result`, inheriting the primary's provider_route +
+      // provider_outcome='served' onto an axis whose secondary draw FAILED.
+      // A 'served' label there is an active falsehood: aggregation Rule 2 trusts
+      // provider provenance, so it never fired and a single PASS@<0.7 primary
+      // could fall through to ALLOW ("All evaluated axes pass.") — the §D6
+      // fail-open, re-opened via the degraded path. We now classify the
+      // secondary error from its STRUCTURED TYPE (never message parsing,
+      // mirroring the engine's §D6 whole-cascade catch) and:
+      //   • provider/auth/circuit failure → attach provider_error |
+      //     circuit_rejected. Rule 2 escalates the axis to REVIEW-or-stricter,
+      //     INDEPENDENT of confidence.
+      //   • any OTHER (generic/local) error → no provider_outcome, matching the
+      //     engine's negative-discrimination baseline (a lone UNCERTAIN@<0.7
+      //     with no provenance still ALLOWs, unchanged).
+      // In BOTH cases the degraded axis DROPS the inherited primary route/
+      // outcome, so it never claims 'served' when the secondary failed.
       const fallbackVerdict: AxisVerdict =
         primary.result.verdict === 'PASS' ? 'UNCERTAIN' : primary.result.verdict;
+      const providerOutcome = classifySecondaryFailure(err);
       const note = `[cascade] secondary error → degraded (${err instanceof Error ? err.message.slice(0, 200) : 'unknown'})`;
+      const degraded: AxisResult = {
+        axis: primary.result.axis,
+        verdict: fallbackVerdict,
+        confidence: primary.result.confidence,
+        reasoning: primary.result.reasoning,
+        objection: primary.result.objection,
+        ...(providerOutcome ? { provider_outcome: providerOutcome } : {}),
+      };
       return {
-        result: annotate({ ...primary.result, verdict: fallbackVerdict }, note),
+        result: annotate(degraded, note),
         modelsUsed,
       };
     }
@@ -259,4 +287,31 @@ function annotate(r: AxisResult, note: string): AxisResult {
     ...r,
     reasoning: `${r.reasoning}\n\n${note}`,
   };
+}
+
+/**
+ * Classify a secondary-draw failure into structured provider provenance,
+ * mirroring the engine's §D6 whole-cascade catch (src/engine/index.ts). The
+ * classification is driven ENTIRELY by the error's TYPE — never by parsing
+ * Error.message.
+ *
+ *   CircuitAllOpenError, attemptedRoutes === [] → no provider fetch was
+ *     started                                    → 'circuit_rejected'
+ *   CircuitAllOpenError, attemptedRoutes ≠ []   → at least one provider fetch
+ *     was started (and failed)                   → 'provider_error'
+ *   ProviderCallError (HTTP 401/5xx or transport failure that did NOT trip the
+ *     breaker)                                   → 'provider_error'
+ *   Any OTHER error (local config: missing key, unknown alias, parser/logic
+ *     bug) → undefined: no provider provenance, prior baseline preserved.
+ */
+function classifySecondaryFailure(
+  err: unknown,
+): 'provider_error' | 'circuit_rejected' | undefined {
+  if (err instanceof CircuitAllOpenError) {
+    return err.attemptedRoutes.length === 0 ? 'circuit_rejected' : 'provider_error';
+  }
+  if (err instanceof ProviderCallError) {
+    return 'provider_error';
+  }
+  return undefined;
 }

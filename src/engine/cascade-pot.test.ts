@@ -22,7 +22,13 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { PotCliCascade, combineVerdicts } from './cascade-pot.js';
-import { MockLlmClient, type LlmCallInput, type LlmCallOutput } from './llm-client.js';
+import {
+  MockLlmClient,
+  CircuitAllOpenError,
+  ProviderCallError,
+  type LlmCallInput,
+  type LlmCallOutput,
+} from './llm-client.js';
 import type { AxisResult } from '../types.js';
 
 function json(payload: object): string {
@@ -211,6 +217,81 @@ describe('PotCliCascade: degraded mode (secondary error)', () => {
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('FAIL');
     expect(out.result.reasoning).toMatch(/degraded/);
+  });
+});
+
+describe('PotCliCascade: degraded-mode provenance (issue #14)', () => {
+  // Serve a primary that carries provider_outcome='served' (providerRoute set),
+  // then throw a chosen error type from the secondary call.
+  function servedPrimaryThenThrow(
+    primary: { verdict: string; confidence: number },
+    error: unknown,
+  ): MockLlmClient {
+    let n = 0;
+    return new MockLlmClient((model): LlmCallOutput => {
+      n++;
+      if (n === 1) {
+        return {
+          raw: json({ verdict: primary.verdict, confidence: primary.confidence, reasoning: 'ok', objection: primary.verdict === 'PASS' ? '' : 'obj' }),
+          modelUsed: `mock:${model}`,
+          latencyMs: 1,
+          providerRoute: 'primary', // → callAxis sets provider_outcome='served' on the primary
+        };
+      }
+      throw error;
+    });
+  }
+
+  it('ProviderCallError secondary → axis drops served, carries provider_error', async () => {
+    const client = servedPrimaryThenThrow(
+      { verdict: 'PASS', confidence: 0.6 },
+      new ProviderCallError('[llm-client] serv 401: nope', 'serv', 401),
+    );
+    const out = await new PotCliCascade(client).run(AXIS_INPUT);
+    expect(out.result.verdict).toBe('UNCERTAIN');
+    expect(out.result.provider_outcome).toBe('provider_error');
+    expect(out.result.provider_route).toBeUndefined();
+    expect(out.result.reasoning).toMatch(/degraded/);
+  });
+
+  it('CircuitAllOpenError (attemptedRoutes=[]) secondary → circuit_rejected', async () => {
+    const client = servedPrimaryThenThrow(
+      { verdict: 'PASS', confidence: 0.6 },
+      new CircuitAllOpenError('serv-swift', null, 'open', 'open', []),
+    );
+    const out = await new PotCliCascade(client).run(AXIS_INPUT);
+    expect(out.result.provider_outcome).toBe('circuit_rejected');
+    expect(out.result.provider_route).toBeUndefined();
+  });
+
+  it('CircuitAllOpenError (attemptedRoutes=[primary]) secondary → provider_error', async () => {
+    const client = servedPrimaryThenThrow(
+      { verdict: 'PASS', confidence: 0.6 },
+      new CircuitAllOpenError('serv-swift', null, 'open', 'open', ['primary']),
+    );
+    const out = await new PotCliCascade(client).run(AXIS_INPUT);
+    expect(out.result.provider_outcome).toBe('provider_error');
+  });
+
+  it('generic (non-provider) secondary error → NO provider_outcome, served still dropped', async () => {
+    const client = servedPrimaryThenThrow(
+      { verdict: 'PASS', confidence: 0.6 },
+      new Error('parser blew up'),
+    );
+    const out = await new PotCliCascade(client).run(AXIS_INPUT);
+    expect(out.result.verdict).toBe('UNCERTAIN');
+    expect(out.result.provider_outcome).toBeUndefined();
+    expect(out.result.provider_route).toBeUndefined();
+  });
+
+  it('primary FAIL (low-conf) + ProviderCallError secondary → FAIL kept + provider_error', async () => {
+    const client = servedPrimaryThenThrow(
+      { verdict: 'FAIL', confidence: 0.6 },
+      new ProviderCallError('[llm-client] serv 500', 'serv', 500),
+    );
+    const out = await new PotCliCascade(client).run(AXIS_INPUT);
+    expect(out.result.verdict).toBe('FAIL');
+    expect(out.result.provider_outcome).toBe('provider_error');
   });
 });
 
