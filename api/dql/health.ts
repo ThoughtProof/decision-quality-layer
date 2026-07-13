@@ -47,9 +47,17 @@ import {
 const VERSION = '0.2.0';
 
 function readCommitSha(env: NodeJS.ProcessEnv): string | null {
-  // Vercel populates VERCEL_GIT_COMMIT_SHA automatically on every deploy.
-  // DQL_COMMIT_SHA is an escape hatch for other hosts.
-  return env.VERCEL_GIT_COMMIT_SHA ?? env.DQL_COMMIT_SHA ?? null;
+  // Vercel populates VERCEL_GIT_COMMIT_SHA automatically on git-integration
+  // deploys. Auf CLI-Deploys (`vercel deploy --prebuilt`) ist die Variable
+  // jedoch als LEERER String gesetzt — `??` fiel dann nie auf die dokumentierte
+  // Escape-Hatch DQL_COMMIT_SHA durch und commit_sha blieb '' (empirisch
+  // verifiziert 2026-07-13, dpl_qlpgappln). Leer gilt jetzt als abwesend;
+  // die Präferenzordnung (Plattform-Var vor Escape-Hatch) bleibt erhalten.
+  const platform = env.VERCEL_GIT_COMMIT_SHA;
+  if (platform) return platform;
+  const escapeHatch = env.DQL_COMMIT_SHA;
+  if (escapeHatch) return escapeHatch;
+  return null;
 }
 
 export default function handler(_req: VercelRequest, res: VercelResponse) {

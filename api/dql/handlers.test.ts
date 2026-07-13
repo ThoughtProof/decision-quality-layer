@@ -211,6 +211,41 @@ describe('M7 + M8 — /dql/health handler contract', () => {
     expect(state.jsonBody.commit_sha).toBe('abc1234def5678');
     expect(state.jsonBody.alias_gate_ready).toBe(true);
   });
+
+  // Regression: Vercel-CLI-Deploys (`vercel deploy --prebuilt`) setzen
+  // VERCEL_GIT_COMMIT_SHA als LEEREN String. Mit `??` fiel readCommitSha nie
+  // auf die dokumentierte Escape-Hatch DQL_COMMIT_SHA durch → commit_sha ''
+  // → SHA-Bindung (E2/V9-H) für jedes CLI-Deploy unerfüllbar.
+  // Empirisch verifiziert 2026-07-13 (Deploy qlpgappln).
+  it('Regression: VERCEL_GIT_COMMIT_SHA="" (CLI-Deploy) + DQL_COMMIT_SHA → Escape-Hatch greift', async () => {
+    process.env.VERCEL_GIT_COMMIT_SHA = '';
+    process.env.DQL_COMMIT_SHA = '9be505c7d4b004d164634aa205986346c78f6f09';
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.commit_sha).toBe('9be505c7d4b004d164634aa205986346c78f6f09');
+  });
+
+  it('Regression: VERCEL_GIT_COMMIT_SHA nicht-leer gewinnt weiterhin über DQL_COMMIT_SHA (Präferenzordnung)', async () => {
+    process.env.VERCEL_GIT_COMMIT_SHA = 'platform1234567890';
+    process.env.DQL_COMMIT_SHA = 'escape1234567890';
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.commit_sha).toBe('platform1234567890');
+  });
+
+  it('Regression: beide leer → commit_sha bleibt null (kein Leer-String-Durchschlag)', async () => {
+    process.env.VERCEL_GIT_COMMIT_SHA = '';
+    process.env.DQL_COMMIT_SHA = '';
+    const mod = await import('./health.js');
+    const { req, res, state } = makeReqRes(undefined, 'GET');
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.jsonBody.commit_sha).toBeNull();
+  });
 });
 
 /**
