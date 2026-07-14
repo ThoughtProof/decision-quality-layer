@@ -125,6 +125,10 @@ npm run test
 npx vercel dev --listen 3002
 ```
 
+### Continuous integration
+
+Every pull request into `main` and every push to `main` runs `.github/workflows/ci.yml`, which runs three independent jobs — `test` (`npm test`), `typecheck` (`npm run typecheck`), and `build` (`npm run build`) — on Node 20 with `npm ci`. The full hermetic suite (including OpenAPI and Spike-80 checks) runs under `test`. These jobs become merge gates only once they are configured as required status checks in branch protection.
+
 ## Relationship to other ThoughtProof products
 
 - **[Sentinel](https://sentinel.thoughtproof.ai)** — single-verdict production API for agentic-commerce checkpoints (live, carries money).
