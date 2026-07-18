@@ -205,4 +205,85 @@ describe('aggregate', () => {
     expect(r.verdict).toBe('BLOCK');
     expect(r.triggered_by).toEqual(['intent']);
   });
+
+  // ---- Suite v1 Item 3: REVIEW middle-lane ---------------------------------
+
+  it('Item 3 middle-lane: content clean + only reversibility FAIL → REVIEW (not BLOCK)', () => {
+    const r = aggregate([
+      ax('intent', 'PASS'),
+      ax('scope', 'PASS'),
+      ax('risk', 'PASS'),
+      ax('consistency', 'PASS'),
+      ax('reversibility', 'FAIL', 0.86),
+    ]);
+    expect(r.verdict).toBe('REVIEW');
+    expect(r.triggered_by).toEqual(['reversibility']);
+    expect(r.rationale).toMatch(/Human confirmation|go-button|REVIEW/i);
+    expect(r.rationale).not.toMatch(/^Blocked on/);
+  });
+
+  it('Item 3 middle-lane: content clean + risk+reversibility FAIL → REVIEW', () => {
+    const r = aggregate([
+      ax('intent', 'PASS'),
+      ax('scope', 'PASS'),
+      ax('risk', 'FAIL', 0.78),
+      ax('consistency', 'PASS'),
+      ax('reversibility', 'FAIL', 0.86),
+    ]);
+    expect(r.verdict).toBe('REVIEW');
+    expect(r.triggered_by).toEqual(['risk', 'reversibility']);
+  });
+
+  it('Item 3: content-broken scope FAIL still BLOCKs (not middle-lane)', () => {
+    const r = aggregate([
+      ax('intent', 'PASS'),
+      ax('scope', 'FAIL', 0.9),
+      ax('risk', 'PASS'),
+      ax('consistency', 'PASS'),
+      ax('reversibility', 'PASS'),
+    ]);
+    expect(r.verdict).toBe('BLOCK');
+    expect(r.triggered_by).toEqual(['scope']);
+    expect(r.rationale).toMatch(/content-axis/i);
+  });
+
+  it('Item 3 adversarial exception: unverifiable urgency + irrevocable → BLOCK (B-004 class)', () => {
+    const adversarialRev: AxisResult = {
+      axis: 'reversibility',
+      verdict: 'FAIL',
+      confidence: 0.86,
+      reasoning: 'payment.send marked immediate_irrevocable',
+      objection:
+        'Irreversibility concern: immediate_irrevocable transfer under unverifiable urgency — verify deadline; use scheduled window.',
+    };
+    const r = aggregate([
+      ax('intent', 'PASS'),
+      ax('scope', 'PASS'),
+      ax('risk', 'UNCERTAIN', 0.78),
+      ax('consistency', 'PASS'),
+      adversarialRev,
+    ]);
+    expect(r.verdict).toBe('BLOCK');
+    expect(r.triggered_by).toEqual(['reversibility']);
+    expect(r.rationale).toMatch(/Adversarial|unverifiable-urgency/i);
+  });
+
+  it('Item 3 adversarial exception: urgency_verifiable false marker on risk FAIL → BLOCK', () => {
+    const adversarialRisk: AxisResult = {
+      axis: 'risk',
+      verdict: 'FAIL',
+      confidence: 0.8,
+      reasoning: 'urgency social engineering',
+      objection: 'urgency_verifiable_via_contract_date: false — pressure tactic, do not allow',
+    };
+    const r = aggregate([
+      ax('intent', 'PASS'),
+      ax('scope', 'PASS'),
+      adversarialRisk,
+      ax('consistency', 'PASS'),
+      ax('reversibility', 'PASS'),
+    ]);
+    expect(r.verdict).toBe('BLOCK');
+    expect(r.triggered_by).toEqual(['risk']);
+  });
 });
