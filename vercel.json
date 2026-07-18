@@ -8,7 +8,7 @@
   ],
   "functions": {
     "api/dql/**/*.ts": {
-      "maxDuration": 60
+      "maxDuration": 300
     }
   },
   "headers": [

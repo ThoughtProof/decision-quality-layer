@@ -52,6 +52,21 @@ export interface CallContext {
    * is a pure observation sink, never a control-flow input.
    */
   collector?: RuntimeDiagnosticsCollector;
+  /**
+   * Absolute epoch-ms deadline for the whole verification request (W).
+   * Set by runVerification when deadline enforcement is enabled.
+   */
+  deadlineAt?: number;
+  /**
+   * Shared AbortSignal for the whole verification request.
+   * Combined with per-attempt signals in the LLM client.
+   */
+  requestSignal?: AbortSignal;
+  /**
+   * Per-provider-call budget in ms (PC). Optional; used with deadlineAt to
+   * clamp attempt timeouts and skip exhausted retries.
+   */
+  providerCallBudgetMs?: number;
 }
 
 /**

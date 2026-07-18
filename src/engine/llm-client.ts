@@ -122,6 +122,12 @@ export interface LlmCallOutput {
   attemptCount?: number;
   backoffWaitedMs?: number;
   retryReasons?: string[];
+  /** Provider finish_reason when available (additive telemetry). */
+  finishReason?: string;
+  /** Provider completion_tokens when available (additive telemetry). */
+  completionTokens?: number;
+  /** Why a call aborted, if it did (additive telemetry). */
+  timeoutSource?: 'attempt_timeout' | 'call_budget' | 'request_deadline' | 'none';
 }
 
 export interface LlmClient {
@@ -201,6 +207,27 @@ export class ProviderCallError extends Error {
   ) {
     super(message, options as ErrorOptions);
     this.name = 'ProviderCallError';
+  }
+}
+
+/**
+ * DeadlineExceededError — non-retryable provider_error subclass used when a
+ * layered budget (attempt / call / whole-request) is exhausted. Aggregation
+ * Rule 2 maps provider_error → REVIEW. request_deadline aborts are not booked
+ * as circuit-breaker failures (health signal is provider-specific).
+ */
+export type TimeoutSource = 'attempt_timeout' | 'call_budget' | 'request_deadline';
+export class DeadlineExceededError extends ProviderCallError {
+  public readonly timeoutSource: TimeoutSource;
+  constructor(
+    message: string,
+    provider: string,
+    timeoutSource: TimeoutSource,
+    options?: { cause?: unknown },
+  ) {
+    super(message, provider, undefined, options);
+    this.name = 'DeadlineExceededError';
+    this.timeoutSource = timeoutSource;
   }
 }
 
@@ -352,6 +379,36 @@ const RETRYABLE_PATTERN =
   /429|too many|rate|proxy|fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|socket hang up|aborted|timeout/i;
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Combine AbortSignals without requiring AbortSignal.any (Node < 20.3 fallback). */
+function combineAbortSignals(signals: AbortSignal[]): { signal: AbortSignal; cleanup: () => void } {
+  const anyFn = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (typeof anyFn === 'function') {
+    return { signal: anyFn(signals), cleanup: () => undefined };
+  }
+  const controller = new AbortController();
+  const onAbort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+  for (const s of signals) {
+    if (s.aborted) {
+      controller.abort();
+      break;
+    }
+    s.addEventListener('abort', onAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      for (const s of signals) s.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
+function remainingMs(deadlineAt?: number): number | undefined {
+  if (deadlineAt === undefined) return undefined;
+  return deadlineAt - Date.now();
+}
 
 // -----------------------------------------------------------------------------
 // Retry-failure telemetry (v0.4.3.1 §C M1)
@@ -544,7 +601,7 @@ export class HttpLlmClient implements LlmClient {
         });
       };
       try {
-        const out = await this.callWithRetry(binding, input, emit);
+        const out = await this.callWithRetry(binding, input, emit, ctx);
         const wallClock = Date.now() - started;
         const backoff = out.backoffWaitedMs ?? 0;
         this.recordBindingSummary(ctx, {
@@ -641,7 +698,7 @@ export class HttpLlmClient implements LlmClient {
         });
       };
       try {
-        out = await this.callWithRetry(binding, input, emitPrimary);
+        out = await this.callWithRetry(binding, input, emitPrimary, ctx);
         const wallClock = Date.now() - started;
         // v0.4.3 CB-latency-fix (PR #11): report NETWORK latency to the
         // circuit-breaker, not wall-clock. Backoff waits are retry-policy
@@ -822,7 +879,7 @@ export class HttpLlmClient implements LlmClient {
         });
       };
       try {
-        out = await this.callWithRetry(fallbackBinding, input, emitFallback);
+        out = await this.callWithRetry(fallbackBinding, input, emitFallback, ctx);
         const wallClock = Date.now() - started;
         backoffWaitedMs = out.backoffWaitedMs ?? 0;
         attemptCount = out.attemptCount ?? 1;
@@ -958,6 +1015,7 @@ export class HttpLlmClient implements LlmClient {
     binding: ModelBinding,
     input: LlmCallInput,
     onIteration?: (iteration: number, ok: boolean, elapsedMs: number, err: unknown) => void,
+    ctx?: CallContext,
   ): Promise<LlmCallOutput> {
     const apiKey = this.env[binding.apiKeyEnv];
     if (!apiKey) {
@@ -965,6 +1023,13 @@ export class HttpLlmClient implements LlmClient {
         `[llm-client] missing env var ${binding.apiKeyEnv} for provider ${binding.provider}`
       );
     }
+
+    const callStarted = Date.now();
+    const pcBudget = ctx?.providerCallBudgetMs ?? this.config.timeoutMs * this.config.maxAttempts;
+    const callDeadlineAt =
+      ctx?.deadlineAt !== undefined
+        ? Math.min(ctx.deadlineAt, callStarted + pcBudget)
+        : callStarted + pcBudget;
 
     let lastErr: unknown;
     let backoffWaitedMs = 0;
@@ -975,9 +1040,33 @@ export class HttpLlmClient implements LlmClient {
     let attemptCount = 0;
     for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
       attemptCount = attempt;
+      const pcRemaining = callDeadlineAt - Date.now();
+      const wRemaining = remainingMs(ctx?.deadlineAt);
+      if (pcRemaining <= 0) {
+        throw new DeadlineExceededError(
+          `[llm-client] provider call budget exhausted before attempt ${attempt}`,
+          binding.provider,
+          'call_budget',
+        );
+      }
+      if (wRemaining !== undefined && wRemaining <= 0) {
+        throw new DeadlineExceededError(
+          `[llm-client] request deadline exhausted before attempt ${attempt}`,
+          binding.provider,
+          'request_deadline',
+        );
+      }
+      if (ctx?.requestSignal?.aborted) {
+        throw new DeadlineExceededError(
+          `[llm-client] request aborted before attempt ${attempt}`,
+          binding.provider,
+          'request_deadline',
+        );
+      }
+
       const iterStarted = Date.now();
       try {
-        const out = await this.singleCall(binding, apiKey, input);
+        const out = await this.singleCall(binding, apiKey, input, ctx, callDeadlineAt);
         // Per-iteration hook: success case.
         if (onIteration) {
           try { onIteration(attempt, true, Date.now() - iterStarted, null); }
@@ -996,6 +1085,14 @@ export class HttpLlmClient implements LlmClient {
           catch { /* diagnostics must never poison the caller */ }
         }
         lastErr = err;
+        // Deadlines are never retryable.
+        if (err instanceof DeadlineExceededError) {
+          throw annotateRetryFailure(err, {
+            attemptCount,
+            backoffWaitedMs,
+            retryReasons: [...retryReasons],
+          });
+        }
         const msg = err instanceof Error ? err.message : String(err);
         const retryable = RETRYABLE_PATTERN.test(msg);
         if (!retryable || attempt === this.config.maxAttempts) {
@@ -1009,9 +1106,21 @@ export class HttpLlmClient implements LlmClient {
           });
         }
         if (retryReasons.length < 4) retryReasons.push(msg.slice(0, 120));
-        const wait =
+        const rawWait =
           Math.min(this.config.backoffBaseMs * Math.pow(2, attempt - 1), this.config.backoffCapMs) +
           Math.floor(Math.random() * 800);
+        const budgetLeft = Math.max(0, callDeadlineAt - Date.now());
+        const wLeft = remainingMs(ctx?.deadlineAt);
+        const clampedCap =
+          wLeft === undefined ? budgetLeft : Math.max(0, Math.min(budgetLeft, wLeft));
+        const wait = Math.min(rawWait, clampedCap);
+        if (wait <= 0) {
+          throw new DeadlineExceededError(
+            `[llm-client] no budget left for backoff before attempt ${attempt + 1}`,
+            binding.provider,
+            'call_budget',
+          );
+        }
         backoffWaitedMs += wait;
         await this.sleep(wait);
       }
@@ -1023,11 +1132,37 @@ export class HttpLlmClient implements LlmClient {
   private async singleCall(
     binding: ModelBinding,
     apiKey: string,
-    input: LlmCallInput
+    input: LlmCallInput,
+    ctx?: CallContext,
+    callDeadlineAt?: number,
   ): Promise<LlmCallOutput> {
     const started = Date.now();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+
+    // Effective attempt timeout = min(T, PC remaining, W remaining).
+    const pcRem = callDeadlineAt !== undefined ? callDeadlineAt - Date.now() : this.config.timeoutMs;
+    const wRem = remainingMs(ctx?.deadlineAt);
+    let effectiveTimeout = Math.min(this.config.timeoutMs, Math.max(1, pcRem));
+    if (wRem !== undefined) effectiveTimeout = Math.min(effectiveTimeout, Math.max(1, wRem));
+    if (effectiveTimeout <= 1) {
+      const source: TimeoutSource =
+        wRem !== undefined && wRem <= 1 ? 'request_deadline' : 'call_budget';
+      throw new DeadlineExceededError(
+        `[llm-client] no time left for attempt (source=${source})`,
+        binding.provider,
+        source,
+      );
+    }
+
+    let timedOutByAttempt = false;
+    const timeout = setTimeout(() => {
+      timedOutByAttempt = true;
+      controller.abort();
+    }, effectiveTimeout);
+
+    const signals = [controller.signal];
+    if (ctx?.requestSignal) signals.push(ctx.requestSignal);
+    const combined = combineAbortSignals(signals);
 
     let response: Response;
     try {
@@ -1058,7 +1193,7 @@ export class HttpLlmClient implements LlmClient {
           // text and let parseAxisResponse handle it.
           response_format: { type: 'json_object' },
         }),
-        signal: controller.signal,
+        signal: combined.signal,
       });
     } catch (err) {
       // A failed fetch is a provider-interaction failure. Preserve the
@@ -1066,11 +1201,20 @@ export class HttpLlmClient implements LlmClient {
       // existing message-regex tests behave exactly as before; only the error
       // TYPE changes (→ ProviderCallError) so the engine can attribute
       // structured provider provenance without string-parsing.
-      // AbortError from our own timeout still surfaces as a retryable
-      // "timeout" message so RETRYABLE_PATTERN picks it up.
       if (err instanceof Error && err.name === 'AbortError') {
+        // Whole-request abort is non-retryable.
+        if (ctx?.requestSignal?.aborted && !timedOutByAttempt) {
+          throw new DeadlineExceededError(
+            `[llm-client] request deadline aborted after ${Date.now() - started}ms`,
+            binding.provider,
+            'request_deadline',
+            { cause: err },
+          );
+        }
+        // Per-attempt timeout stays retryable within PC budget (legacy contract
+        // + maxAttempts). Use ProviderCallError so RETRYABLE_PATTERN matches.
         throw new ProviderCallError(
-          `[llm-client] request timeout after ${this.config.timeoutMs}ms (aborted)`,
+          `[llm-client] request timeout after ${effectiveTimeout}ms (aborted)`,
           binding.provider,
           undefined,
           { cause: err },
@@ -1080,6 +1224,7 @@ export class HttpLlmClient implements LlmClient {
       throw new ProviderCallError(msg, binding.provider, undefined, { cause: err });
     } finally {
       clearTimeout(timeout);
+      combined.cleanup();
     }
 
     if (!response.ok) {
@@ -1092,13 +1237,20 @@ export class HttpLlmClient implements LlmClient {
     }
 
     const json = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+      usage?: { completion_tokens?: number };
     };
-    const raw = json?.choices?.[0]?.message?.content ?? '';
+    const choice0 = json?.choices?.[0];
+    const raw = choice0?.message?.content ?? '';
+    const finishReason = choice0?.finish_reason;
+    const completionTokens = json?.usage?.completion_tokens;
     return {
       raw,
       modelUsed: `${binding.provider}:${binding.modelId}`,
       latencyMs: Date.now() - started,
+      ...(finishReason ? { finishReason } : {}),
+      ...(typeof completionTokens === 'number' ? { completionTokens } : {}),
+      timeoutSource: 'none',
     };
   }
 }

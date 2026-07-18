@@ -629,6 +629,6 @@ describe('B7 — computeConfigHash + canonicaliseJson', () => {
   });
 
   it('schema version constant is exported and matches expected form', () => {
-    expect(CONFIG_SCHEMA_VERSION).toMatch(/^0\.4\.3\.1/);
+    expect(CONFIG_SCHEMA_VERSION).toMatch(/^0\.4\.3\.[0-9]+/);
   });
 });

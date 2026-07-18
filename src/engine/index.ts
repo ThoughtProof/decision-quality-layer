@@ -34,6 +34,14 @@ export interface EngineInput {
    * Never used for control flow — observation only.
    */
   collector?: RuntimeDiagnosticsCollector;
+  /**
+   * Whole-request deadline budget W (ms). When set (>0), runVerification
+   * arms a shared AbortController and threads deadlineAt/requestSignal into
+   * every axis CallContext.
+   */
+  requestDeadlineMs?: number;
+  /** Per-provider-call budget PC (ms), threaded into CallContext. */
+  providerCallBudgetMs?: number;
 }
 
 export async function runVerification(input: EngineInput): Promise<DqlResponse> {
@@ -48,6 +56,17 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
     context: input.request.context,
   };
 
+  // Whole-request deadline (W). Optional — absent keeps legacy behavior.
+  let deadlineAt: number | undefined;
+  let requestController: AbortController | undefined;
+  let requestTimer: ReturnType<typeof setTimeout> | undefined;
+  if (input.requestDeadlineMs && input.requestDeadlineMs > 0) {
+    deadlineAt = Date.now() + input.requestDeadlineMs;
+    requestController = new AbortController();
+    requestTimer = setTimeout(() => requestController!.abort(), input.requestDeadlineMs);
+  }
+
+  try {
   // Run all axes in parallel. Any axis error is caught and mapped to an
   // UNCERTAIN result so a single-axis failure does not fail the whole request.
   //
@@ -75,6 +94,11 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
         axis,
         callId: generateCallId(),
         collector: input.collector,
+        ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+        ...(requestController ? { requestSignal: requestController.signal } : {}),
+        ...(input.providerCallBudgetMs !== undefined
+          ? { providerCallBudgetMs: input.providerCallBudgetMs }
+          : {}),
       };
       try {
         return await cascade.run({ axis, prompt, ctx });
@@ -145,6 +169,9 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
       sandbox: input.request.sandbox,
     },
   };
+  } finally {
+    if (requestTimer !== undefined) clearTimeout(requestTimer);
+  }
 }
 
 function uniqueStrings(xs: string[]): string[] {

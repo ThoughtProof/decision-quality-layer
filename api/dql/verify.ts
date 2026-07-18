@@ -159,6 +159,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             requestId,
             version: VERSION,
             collector: collector ?? undefined,
+            ...(RUNTIME.kind === 'production' &&
+            RUNTIME.production.config.deadline_enforcement_enabled
+              ? {
+                  requestDeadlineMs: RUNTIME.production.config.request_deadline_ms,
+                  providerCallBudgetMs: RUNTIME.production.config.provider_call_budget_ms,
+                }
+              : {}),
           });
           status = 200;
           payload = response;

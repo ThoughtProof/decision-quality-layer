@@ -38,7 +38,12 @@ import type { AxisResult, Axis, AxisVerdict } from '../types.js';
 import type { Cascade, CascadeInput, CascadeOutput } from './cascade.js';
 import { parseAxisResponse } from './cascade.js';
 import type { LlmClient } from './llm-client.js';
-import { HttpLlmClient, CircuitAllOpenError, ProviderCallError } from './llm-client.js';
+import {
+  HttpLlmClient,
+  CircuitAllOpenError,
+  ProviderCallError,
+  DeadlineExceededError,
+} from './llm-client.js';
 import type { CallContext } from './call-context.js';
 
 export interface PotCliCascadeConfig {
@@ -110,6 +115,38 @@ export class PotCliCascade implements Cascade {
     }
 
     // ---- Secondary ------------------------------------------------------
+    // If whole-request budget is nearly exhausted, skip secondary and
+    // fail-closed immediately so we still return 200+REVIEW before platform kill.
+    if (ctx?.deadlineAt !== undefined) {
+      const remainingW = ctx.deadlineAt - Date.now();
+      const pc = ctx.providerCallBudgetMs ?? 40_000;
+      const minSecondaryBudget = pc + 3_000;
+      if (remainingW < minSecondaryBudget) {
+        const err = new DeadlineExceededError(
+          `[cascade] skipping secondary — remainingW=${remainingW}ms < minSecondaryBudget=${minSecondaryBudget}ms`,
+          'serv',
+          'request_deadline',
+        );
+        const fallbackVerdict: AxisVerdict =
+          primary.result.verdict === 'PASS' ? 'UNCERTAIN' : primary.result.verdict;
+        const degraded: AxisResult = {
+          axis: primary.result.axis,
+          verdict: fallbackVerdict,
+          confidence: primary.result.confidence,
+          reasoning: primary.result.reasoning,
+          objection: primary.result.objection,
+          provider_outcome: 'provider_error',
+        };
+        return {
+          result: annotate(
+            degraded,
+            `[cascade] secondary skipped (request_deadline) → degraded (${err.message.slice(0, 200)})`,
+          ),
+          modelsUsed,
+        };
+      }
+    }
+
     let secondary: AxisCall;
     try {
       secondary = await this.callAxis(this.config.secondaryModel, axis, prompt, ctx);
@@ -310,6 +347,7 @@ function classifySecondaryFailure(
   if (err instanceof CircuitAllOpenError) {
     return err.attemptedRoutes.length === 0 ? 'circuit_rejected' : 'provider_error';
   }
+  // DeadlineExceededError extends ProviderCallError → provider_error → REVIEW.
   if (err instanceof ProviderCallError) {
     return 'provider_error';
   }

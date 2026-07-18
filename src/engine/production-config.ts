@@ -36,7 +36,7 @@ import crypto from 'node:crypto';
 export type RuntimeMode = 'stub' | 'pot-cli';
 
 /** Fixed monotonic schema version. Bump when the resolved shape changes. */
-export const CONFIG_SCHEMA_VERSION = '0.4.3.1-hardening-1';
+export const CONFIG_SCHEMA_VERSION = '0.4.3.2-deadline-1';
 
 /** Aliases the v0.4.3.1 resolver knows about. Wired in per-alias config. */
 export const KNOWN_ALIASES = ['serv-nano', 'serv-swift'] as const;
@@ -107,6 +107,23 @@ export interface ProductionConfig {
    * safety margin — see product_latency_ceiling_by_alias for that.
    */
   required_healthy_alias_fraction: number;
+  /**
+   * When true, layered provider deadlines are enforced (W/PC/T).
+   * Env: DQL_DEADLINE_ENFORCEMENT. Default false = legacy timeouts.
+   */
+  deadline_enforcement_enabled: boolean;
+  /** Whole-request budget W (ms). Default 90000 when enforcement on. */
+  request_deadline_ms: number;
+  /** Per-provider-call budget PC (ms). Default 40000 when enforcement on. */
+  provider_call_budget_ms: number;
+  /** Per-attempt timeout T (ms). Default 30000 when enforcement on. */
+  attempt_timeout_ms: number;
+  /** Max HTTP attempts including first. Default 2 when enforcement on, else 6. */
+  max_attempts: number;
+  /** Retry backoff base ms. Default 500 when enforcement on, else 800. */
+  backoff_base_ms: number;
+  /** Retry backoff cap ms. Default 1500 when enforcement on, else 90000. */
+  backoff_cap_ms: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +742,80 @@ export function resolveProductionConfig(
     }
   }
 
+  // Deadline layering (2026-07-18). Flag default OFF preserves legacy 60s×6.
+  // When ON (Hobby+Fluid maxDuration 300s): W≈90 / PC≈40 / T≈30 / attempts 2.
+  const deadlineEnforcementEnabled = readStrictBool(
+    env.DQL_DEADLINE_ENFORCEMENT,
+    'DQL_DEADLINE_ENFORCEMENT',
+    false,
+    reasons,
+  );
+
+  function readPositiveInt(
+    raw: string | undefined,
+    envName: string,
+    defaultValue: number,
+    reasonsArr: string[],
+  ): number {
+    if (raw === undefined || raw === '') return defaultValue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+      reasonsArr.push(`${envName} must be a positive integer; got ${JSON.stringify(raw)}`);
+      return defaultValue;
+    }
+    return n;
+  }
+
+  const requestDeadlineMs = readPositiveInt(
+    env.DQL_REQUEST_DEADLINE_MS,
+    'DQL_REQUEST_DEADLINE_MS',
+    deadlineEnforcementEnabled ? 90_000 : 60_000,
+    reasons,
+  );
+  const providerCallBudgetMs = readPositiveInt(
+    env.DQL_PROVIDER_CALL_BUDGET_MS,
+    'DQL_PROVIDER_CALL_BUDGET_MS',
+    deadlineEnforcementEnabled ? 40_000 : 60_000,
+    reasons,
+  );
+  const attemptTimeoutMs = readPositiveInt(
+    env.DQL_ATTEMPT_TIMEOUT_MS,
+    'DQL_ATTEMPT_TIMEOUT_MS',
+    deadlineEnforcementEnabled ? 30_000 : 60_000,
+    reasons,
+  );
+  const maxAttempts = readPositiveInt(
+    env.DQL_MAX_ATTEMPTS,
+    'DQL_MAX_ATTEMPTS',
+    deadlineEnforcementEnabled ? 2 : 6,
+    reasons,
+  );
+  const backoffBaseMs = readPositiveInt(
+    env.DQL_BACKOFF_BASE_MS,
+    'DQL_BACKOFF_BASE_MS',
+    deadlineEnforcementEnabled ? 500 : 800,
+    reasons,
+  );
+  const backoffCapMs = readPositiveInt(
+    env.DQL_BACKOFF_CAP_MS,
+    'DQL_BACKOFF_CAP_MS',
+    deadlineEnforcementEnabled ? 1_500 : 90_000,
+    reasons,
+  );
+
+  if (deadlineEnforcementEnabled) {
+    if (attemptTimeoutMs > providerCallBudgetMs) {
+      reasons.push(
+        `DQL_ATTEMPT_TIMEOUT_MS (${attemptTimeoutMs}) must be <= DQL_PROVIDER_CALL_BUDGET_MS (${providerCallBudgetMs})`,
+      );
+    }
+    if (providerCallBudgetMs > requestDeadlineMs) {
+      reasons.push(
+        `DQL_PROVIDER_CALL_BUDGET_MS (${providerCallBudgetMs}) must be <= DQL_REQUEST_DEADLINE_MS (${requestDeadlineMs})`,
+      );
+    }
+  }
+
   if (reasons.length > 0) {
     throw new ProductionConfigError(mode, reasons);
   }
@@ -741,6 +832,13 @@ export function resolveProductionConfig(
     circuit_breaker_config_by_alias: cbByAlias,
     product_latency_ceiling_by_alias: latencyByAlias,
     required_healthy_alias_fraction: requiredHealthyAliasFraction,
+    deadline_enforcement_enabled: deadlineEnforcementEnabled,
+    request_deadline_ms: requestDeadlineMs,
+    provider_call_budget_ms: providerCallBudgetMs,
+    attempt_timeout_ms: attemptTimeoutMs,
+    max_attempts: maxAttempts,
+    backoff_base_ms: backoffBaseMs,
+    backoff_cap_ms: backoffCapMs,
   };
 }
 
@@ -805,12 +903,19 @@ export function canonicaliseJson(value: unknown): string {
  */
 export function computeConfigHash(config: ProductionConfig): string {
   const canonical = {
+    attempt_timeout_ms: config.attempt_timeout_ms,
+    backoff_base_ms: config.backoff_base_ms,
+    backoff_cap_ms: config.backoff_cap_ms,
     capital_path_mode: config.capital_path_mode,
     circuit_breaker_config_by_alias: config.circuit_breaker_config_by_alias,
     confirm_fail: config.confirm_fail,
+    deadline_enforcement_enabled: config.deadline_enforcement_enabled,
     diagnostics_on: config.diagnostics_on,
     disable_circuit_breaker: config.disable_circuit_breaker,
+    max_attempts: config.max_attempts,
     product_latency_ceiling_by_alias: config.product_latency_ceiling_by_alias,
+    provider_call_budget_ms: config.provider_call_budget_ms,
+    request_deadline_ms: config.request_deadline_ms,
     required_healthy_alias_fraction: config.required_healthy_alias_fraction,
     runtime_mode: config.runtime_mode,
     serv_api_key_bound: config.serv_api_key_bound,

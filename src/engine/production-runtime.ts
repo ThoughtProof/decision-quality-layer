@@ -151,27 +151,29 @@ export function createProductionRuntime(
   // v0.4.3.1 hardening: capital_path_mode, per-alias CB config and the
   // validated ModelBindings all flow through EXPLICITLY. No silent default
   // and no reliance on the ambient DEFAULT_MODEL_MAP anywhere below.
-  const baseClientOptions = {
+  // Instrumental timeout/retry knobs from resolver. Applied as DEFAULTS so
+  // clientOptionsOverride (tests) can still pin maxAttempts/timeoutMs.
+  const deadlineClientOptions = {
+    timeoutMs: config.attempt_timeout_ms,
+    maxAttempts: config.max_attempts,
+    backoffBaseMs: config.backoff_base_ms,
+    backoffCapMs: config.backoff_cap_ms,
+  };
+  // Safety options — always win over override.
+  const safetyClientOptions = {
     capitalPathMode: config.capital_path_mode,
     circuitBreakerConfigByAlias: cbByAliasForClient,
     disableCircuitBreaker: config.disable_circuit_breaker,
     // v0.4.3.1 §C+integration H1: enforce diagnostics precondition on
     // every call() when the canary is active AND diagnostics_on=true.
-    // This closes the gap where the resolver enforced env=1 but no client
-    // check enforced that the concrete call carried a Request-Collector.
-    // Non-overridable: re-spread after clientOptionsOverride below.
     requireDiagnostics: config.v0431_active && config.diagnostics_on,
   };
-  // Hermes design-hint fix (post-260d125 review): the override is a
-  // typed WHITELIST of instrumental fields. The factory-derived safety
-  // options (capitalPathMode, circuitBreakerConfigByAlias,
-  // disableCircuitBreaker) are re-spread AFTER the override so that
-  // even a typed override cannot silently subvert them. The
-  // ClientOptionsOverride type does not include those fields, but this
-  // ordering makes the invariant robust to future field additions.
-  const mergedClientOptions: HttpLlmClientConfig = opts.clientOptionsOverride
-    ? { ...opts.clientOptionsOverride, ...baseClientOptions }
-    : baseClientOptions;
+  // Order: deadline defaults → test/instrumental override → safety last.
+  const mergedClientOptions: HttpLlmClientConfig = {
+    ...deadlineClientOptions,
+    ...(opts.clientOptionsOverride ?? {}),
+    ...safetyClientOptions,
+  };
 
   const client =
     opts.clientOverride ??
