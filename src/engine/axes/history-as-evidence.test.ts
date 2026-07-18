@@ -48,6 +48,30 @@ describe('history-as-evidence prompt contracts (suite v1 item 1)', () => {
     expect(text).toContain('past_payments_to_same_iban: 0');
   });
 
+  it('scope prompt keeps zero-history out of scope FAIL (item 2 overcorrection guard)', () => {
+    const p = buildScopePrompt({
+      ...base,
+      mandate: 'Pay the quarterly professional insurance premium',
+      proposed_action: JSON.stringify({
+        action: 'payment.schedule',
+        amount_eur: 800,
+        recipient_iban: 'verified_broker_iban',
+      }),
+      context: JSON.stringify({
+        evidence: {
+          past_payments_to_same_iban: 0,
+          amount_matches_contract: true,
+          contract_reference_present: true,
+        },
+      }),
+    });
+    const text = `${p.system}\n${p.user}`;
+    expect(text).toContain('NAMED-PAYMENT + CONTRACT/INVOICE AMOUNT');
+    expect(text).toContain('Zero payment history is a RISK');
+    expect(text).toContain('Do NOT FAIL scope because past_payments_to_same_iban == 0');
+    expect(text).toContain('relationship gap is risk');
+  });
+
   it('risk prompt includes FIRST-PAYMENT EVIDENCE-GAP hard rule (item 2)', () => {
     const p = buildRiskPrompt({
       ...base,
