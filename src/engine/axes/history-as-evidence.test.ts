@@ -47,4 +47,33 @@ describe('history-as-evidence prompt contracts (suite v1 item 1)', () => {
     // first-payment must remain out of the hard-rule pass path
     expect(text).toContain('past_payments_to_same_iban: 0');
   });
+
+  it('risk prompt includes FIRST-PAYMENT EVIDENCE-GAP hard rule (item 2)', () => {
+    const p = buildRiskPrompt({
+      ...base,
+      mandate: 'Pay the quarterly professional insurance premium',
+      proposed_action: JSON.stringify({
+        action: 'payment.schedule',
+        amount_eur: 800,
+        recipient_iban: 'verified_broker_iban',
+      }),
+      context: JSON.stringify({
+        evidence: {
+          past_payments_to_same_iban: 0,
+          broker_verified_via: 'chamber_of_commerce_lookup',
+          contract_reference_present: true,
+        },
+      }),
+    });
+    const text = `${p.system}\n${p.user}`;
+    expect(text).toContain('FIRST-PAYMENT EVIDENCE-GAP');
+    expect(text).toContain('past_payments_to_same_iban is present and == 0');
+    expect(text).toContain('Do NOT return PASS');
+    expect(text).toContain('Do NOT return FAIL solely for the missing relationship');
+    expect(text).toContain('verdict UNCERTAIN');
+    expect(text).toContain('Registry/chamber lookup confirms broker existence');
+    expect(text).toContain('existence ≠ relationship');
+    // overcorrection guard: BLOCK path must stay out of this rule
+    expect(text).toMatch(/NOT FAIL\/BLOCK/);
+  });
 });
