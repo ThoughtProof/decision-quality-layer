@@ -186,6 +186,50 @@ describe('loadtest pure helpers', () => {
     expect(() => assertNonCertifying({ certifying: true })).toThrow(/certifying must be false/);
     expect(() => assertNonCertifying({ certifying: false, load_test_only: false })).toThrow(/load_test_only/);
   });
+
+  it('assertNonCertifying walks nested objects/arrays and the broadened key set', () => {
+    // Deeply-nested certification-like key is still caught.
+    expect(() => assertNonCertifying({ a: { b: [{ c: { certificate: 'x' } }] } })).toThrow(
+      /forbidden certification field 'certificate' at \$\.a\.b\[0\]\.c/,
+    );
+    // Rate/calibration vocabulary as KEYS is rejected.
+    for (const key of ['far', 'fbr', 'false_allow_rate', 'false_block_rate', 'recall_rate', 'precision_rate', 'calibration', 'attestation', 'accreditation', 'production_ready']) {
+      expect(() => assertNonCertifying({ [key]: 1 })).toThrow(/forbidden certification field/);
+    }
+    // A nested bad stamp value is caught at depth.
+    expect(() => assertNonCertifying({ report: { certifying: true } })).toThrow(/certifying must be false/);
+    // Movement enum VALUES ('false_allow' etc.) are legitimate and must pass.
+    expect(() =>
+      assertNonCertifying({
+        certifying: false,
+        load_test_only: true,
+        movements: { false_allow: 2, recall_miss: 1, expected_catch: 3 },
+        results: [{ movement: 'false_allow' }, { movement: 'recall_miss' }],
+      }),
+    ).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Identity hash — every operational knob is bound
+// ---------------------------------------------------------------------------
+
+describe('loadtest identity hash binds operational caps', () => {
+  const ids = ['a', 'b', 'c', 'd'];
+  const base = () => computeIdentityHash(baseConfig(), ids);
+
+  it('changes when concurrency, caps, storm, or wall-clock drift', () => {
+    expect(computeIdentityHash(baseConfig({ concurrency: 1 }), ids)).not.toBe(base());
+    expect(computeIdentityHash(baseConfig({ hardConcurrencyCap: 8 }), ids)).not.toBe(base());
+    expect(computeIdentityHash(baseConfig({ wallClockCapMs: 30_000 }), ids)).not.toBe(base());
+    expect(computeIdentityHash(baseConfig({ maxProviderErrorStorm: 500 }), ids)).not.toBe(base());
+    expect(computeIdentityHash(baseConfig({ maxOpenTransitions: 5 }), ids)).not.toBe(base());
+  });
+
+  it('is stable when only non-identity fields change', () => {
+    // secretScanValues is defense-in-depth, not part of the experiment identity.
+    expect(computeIdentityHash(baseConfig({ secretScanValues: ['other'] }), ids)).toBe(base());
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -477,6 +521,73 @@ describe('loadtest abort guards', () => {
       resolveFingerprints: () => ({ ...PINS }),
     });
     await expect(harness.run()).rejects.toMatchObject({ reason: 'secret_leak' });
+  });
+
+  it('aborts IN-FLIGHT work via the shared signal at the wall-clock cap', async () => {
+    // A real-timer executor that hangs until the shared signal fires. The
+    // harness's wall-clock timer must abort the signal, interrupt the awaited
+    // case, and fail closed — preserving whatever was already checkpointed.
+    const started: string[] = [];
+    const executor: CaseExecutor = ({ loadCase, signal }) =>
+      new Promise((resolve, reject) => {
+        started.push(loadCase.id);
+        if (signal.aborted) {
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          return;
+        }
+        const t = setTimeout(() => resolve({ response: servedBlock() }), 10_000);
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(t);
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          },
+          { once: true },
+        );
+      });
+    const io = memIO();
+    const harness = new LoadTestHarness(
+      baseConfig({ concurrency: 1, wallClockCapMs: 25 }),
+      makeCases(4),
+      { executor, io, resolveFingerprints: () => ({ ...PINS }) },
+    );
+    const report = await harness.run();
+    expect(report.aborted).toBe(true);
+    expect(report.abort_reason).toBe('wall_clock_cap');
+    // The in-flight case never completed → nothing (or only prior) checkpointed.
+    expect(report.completed).toBeLessThan(4);
+    expect(io.lines.length).toBeLessThan(4);
+    expect(started.length).toBeGreaterThan(0);
+  });
+
+  it('sums live_totals across cases that report reliability rollups', async () => {
+    const executor: CaseExecutor = async () => ({
+      response: servedBlock(),
+      observation: {
+        aggregate_verdict: 'BLOCK',
+        axis_hit: true,
+        per_alias: { 'serv-nano': { calls: 5, served: 5, provider_error: 0, circuit_rejected: 0 } },
+        deadline_source: 'none',
+        provider_calls: 5,
+        attempts: 6,
+        backoff_ms: 10,
+        net_latency_ms: 100,
+        transitions: { open: 0, half_open: 0 },
+      },
+    });
+    const io = memIO();
+    const harness = new LoadTestHarness(baseConfig({ concurrency: 2 }), makeCases(4), {
+      executor,
+      io,
+      resolveFingerprints: () => ({ ...PINS }),
+    });
+    const report = await harness.run();
+    expect(report.live_totals).toEqual({
+      provider_calls: 20,
+      attempts: 24,
+      backoff_ms: 40,
+      net_latency_ms: 400,
+    });
   });
 
   it('aborts on the wall-clock cap', async () => {

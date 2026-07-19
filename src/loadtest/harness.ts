@@ -78,6 +78,17 @@ export interface CaseObservation {
   /** provider_outcome tally keyed by resolved alias. */
   per_alias: Record<string, AliasOutcomeTally>;
   deadline_source: DeadlineSource;
+  /**
+   * Optional live-only reliability signals (secret/raw-free numeric rollups).
+   * Populated by the production-backed executor from the diagnostics collector;
+   * omitted by offline fixtures. All optional so the resume/checkpoint format
+   * stays backward compatible.
+   */
+  provider_calls?: number;
+  attempts?: number;
+  backoff_ms?: number;
+  net_latency_ms?: number;
+  transitions?: { open: number; half_open: number };
 }
 
 /** Persisted per-case result line (append-only JSONL). Secret/raw-free. */
@@ -90,6 +101,12 @@ export interface CaseResult {
   latency_ms: number;
   /** Decision-quality movement vs. expected ground truth. */
   movement: 'expected_catch' | 'false_allow' | 'recall_miss' | 'no_ground_truth';
+  /** Optional live reliability rollups (see CaseObservation). */
+  provider_calls?: number;
+  attempts?: number;
+  backoff_ms?: number;
+  net_latency_ms?: number;
+  transitions?: { open: number; half_open: number };
 }
 
 export interface LoadTestConfig {
@@ -183,6 +200,18 @@ export interface LoadTestReport {
     recall_miss: number;
     no_ground_truth: number;
   };
+  /**
+   * Live reliability rollups summed across cases that reported them (0 for a
+   * pure offline run). `provider_calls` is the true count of provider fetches
+   * (binding calls incl. retries + fallback draws) — the number the live
+   * matrix's hard cap is sized against.
+   */
+  live_totals: {
+    provider_calls: number;
+    attempts: number;
+    backoff_ms: number;
+    net_latency_ms: number;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +221,13 @@ export interface LoadTestReport {
 export interface CaseExecutorInput {
   loadCase: LoadCase;
   deadline: LoadTestConfig['deadline'];
+  /**
+   * Shared run-level abort signal. Fires when the wall-clock cap is reached so
+   * a provider-backed executor can cancel IN-FLIGHT work (thread it into the
+   * request AbortController) rather than only stopping at scheduling
+   * boundaries. Offline fixtures may ignore it.
+   */
+  signal: AbortSignal;
 }
 
 export interface CaseExecutorResult {
@@ -254,6 +290,10 @@ export function computeIdentityHash(
   config: LoadTestConfig,
   caseIds: readonly string[],
 ): string {
+  // Every operational knob that could change what the run DOES is bound into
+  // the identity. A resume that silently ran at a different concurrency, storm
+  // budget, or wall-clock cap would be a different experiment wearing the same
+  // checkpoint — so any drift in these fields aborts the resume.
   const canonical = JSON.stringify({
     runId: config.runId,
     n: config.n,
@@ -262,6 +302,9 @@ export function computeIdentityHash(
     aliasPins: sortedRecord(config.aliasPins),
     deadline: config.deadline,
     scenarioFileHash: config.scenarioFileHash,
+    wallClockCapMs: config.wallClockCapMs,
+    maxProviderErrorStorm: config.maxProviderErrorStorm,
+    maxOpenTransitions: config.maxOpenTransitions,
     caseIds: [...caseIds],
   });
   return sha256Hex(canonical);
@@ -344,22 +387,93 @@ function percentile(sorted: number[], p: number): number {
   return sorted[idx]!;
 }
 
-/** Assert an artefact is non-certifying. Throws (fail-closed) on violation. */
-export function assertNonCertifying(obj: unknown): void {
-  const serialized = JSON.stringify(obj) ?? '';
-  // A load artefact must never claim certification.
-  const forbidden = /"certified"|"certification"|"certificate"/i;
-  if (forbidden.test(serialized)) {
-    throw new Error('[loadtest] certification field present in a non-certifying artefact');
+/**
+ * Any key that would let a load artefact masquerade as a certification /
+ * calibration / decision-quality result. Matched case-insensitively against
+ * EVERY key at EVERY depth (see `assertNonCertifying`). This set matches or
+ * exceeds the DQL movement runner's forbidden-field guard: certification
+ * vocabulary (certified/certification/certificate/certifies/attestation),
+ * pass/fail-rate calibration vocabulary (far/fbr/false_allow_rate/
+ * false_block_rate/recall/precision as run-level RATES), and the
+ * accreditation words (accredit*, ratified, official, production_ready).
+ *
+ * NOTE: per-case `movement` values ('false_allow'|'recall_miss'|…) are NOT
+ * rates and are legitimately present; the guard only rejects rate-shaped
+ * KEYS, never these enum string values.
+ */
+/**
+ * Substring stems: a KEY that CONTAINS any of these (case-insensitively) is
+ * rejected. Stems catch every inflection/compound (certified, certification,
+ * certificate, certifies; calibration, recalibrate; accreditation; attestation;
+ * production_ready). The legitimate stamp key `certifying` also contains
+ * 'certif' — it is handled BEFORE this check (value-enforced, not rejected).
+ */
+const FORBIDDEN_CERT_STEMS = [
+  'certif',
+  'attestation',
+  'accredit',
+  'calibrat',
+  'production_ready',
+];
+
+/**
+ * Exact rate/accreditation KEYS. Kept exact (not substring) because the tokens
+ * are short/common enough that substring matching would over-reject benign
+ * fields (e.g. 'far' inside 'fare'). These are the run-level RATE names a
+ * calibration/certification artefact would carry.
+ */
+const FORBIDDEN_CERT_EXACT = new Set([
+  'far',
+  'fbr',
+  'false_allow_rate',
+  'false_block_rate',
+  'recall_rate',
+  'precision_rate',
+  'official',
+  'ratified',
+  'certification_id',
+]);
+
+function isForbiddenCertKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  if (FORBIDDEN_CERT_EXACT.has(lower)) return true;
+  return FORBIDDEN_CERT_STEMS.some((stem) => lower.includes(stem));
+}
+
+/**
+ * Assert an artefact is non-certifying. Throws (fail-closed) on violation.
+ *
+ * Recursive: walks the whole object graph so a certification-like field can
+ * never hide inside a nested manifest, report, or per-case record. Also
+ * enforces that wherever the non-certifying stamps appear they carry the
+ * correct values (`certifying===false`, `load_test_only===true`).
+ */
+export function assertNonCertifying(obj: unknown, path = '$'): void {
+  if (obj === null || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => assertNonCertifying(v, `${path}[${i}]`));
+    return;
   }
-  if (obj && typeof obj === 'object') {
-    const rec = obj as Record<string, unknown>;
-    if ('certifying' in rec && rec.certifying !== false) {
-      throw new Error('[loadtest] certifying must be false');
+  const rec = obj as Record<string, unknown>;
+  for (const [key, value] of Object.entries(rec)) {
+    // Legitimate non-certifying stamp keys are value-enforced, NOT rejected —
+    // even though 'certifying' contains the 'certif' stem. Handle them first.
+    if (key === 'certifying') {
+      if (value !== false) throw new Error(`[loadtest] certifying must be false (at ${path})`);
+      assertNonCertifying(value, `${path}.${key}`);
+      continue;
     }
-    if ('load_test_only' in rec && rec.load_test_only !== true) {
-      throw new Error('[loadtest] load_test_only must be true');
+    if (key === 'load_test_only') {
+      if (value !== true) throw new Error(`[loadtest] load_test_only must be true (at ${path})`);
+      assertNonCertifying(value, `${path}.${key}`);
+      continue;
     }
+    if (isForbiddenCertKey(key)) {
+      throw new Error(
+        `[loadtest] forbidden certification field '${key}' at ${path} in a non-certifying artefact`,
+      );
+    }
+    assertNonCertifying(value, `${path}.${key}`);
   }
 }
 
@@ -372,6 +486,39 @@ export class LoadTestAbort extends Error {
     super(message);
     this.name = 'LoadTestAbort';
   }
+}
+
+/** Internal sentinel: an in-flight case was cut short by the wall-clock abort. */
+class WallClockInterrupt extends Error {
+  constructor() {
+    super('[loadtest] wall-clock cap interrupted an in-flight case');
+    this.name = 'WallClockInterrupt';
+  }
+}
+
+/**
+ * Resolve with `p`, or reject with WallClockInterrupt the moment `signal`
+ * aborts — whichever happens first. Lets the harness stop waiting on a hung
+ * in-flight case at the wall-clock cap instead of only at scheduling
+ * boundaries. The underlying executor also receives the same signal so it can
+ * cancel its own provider call.
+ */
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new WallClockInterrupt());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new WallClockInterrupt());
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
 }
 
 export class LoadTestHarness {
@@ -537,12 +684,27 @@ export class LoadTestHarness {
       }
     };
 
+    // Shared abort so a wall-clock breach cancels IN-FLIGHT work, not just the
+    // next scheduling decision. A real timer fires at the cap; injected-clock
+    // tests still trip the scheduling-boundary check below. Both call stop().
+    const runAbort = new AbortController();
+    const remainingToCap = this.config.wallClockCapMs - (this.now() - startedAt);
+    const wallTimer: ReturnType<typeof setTimeout> | undefined =
+      remainingToCap > 0
+        ? setTimeout(() => {
+            stop('wall_clock_cap');
+            runAbort.abort();
+          }, remainingToCap)
+        : undefined;
+    if (wallTimer && typeof wallTimer.unref === 'function') wallTimer.unref();
+
     let cursor = 0;
     const worker = async (): Promise<void> => {
       while (true) {
         if (aborted) return;
         if (this.now() - startedAt > this.config.wallClockCapMs) {
           stop('wall_clock_cap');
+          runAbort.abort();
           return;
         }
         const i = cursor++;
@@ -550,10 +712,29 @@ export class LoadTestHarness {
         const loadCase = pending[i]!;
 
         const caseStart = this.now();
-        const { response, observation } = await this.deps.executor({
-          loadCase,
-          deadline: this.config.deadline,
-        });
+        let response: DqlResponse;
+        let observation: CaseObservation | undefined;
+        try {
+          const out = await raceAbort(
+            this.deps.executor({
+              loadCase,
+              deadline: this.config.deadline,
+              signal: runAbort.signal,
+            }),
+            runAbort.signal,
+          );
+          response = out.response;
+          observation = out.observation;
+        } catch (err) {
+          // A wall-clock abort interrupts the in-flight case: preserve all
+          // prior partials (already checkpointed) and fail closed. Any other
+          // executor throw is unexpected — surface it.
+          if (runAbort.signal.aborted) {
+            stop('wall_clock_cap');
+            return;
+          }
+          throw err;
+        }
         const obs =
           observation ??
           buildObservation(
@@ -571,6 +752,11 @@ export class LoadTestHarness {
           deadline_source: obs.deadline_source,
           latency_ms,
           movement: classifyMovement(obs),
+          ...(obs.provider_calls !== undefined ? { provider_calls: obs.provider_calls } : {}),
+          ...(obs.attempts !== undefined ? { attempts: obs.attempts } : {}),
+          ...(obs.backoff_ms !== undefined ? { backoff_ms: obs.backoff_ms } : {}),
+          ...(obs.net_latency_ms !== undefined ? { net_latency_ms: obs.net_latency_ms } : {}),
+          ...(obs.transitions !== undefined ? { transitions: obs.transitions } : {}),
         };
         this.scanForSecrets(result);
         this.deps.io.appendResult(JSON.stringify(result));
@@ -600,9 +786,13 @@ export class LoadTestHarness {
     };
 
     // Bounded worker pool — NO pacing/sleep between cases.
-    await Promise.all(
-      Array.from({ length: Math.min(this.config.concurrency, pending.length || 1) }, () => worker()),
-    );
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(this.config.concurrency, pending.length || 1) }, () => worker()),
+      );
+    } finally {
+      if (wallTimer !== undefined) clearTimeout(wallTimer);
+    }
 
     const wall_clock_ms = this.now() - startedAt;
     const report = this.buildReport(
@@ -654,6 +844,7 @@ export class LoadTestHarness {
       no_ground_truth: 0,
     };
     const latencies: number[] = [];
+    const live_totals = { provider_calls: 0, attempts: 0, backoff_ms: 0, net_latency_ms: 0 };
 
     for (const r of results) {
       for (const [alias, tally] of Object.entries(r.per_alias)) {
@@ -663,6 +854,10 @@ export class LoadTestHarness {
       aggregate_verdicts[r.aggregate_verdict] += 1;
       movements[r.movement] += 1;
       latencies.push(r.latency_ms);
+      live_totals.provider_calls += r.provider_calls ?? 0;
+      live_totals.attempts += r.attempts ?? 0;
+      live_totals.backoff_ms += r.backoff_ms ?? 0;
+      live_totals.net_latency_ms += r.net_latency_ms ?? 0;
     }
     latencies.sort((a, b) => a - b);
 
@@ -693,6 +888,7 @@ export class LoadTestHarness {
       aggregate_verdicts,
       review_amplification,
       movements,
+      live_totals,
     };
   }
 }

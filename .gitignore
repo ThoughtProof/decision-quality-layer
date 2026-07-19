@@ -9,3 +9,4 @@ dist/
 coverage/
 .turbo/
 scenarios/last-run.json
+runs/

@@ -378,12 +378,16 @@ export interface HttpLlmClientConfig {
 
 /**
  * Stable identity of the PHYSICAL provider route an alias resolves to.
- * Breaker isolation follows this fingerprint, not the alias label: two
- * aliases that resolve to the same physical route share health, and if an
- * alias resolver ever remaps an alias to a DIFFERENT physical model the old
- * breaker (carrying the prior model's samples / OPEN state) is discarded
- * rather than contaminating the new route. Non-secret — provider id, model
- * id, and the public base URL only; no API key ever appears here.
+ *
+ * The breaker map is keyed by ALIAS: every alias owns an isolated breaker, so
+ * two DIFFERENT aliases that happen to resolve to the same physical route do
+ * NOT share health (that per-alias isolation is the whole point of this
+ * track). The fingerprint is not a sharing key — it is the freshness stamp
+ * bound to each alias's breaker: if an alias resolver ever remaps an alias to
+ * a DIFFERENT physical model, `getBreaker` sees the fingerprint change and
+ * discards the stale breaker (carrying the prior model's samples / OPEN state)
+ * so it cannot contaminate the new route. Non-secret — provider id, model id,
+ * and the public base URL only; no API key ever appears here.
  */
 export function routeFingerprint(binding: ModelBinding): string {
   return `${binding.provider}:${binding.modelId}:${binding.baseUrl}`;
