@@ -482,6 +482,19 @@ export class CircuitBreaker {
     return { accepted: true, events };
   }
 
+  /**
+   * True when the breaker holds no live protection or in-flight work:
+   * CLOSED, no samples in the current window, and no probe in flight. Used
+   * by the client's bounded-lifecycle sweep to decide whether a breaker can
+   * be evicted from the per-route map WITHOUT dropping an OPEN/HALF_OPEN
+   * protection or a mid-probe recovery. Evicting a non-idle breaker could
+   * silently reset a live trip, so the sweep MUST consult this first.
+   */
+  isIdle(): boolean {
+    this.evictExpired(this.now());
+    return this.state === 'CLOSED' && this.samples.length === 0 && !this.probeInFlight;
+  }
+
   /** State snapshot for telemetry / test assertions. */
   snapshot(): CircuitSnapshot {
     this.evictExpired(this.now());
