@@ -64,7 +64,7 @@
  * that work is tracked separately.
  */
 
-import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError, type CircuitDomainEvent } from './circuit-breaker.js';
+import { CircuitBreaker, type CircuitBreakerConfig, CircuitOpenError, type CircuitDomainEvent, type CircuitState } from './circuit-breaker.js';
 import type { CallContext } from './call-context.js';
 import type { AttemptEvent, BindingSummary } from './runtime-diagnostics.js';
 import { categorizeFailure } from './runtime-diagnostics.js';
@@ -362,9 +362,66 @@ export interface HttpLlmClientConfig {
    * Default: false. Flip to true in prod-capital deploys until v0.4.3.
    */
   capitalPathMode?: boolean;
+  /**
+   * Bounded-lifecycle cap on the per-route CircuitBreaker map. When creating
+   * a breaker for a new route would exceed this many live entries, the client
+   * evicts the least-recently-used breaker that is idle (CLOSED, empty
+   * window, no probe in flight — see CircuitBreaker.isIdle). A non-idle
+   * breaker is NEVER evicted, so an OPEN/HALF_OPEN protection can never be
+   * silently reset by the sweep. Default: 64. The live cascade only ever
+   * touches two routes (serv-nano, serv-swift), so this bound is only
+   * exercised under pathological alias churn / load; it exists to keep the
+   * map from growing without bound over a long-lived cold-start bundle.
+   */
+  maxBreakers?: number;
 }
 
-const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics'>> = {
+/**
+ * Stable identity of the PHYSICAL provider route an alias resolves to.
+ * Breaker isolation follows this fingerprint, not the alias label: two
+ * aliases that resolve to the same physical route share health, and if an
+ * alias resolver ever remaps an alias to a DIFFERENT physical model the old
+ * breaker (carrying the prior model's samples / OPEN state) is discarded
+ * rather than contaminating the new route. Non-secret — provider id, model
+ * id, and the public base URL only; no API key ever appears here.
+ */
+export function routeFingerprint(binding: ModelBinding): string {
+  return `${binding.provider}:${binding.modelId}:${binding.baseUrl}`;
+}
+
+/** Human-facing resolved-route key for diagnostics (no base URL). */
+export function routeKeyOf(binding: ModelBinding): string {
+  return `${binding.provider}:${binding.modelId}`;
+}
+
+/** Per-alias structured breaker diagnostic — no prompts/responses/secrets. */
+export interface CircuitDiagnostic {
+  /** Alias the cascade requested. */
+  alias: string;
+  /** Resolved physical route (provider:modelId). */
+  route: string;
+  state: CircuitState;
+  sampleCount: number;
+  failureRate: number;
+  p90LatencyMs: number;
+  tripGeneration: number;
+  recoveryEpoch: number;
+  probeSequence: number;
+  stateRevision: number;
+  openedAt: number | null;
+}
+
+interface BreakerEntry {
+  breaker: CircuitBreaker;
+  /** routeFingerprint of the binding this breaker was created for. */
+  fingerprint: string;
+  /** provider:modelId, for diagnostics. */
+  route: string;
+  /** Monotonic LRU stamp, bumped on every access. */
+  lastAccess: number;
+}
+
+const DEFAULT_CONFIG: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics' | 'maxBreakers'>> = {
   timeoutMs: 60_000,
   maxAttempts: 6,
   backoffBaseMs: 800,
@@ -458,10 +515,20 @@ function readRetryTelemetry(err: unknown): RetryTelemetry | null {
 // -----------------------------------------------------------------------------
 
 export class HttpLlmClient implements LlmClient {
-  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics'>>;
+  private readonly config: Required<Omit<HttpLlmClientConfig, 'sleep' | 'fetchImpl' | 'circuitBreakerConfig' | 'circuitBreakerConfigByAlias' | 'disableCircuitBreaker' | 'capitalPathMode' | 'requireDiagnostics' | 'maxBreakers'>>;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
-  private readonly circuitBreakers: Map<string, CircuitBreaker> = new Map();
+  /**
+   * Per-alias breaker registry. Keyed by the requested alias so the
+   * alias-facing surface (circuitSnapshot, _testOnlyGetBreaker) is stable,
+   * but each entry is bound to a resolved-route fingerprint: isolation
+   * follows the physical route, and an alias→route remap discards the stale
+   * breaker instead of contaminating the new route.
+   */
+  private readonly circuitBreakers: Map<string, BreakerEntry> = new Map();
+  /** Monotonic LRU clock for bounded-lifecycle eviction. */
+  private lruClock = 0;
+  private readonly maxBreakers: number;
   private readonly circuitBreakerConfig: CircuitBreakerConfig | undefined;
   private readonly circuitBreakerConfigByAlias:
     | Record<string, CircuitBreakerConfig>
@@ -488,26 +555,65 @@ export class HttpLlmClient implements LlmClient {
     this.disableCircuitBreaker = config.disableCircuitBreaker ?? false;
     this.capitalPathMode = config.capitalPathMode ?? false;
     this.requireDiagnostics = config.requireDiagnostics ?? false;
+    this.maxBreakers = config.maxBreakers && config.maxBreakers > 0 ? config.maxBreakers : 64;
   }
 
   /**
    * Lazily construct a CircuitBreaker per alias. Kept private — no caller
    * should hold a stable ref because Map identity is per-client-instance.
    */
-  private getBreaker(alias: string): CircuitBreaker {
-    let cb = this.circuitBreakers.get(alias);
-    if (!cb) {
-      // v0.4.3.1 hardening: per-alias config wins over global. Shallow
-      // merge so unspecified per-alias fields fall back to global then
-      // CB defaults. This is the wiring point Hermes Blocker 6 requires.
-      const perAlias = this.circuitBreakerConfigByAlias?.[alias];
-      const merged: CircuitBreakerConfig | undefined = perAlias
-        ? { ...(this.circuitBreakerConfig ?? {}), ...perAlias }
-        : this.circuitBreakerConfig;
-      cb = new CircuitBreaker(alias, merged);
-      this.circuitBreakers.set(alias, cb);
+  private getBreaker(alias: string, binding: ModelBinding): CircuitBreaker {
+    const fingerprint = routeFingerprint(binding);
+    const existing = this.circuitBreakers.get(alias);
+    if (existing) {
+      if (existing.fingerprint === fingerprint) {
+        existing.lastAccess = ++this.lruClock;
+        return existing.breaker;
+      }
+      // The alias now resolves to a DIFFERENT physical route than the
+      // breaker was created for (alias-resolver / binding remap). The old
+      // breaker's samples and OPEN/HALF_OPEN state belong to the prior
+      // model — reusing it would contaminate the new route's health. Drop
+      // it and create a fresh breaker for the new route.
+      this.circuitBreakers.delete(alias);
     }
+    // v0.4.3.1 hardening: per-alias config wins over global. Shallow
+    // merge so unspecified per-alias fields fall back to global then
+    // CB defaults. This is the wiring point Hermes Blocker 6 requires.
+    const perAlias = this.circuitBreakerConfigByAlias?.[alias];
+    const merged: CircuitBreakerConfig | undefined = perAlias
+      ? { ...(this.circuitBreakerConfig ?? {}), ...perAlias }
+      : this.circuitBreakerConfig;
+    const cb = new CircuitBreaker(alias, merged);
+    this.enforceBreakerCap();
+    this.circuitBreakers.set(alias, {
+      breaker: cb,
+      fingerprint,
+      route: routeKeyOf(binding),
+      lastAccess: ++this.lruClock,
+    });
     return cb;
+  }
+
+  /**
+   * Bounded-lifecycle sweep. Before inserting a new breaker, if the map is at
+   * capacity evict the least-recently-used IDLE breaker (CLOSED, empty
+   * window, no probe in flight). A non-idle breaker is never evicted, so an
+   * OPEN/HALF_OPEN protection can never be silently reset. If nothing is
+   * idle, the map is allowed to exceed the cap transiently rather than drop
+   * live protection — safety wins over the bound.
+   */
+  private enforceBreakerCap(): void {
+    if (this.circuitBreakers.size < this.maxBreakers) return;
+    let victimKey: string | null = null;
+    let victimAccess = Infinity;
+    for (const [key, entry] of this.circuitBreakers) {
+      if (entry.breaker.isIdle() && entry.lastAccess < victimAccess) {
+        victimAccess = entry.lastAccess;
+        victimKey = key;
+      }
+    }
+    if (victimKey !== null) this.circuitBreakers.delete(victimKey);
   }
 
   /**
@@ -519,7 +625,11 @@ export class HttpLlmClient implements LlmClient {
    * instances.
    */
   _testOnlyGetBreaker(alias: string): CircuitBreaker {
-    return this.getBreaker(alias);
+    const binding = this.modelMap[alias];
+    if (!binding) {
+      throw new Error(`[llm-client] _testOnlyGetBreaker: unknown alias '${alias}'`);
+    }
+    return this.getBreaker(alias, binding);
   }
 
   /**
@@ -543,8 +653,35 @@ export class HttpLlmClient implements LlmClient {
   /** Snapshot of every alias circuit — for telemetry / test assertions. */
   circuitSnapshot(): Record<string, ReturnType<CircuitBreaker['snapshot']>> {
     const out: Record<string, ReturnType<CircuitBreaker['snapshot']>> = {};
-    for (const [alias, cb] of this.circuitBreakers) {
-      out[alias] = cb.snapshot();
+    for (const [alias, entry] of this.circuitBreakers) {
+      out[alias] = entry.breaker.snapshot();
+    }
+    return out;
+  }
+
+  /**
+   * Truthful per-alias circuit diagnostics keyed to the RESOLVED route.
+   * Safe to attach to load-test / observability output: contains only
+   * provider id, model id, state-machine counters, and latency percentiles —
+   * never prompts, raw responses, headers, or secrets.
+   */
+  circuitDiagnostics(): CircuitDiagnostic[] {
+    const out: CircuitDiagnostic[] = [];
+    for (const [alias, entry] of this.circuitBreakers) {
+      const s = entry.breaker.snapshot();
+      out.push({
+        alias,
+        route: entry.route,
+        state: s.state,
+        sampleCount: s.sampleCount,
+        failureRate: s.failureRate,
+        p90LatencyMs: s.p90LatencyMs,
+        tripGeneration: s.tripGeneration,
+        recoveryEpoch: s.recoveryEpoch,
+        probeSequence: s.probeSequence,
+        stateRevision: s.stateRevision,
+        openedAt: s.openedAt,
+      });
     }
     return out;
   }
@@ -650,7 +787,7 @@ export class HttpLlmClient implements LlmClient {
     // the routing decision; a completed-flag catch reports a defensive
     // failure only on pathological throws (e.g. bugs, aborts outside the
     // retry loop) so the probe cannot strand HALF_OPEN.
-    const primaryBreaker = this.getBreaker(modelAlias);
+    const primaryBreaker = this.getBreaker(modelAlias, binding);
     let primaryAdmission;
     try {
       primaryAdmission = primaryBreaker.admit();
@@ -836,7 +973,7 @@ export class HttpLlmClient implements LlmClient {
     // admission→config-error→sample sequence occur.
     this.requireApiKey(fallbackBinding);
 
-    const fallbackBreaker = this.getBreaker(fallbackAlias);
+    const fallbackBreaker = this.getBreaker(fallbackAlias, fallbackBinding);
     let fallbackAdmission;
     try {
       fallbackAdmission = fallbackBreaker.admit();
