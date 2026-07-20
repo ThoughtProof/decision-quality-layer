@@ -96,6 +96,17 @@ Rejected — shadow calibration needs a visible, testable artifact.
 2. Measure would-block rate vs cascade scope FAIL on traffic with structured fields
 3. Flip specific clients / keys to `enforce` only after false-block review
 
+### Step 2 instrumentation (shipped)
+
+- Every `runVerification` emits one structured log line:
+  `{"event":"dql.structural_shadow", ...agreement, would_block, scope_verdict, ...}`
+- Process-local counters + `GET /dql/structural-metrics` for live canary peek
+  (honest: serverless per-instance; durable N-day rates = log drain on the event)
+- Agreement labels: `both_block | structural_only | cascade_only | neither |
+  enforced_short_circuit | silent | no_scope_axis`
+- `HISTORY_VARIANCE_HARD = 0.2` remains INITIAL/UNCALIBRATED until real-traffic
+  `history_variance_break` samples exist (see code comment)
+
 **Follow-up (not v0):** today `gate_mode` is fully caller-controlled. When step 3
 goes live, add a server floor (env allowlist / per-key force-enforce) so a client
 cannot silently downgrade `enforce` → `shadow`. Harmless while default is shadow.

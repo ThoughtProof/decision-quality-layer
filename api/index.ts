@@ -11,6 +11,7 @@ export default function handler(_req: VercelRequest, res: VercelResponse) {
       verify: 'POST /dql/verify',
       axes: 'GET /dql/axes',
       health: 'GET /dql/health',
+      structural_metrics: 'GET /dql/structural-metrics',
       openapi: 'GET /openapi.json',
     },
     docs: 'https://github.com/ThoughtProof/decision-quality-layer',

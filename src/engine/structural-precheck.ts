@@ -100,9 +100,16 @@ const AMOUNT_OVERSHOOT_TOLERANCE = 0.005; // 0.5%
 
 /**
  * History-band hard break. Soft history / first-payment stay with LLM axes.
- * Only fires with past_payments ≥ HISTORY_MIN_COUNT. INITIAL / UNCALIBRATED.
+ * Only fires with past_payments ≥ HISTORY_MIN_COUNT.
+ *
+ * CALIBRATION NOTE (ADR-0020 step 2, 2026-07-20):
+ * HISTORY_VARIANCE_HARD = 0.2 is INITIAL / UNCALIBRATED. Do NOT treat as product
+ * truth. After real traffic with structured history fields, recompute from the
+ * dql.structural_shadow log stream (agreement structural_only vs both_block on
+ * history_variance_break) and adjust. Until then enforce-flip on this kind alone
+ * is premature — shadow metrics first.
  */
-const HISTORY_VARIANCE_HARD = 0.2; // 20%
+const HISTORY_VARIANCE_HARD = 0.2; // 20% — UNCALIBRATED, see note above
 const HISTORY_MIN_COUNT = 3;
 
 function parseAllowance(allowance: string | number | undefined): number | null {

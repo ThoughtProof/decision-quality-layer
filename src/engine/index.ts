@@ -30,6 +30,11 @@ import {
   toStructuralField,
   type StructuralPrecheckResult,
 } from './structural-precheck.js';
+import {
+  buildStructuralShadowSample,
+  logStructuralShadowSample,
+  recordStructuralSample,
+} from './structural-metrics.js';
 
 export interface EngineInput {
   request: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> &
@@ -70,7 +75,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   const structuralField = toStructuralField(precheck);
 
   if (precheck.enforced) {
-    return buildEnforcedBlockResponse({
+    const enforced = buildEnforcedBlockResponse({
       requestId: input.requestId,
       version: input.version,
       axes,
@@ -79,6 +84,14 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
       structuralField,
       started,
     });
+    emitStructuralMetrics({
+      requestId: input.requestId,
+      structural: structuralField,
+      axes: enforced.axes,
+      aggregateVerdict: enforced.aggregate.verdict,
+      sandbox: input.request.sandbox,
+    });
+    return enforced;
   }
 
   const promptInput = {
@@ -189,6 +202,14 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   const modelsUsed = uniqueStrings(perAxis.flatMap((p) => p.modelsUsed));
   const aggregateResult = aggregate(axisResults);
 
+  emitStructuralMetrics({
+    requestId: input.requestId,
+    structural: structuralField,
+    axes: axisResults,
+    aggregateVerdict: aggregateResult.verdict,
+    sandbox: input.request.sandbox,
+  });
+
   return {
     id: input.requestId,
     version: input.version,
@@ -204,6 +225,29 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   };
   } finally {
     if (requestTimer !== undefined) clearTimeout(requestTimer);
+  }
+}
+
+/** Shadow metrics: compare structural.would_block vs cascade scope FAIL. Never throws. */
+function emitStructuralMetrics(args: {
+  requestId: string;
+  structural: ReturnType<typeof toStructuralField>;
+  axes: AxisResult[];
+  aggregateVerdict: AggregateResult['verdict'];
+  sandbox: boolean;
+}): void {
+  try {
+    const sample = buildStructuralShadowSample({
+      requestId: args.requestId,
+      structural: args.structural,
+      axes: args.axes,
+      aggregateVerdict: args.aggregateVerdict,
+      sandbox: args.sandbox,
+    });
+    recordStructuralSample(sample);
+    logStructuralShadowSample(sample);
+  } catch {
+    // metrics never affect the request path
   }
 }
 
