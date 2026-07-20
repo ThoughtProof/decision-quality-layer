@@ -101,10 +101,17 @@ export function parseAxisResponse(axis: Axis, raw: string): AxisResult {
       ? verdictRaw
       : 'UNCERTAIN';
 
-  const confidence =
-    typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
-      ? clamp01(parsed.confidence)
-      : 0;
+  // Missing/non-numeric confidence used to become 0, which made both-PASS
+// merges show PASS@0% in the UI (Math.min with a real conf). Treat absence
+// as a mid default by verdict; explicit 0 stays 0 (model said "no conf").
+const hasConf =
+    typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence);
+  let confidence = hasConf ? clamp01(parsed.confidence as number) : defaultConfidence(verdict);
+  // Degenerate: PASS/FAIL with exact 0 is almost always a model omit-as-zero.
+  // Floor to the same mid default so receipt never shows "PASS · 0%".
+  if ((verdict === 'PASS' || verdict === 'FAIL') && confidence === 0) {
+    confidence = defaultConfidence(verdict);
+  }
 
   const reasoning =
     typeof parsed.reasoning === 'string' ? parsed.reasoning.trim() : '(no reasoning provided)';
@@ -112,6 +119,13 @@ export function parseAxisResponse(axis: Axis, raw: string): AxisResult {
   const objection = typeof parsed.objection === 'string' ? parsed.objection.trim() : '';
 
   return { axis, verdict, confidence, reasoning, objection };
+}
+
+/** Mid defaults when the model omits confidence. UNCERTAIN stays low. */
+function defaultConfidence(verdict: 'PASS' | 'FAIL' | 'UNCERTAIN'): number {
+  if (verdict === 'PASS') return 0.7;
+  if (verdict === 'FAIL') return 0.7;
+  return 0.4;
 }
 
 function extractJson(raw: string): string {

@@ -37,6 +37,24 @@ describe('parseAxisResponse', () => {
     expect(r.confidence).toBe(1);
   });
 
+  it('defaults missing confidence on PASS (never PASS@0)', () => {
+    const r = parseAxisResponse(
+      'scope',
+      '{"verdict":"PASS","reasoning":"in scope","objection":""}'
+    );
+    expect(r.verdict).toBe('PASS');
+    expect(r.confidence).toBe(0.7);
+  });
+
+  it('floors explicit PASS confidence 0 to mid default', () => {
+    const r = parseAxisResponse(
+      'scope',
+      '{"verdict":"PASS","confidence":0,"reasoning":"ok","objection":""}'
+    );
+    expect(r.verdict).toBe('PASS');
+    expect(r.confidence).toBe(0.7);
+  });
+
   it('defaults unknown verdict to UNCERTAIN', () => {
     const r = parseAxisResponse(
       'reversibility',
