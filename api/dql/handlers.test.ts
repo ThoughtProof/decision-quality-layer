@@ -13,10 +13,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Minimal Vercel req/res doubles. We don't pull in @vercel/node runtime
 // because we test the JSON contract, not the platform integration.
-function makeReqRes(body?: unknown, method = 'POST') {
+function makeReqRes(body?: unknown, method = 'POST', headers: Record<string, string> = {}) {
   const req = {
     method,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...headers },
     body,
   } as any;
   const state: {
@@ -58,6 +58,17 @@ const validVerifyBody = {
   axes: ['intent', 'scope', 'risk', 'consistency', 'reversibility'],
 };
 
+// Phase 2 key gate: non-sandbox POSTs need a valid X-DQL-Key. Registry must
+// be set BEFORE dynamic-import of the handler (cold-start parseApiKeys).
+const DEV_KEY = 'dqlk_test_dev_key_0000000000000000';
+const DEV_KEYS_ENV = JSON.stringify({
+  [DEV_KEY]: { owner: 'test-suite', dev_access: true, daily_cap: 1000 },
+});
+const AUTH_HEADERS = { 'x-dql-key': DEV_KEY };
+function armKeyEnv() {
+  process.env.DQL_API_KEYS = DEV_KEYS_ENV;
+}
+
 describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
   const originalEnv = process.env;
   beforeEach(() => {
@@ -80,6 +91,60 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
     expect(state.jsonBody.meta.sandbox).toBe(true);
+    expect(state.headers['X-DQL-Billing']).toBe('sandbox');
+    expect(state.headers['X-DQL-Price-Usd']).toBe('0.00');
+  });
+
+  it('Phase 2: non-sandbox WITHOUT key → 402 PAYMENT_REQUIRED', async () => {
+    const mod = await import('./verify.js');
+    const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false });
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(402);
+    expect(state.jsonBody.code).toBe('PAYMENT_REQUIRED');
+    expect(state.jsonBody.price_usd_per_call).toBe(0.05);
+    expect(state.jsonBody.access).toBeTruthy();
+  });
+
+  it('Phase 2: non-sandbox with INVALID key → 402', async () => {
+    armKeyEnv();
+    const mod = await import('./verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'x-dql-key': 'dqlk_not_in_registry' },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(402);
+    expect(state.jsonBody.code).toBe('PAYMENT_REQUIRED');
+  });
+
+  it('Phase 2: valid dev key → 200 + billing headers (dev-access, $0.00)', async () => {
+    armKeyEnv();
+    const mod = await import('./verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      AUTH_HEADERS,
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.headers['X-DQL-Billing']).toBe('dev-access');
+    expect(state.headers['X-DQL-Price-Usd']).toBe('0.00');
+    for (const axis of state.jsonBody.axes) {
+      expect(axis.verdict).toBe('UNCERTAIN');
+    }
+  });
+
+  it('Phase 2: empty registry fails closed (presented key still 402)', async () => {
+    // beforeEach wiped DQL_API_KEYS — no armKeyEnv().
+    const mod = await import('./verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      AUTH_HEADERS,
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(402);
   });
 
   it('DQL_CASCADE=pot-cli WITHOUT required env → 503 CONFIG_INVALID even for sandbox=true (Blocker 1)', async () => {
@@ -95,8 +160,13 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
 
   it('DQL_CASCADE=pot-cli WITHOUT required env → 503 CONFIG_INVALID for sandbox=false too', async () => {
     process.env.DQL_CASCADE = 'pot-cli';
+    armKeyEnv();
     const mod = await import('./verify.js');
-    const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false });
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      AUTH_HEADERS,
+    );
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
     expect(state.jsonBody.code).toBe('CONFIG_INVALID');
@@ -104,24 +174,35 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
 
   it('DQL_CASCADE=mystery (unknown) → 503 CONFIG_INVALID (parseRuntimeMode throws)', async () => {
     process.env.DQL_CASCADE = 'mystery';
+    armKeyEnv();
     const mod = await import('./verify.js');
-    const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false });
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      AUTH_HEADERS,
+    );
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
     expect(state.jsonBody.code).toBe('CONFIG_INVALID');
   });
 
   it('DQL_CASCADE=stub + invalid body → 400 INVALID_REQUEST', async () => {
+    armKeyEnv();
     const mod = await import('./verify.js');
-    const { req, res, state } = makeReqRes({}, 'POST');
+    const { req, res, state } = makeReqRes({}, 'POST', AUTH_HEADERS);
     await mod.default(req, res);
     expect(state.statusCode).toBe(400);
     expect(state.jsonBody.code).toBe('INVALID_REQUEST');
   });
 
   it('DQL_CASCADE=stub + valid body + sandbox=false → 200 UNCERTAIN (stub cascade)', async () => {
+    armKeyEnv();
     const mod = await import('./verify.js');
-    const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false });
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      AUTH_HEADERS,
+    );
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
     for (const axis of state.jsonBody.axes) {
@@ -512,8 +593,9 @@ describe('H4 — sendJsonWithDiagnostics is wire-effective on every path', () =>
 
   it('400 INVALID_REQUEST path preserves status/body under H4 refactor', async () => {
     process.env.DQL_CASCADE = 'stub';
+    armKeyEnv();
     const mod = await import('./verify.js');
-    const { req, res, state } = makeReqRes({ garbage: true });
+    const { req, res, state } = makeReqRes({ garbage: true }, 'POST', AUTH_HEADERS);
     await mod.default(req, res);
     expect(state.statusCode).toBe(400);
     expect(state.jsonBody.code).toBe('INVALID_REQUEST');
