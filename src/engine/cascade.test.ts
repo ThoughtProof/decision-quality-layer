@@ -55,6 +55,18 @@ describe('parseAxisResponse', () => {
     expect(r.confidence).toBe(0.7);
   });
 
+  it('maps model refusal to UNCERTAIN@0 with provider_error (not a judgment)', () => {
+    const r = parseAxisResponse(
+      'consistency',
+      '{"verdict":"UNCERTAIN","confidence":0.86,"reasoning":"I can\'t share that.","objection":"I can\'t share that."}',
+    );
+    expect(r.verdict).toBe('UNCERTAIN');
+    expect(r.confidence).toBe(0);
+    expect(r.provider_outcome).toBe('provider_error');
+    expect(r.objection).toMatch(/refusal/i);
+    expect(r.objection).not.toMatch(/can'?t share/i);
+  });
+
   it('defaults unknown verdict to UNCERTAIN', () => {
     const r = parseAxisResponse(
       'reversibility',

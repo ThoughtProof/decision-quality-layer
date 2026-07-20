@@ -113,12 +113,68 @@ const hasConf =
     confidence = defaultConfidence(verdict);
   }
 
-  const reasoning =
+  let reasoning =
     typeof parsed.reasoning === 'string' ? parsed.reasoning.trim() : '(no reasoning provided)';
 
-  const objection = typeof parsed.objection === 'string' ? parsed.objection.trim() : '';
+  let objection = typeof parsed.objection === 'string' ? parsed.objection.trim() : '';
+
+  // Model refusals ("I can't share that.") must never look like axis judgments.
+  // Treat as evaluation failure: UNCERTAIN@0 with an honest infra note.
+  // High-conf UNCERTAIN + refusal text is the worst product surface (seen live
+  // on Guardian 2026-07-20: consistency/reversibility @ 86–95%).
+  if (isModelRefusal(`${reasoning}
+${objection}
+${raw}`)) {
+    return {
+      axis,
+      verdict: 'UNCERTAIN',
+      confidence: 0,
+      reasoning:
+        'Axis evaluation incomplete — model refused to produce a judgment on this axis.',
+      objection: 'Model refusal (not an axis judgment).',
+      provider_outcome: 'provider_error',
+    };
+  }
 
   return { axis, verdict, confidence, reasoning, objection };
+}
+
+/** Detect policy/safety refusals that are not decision-quality judgments. */
+export function isModelRefusal(text: string): boolean {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  // Short pure refusals
+  if (
+    /^\s*i (can'?t|cannot|won'?t) (share|help with|provide|discuss|assist).{0,40}\.?\s*$/im.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  const patterns = [
+    /i can'?t share that/i,
+    /i cannot share that/i,
+    /i'?m not able to share/i,
+    /i'?m unable to share/i,
+    /i won'?t (share|provide|discuss)/i,
+    /as an ai (language )?model,? i (can'?t|cannot)/i,
+    /i (can'?t|cannot) (assist|help) with that/i,
+    /against my (guidelines|policies|programming)/i,
+    /content.?policy/i,
+    /i must refuse/i,
+  ];
+  // Only flag when the bulk of the text is the refusal, not a long analysis
+  // that happens to contain a quote.
+  const compact = t.replace(/\s+/g, ' ').trim();
+  if (compact.length <= 120 && patterns.some((re) => re.test(compact))) return true;
+  // Longer outputs: refusal is the main claim if it appears early and little else.
+  if (compact.length <= 240) {
+    const early = compact.slice(0, 80);
+    if (patterns.some((re) => re.test(early)) && !/\b(pass|fail|mandate|scope|risk)\b/i.test(compact)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Mid defaults when the model omits confidence. UNCERTAIN stays low. */
