@@ -2,7 +2,8 @@
  * DQL Engine — orchestrates 5-axis verification.
  *
  * Given a validated request, this module:
- *   1. Builds a prompt per requested axis.
+ *   0. Runs the deterministic structural pre-check (ADR-0020).
+ *   1. Builds a prompt per requested axis (unless enforce short-circuits).
  *   2. Runs each axis through the cascade IN PARALLEL.
  *   3. Aggregates the per-axis verdicts into a single aggregate verdict.
  *
@@ -11,16 +12,28 @@
  * production cascade is wired in Phase 1.
  */
 
-import type { DqlRequest, DqlResponse, AxisResult, Axis } from '../types.js';
+import type {
+  DqlRequest,
+  DqlResponse,
+  AxisResult,
+  Axis,
+  AggregateResult,
+} from '../types.js';
 import { AXIS_PROMPT_BUILDERS } from './axes/index.js';
 import { aggregate } from '../aggregation.js';
 import type { Cascade } from './cascade.js';
 import { CircuitAllOpenError, ProviderCallError } from './llm-client.js';
 import { generateCallId, type CallContext } from './call-context.js';
 import type { RuntimeDiagnosticsCollector } from './runtime-diagnostics.js';
+import {
+  runStructuralPrecheck,
+  toStructuralField,
+  type StructuralPrecheckResult,
+} from './structural-precheck.js';
 
 export interface EngineInput {
-  request: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'>;
+  request: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> &
+    Pick<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>;
   /** The cascade to run when `request.sandbox` is false. */
   cascade: Cascade;
   /** The cascade to run when `request.sandbox` is true. */
@@ -48,6 +61,25 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   const started = Date.now();
   const axes = input.request.axes;
   const cascade = input.request.sandbox ? input.sandboxCascade : input.cascade;
+
+  // 0. Deterministic structural pre-check (ADR-0020). Default shadow:
+  //    compute + attach, never short-circuit. Enforce + violation → BLOCK
+  //    without spending the cascade. Fail-toward-silence / add-only.
+  const gateMode = input.request.gate_mode ?? 'shadow';
+  const precheck = runStructuralPrecheck(input.request.structured_context, gateMode);
+  const structuralField = toStructuralField(precheck);
+
+  if (precheck.enforced) {
+    return buildEnforcedBlockResponse({
+      requestId: input.requestId,
+      version: input.version,
+      axes,
+      sandbox: input.request.sandbox,
+      precheck,
+      structuralField,
+      started,
+    });
+  }
 
   const promptInput = {
     mandate: input.request.mandate,
@@ -162,6 +194,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
     version: input.version,
     axes: axisResults,
     aggregate: aggregateResult,
+    structural: structuralField,
     meta: {
       duration_ms: Date.now() - started,
       models_used: modelsUsed,
@@ -172,6 +205,90 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   } finally {
     if (requestTimer !== undefined) clearTimeout(requestTimer);
   }
+}
+
+/**
+ * Enforce-mode short-circuit: hard structural violation → BLOCK without
+ * cascade spend. Synthetic axis results keep the response shape stable:
+ * scope FAIL@1.0 carries the violation; other requested axes are marked
+ * skipped as UNCERTAIN@0 (never fabricated PASS — receipt honesty).
+ * No provider_outcome on skips so D6 provenance rules do not fire.
+ * Aggregation Rule 1 (scope FAIL@1.0) still yields BLOCK first.
+ */
+function buildEnforcedBlockResponse(args: {
+  requestId: string;
+  version: string;
+  axes: Axis[];
+  sandbox: boolean;
+  precheck: StructuralPrecheckResult;
+  structuralField: ReturnType<typeof toStructuralField>;
+  started: number;
+}): DqlResponse {
+  const detail = args.precheck.violations.map((v) => v.detail).join(' ');
+  const kinds = args.precheck.violations.map((v) => v.kind).join(', ');
+
+  const scopeFail = (): AxisResult => ({
+    axis: 'scope',
+    verdict: 'FAIL',
+    confidence: 1,
+    reasoning:
+      `Deterministic structural pre-check (enforce): ${kinds}. ` +
+      `Binary unfixable scope/identity violation — cascade skipped.`,
+    objection: detail || `Structural pre-check blocked (${kinds}).`,
+  });
+
+  const skippedAxis = (axis: Axis): AxisResult => ({
+    axis,
+    verdict: 'UNCERTAIN',
+    confidence: 0,
+    reasoning: 'skipped — structural enforce short-circuit',
+    objection: 'Axis not evaluated; structural pre-check already hard-blocked.',
+    // intentionally no provider_outcome — not a provider failure (D6).
+  });
+
+  const axisResults: AxisResult[] = args.axes.map((axis) =>
+    axis === 'scope' ? scopeFail() : skippedAxis(axis),
+  );
+
+  // If the caller omitted scope from axes[], force a synthetic scope FAIL
+  // so content-broken BLOCK still fires and the audit trail names scope.
+  const hasScope = axisResults.some((r) => r.axis === 'scope');
+  if (!hasScope) {
+    axisResults.unshift(scopeFail());
+  }
+
+  // Requested axes only (plus synthetic scope if omitted). Do not claim the
+  // cascade "evaluated" skipped axes — meta lists what appears on the receipt,
+  // with models_used: [] making the short-circuit explicit.
+  let aggregateResult: AggregateResult = aggregate(axisResults);
+
+  // Belt-and-suspenders: never ALLOW after enforced structural block.
+  // (scope FAIL@1.0 should already BLOCK via Rule 1; UNCERTAIN@0 skips alone
+  // would not reverse that.)
+  if (aggregateResult.verdict !== 'BLOCK') {
+    aggregateResult = {
+      verdict: 'BLOCK',
+      confidence: 1,
+      triggered_by: ['scope'],
+      rationale:
+        `Blocked by deterministic structural pre-check (${kinds}). ` +
+        (detail || 'Binary unfixable violation.'),
+    };
+  }
+
+  return {
+    id: args.requestId,
+    version: args.version,
+    axes: axisResults,
+    aggregate: aggregateResult,
+    structural: args.structuralField,
+    meta: {
+      duration_ms: Date.now() - args.started,
+      models_used: [],
+      axes_evaluated: axisResults.map((r) => r.axis),
+      sandbox: args.sandbox,
+    },
+  };
 }
 
 function uniqueStrings(xs: string[]): string[] {

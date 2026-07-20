@@ -13,7 +13,7 @@ class ScriptedCascade implements Cascade {
   }
 }
 
-const req: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> = {
+const req: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> & Pick<DqlRequest, 'context' | 'structured_context' | 'gate_mode'> = {
   mandate: 'Swap 100 USDC to ETH',
   proposed_action: 'Approve USDC and swap',
   reasoning: 'User asked for it',
@@ -173,5 +173,158 @@ describe('runVerification', () => {
     // Aggregate must NOT be ALLOW under provider outage. UNCERTAIN axes can
     // only aggregate to REVIEW or BLOCK — that is the fail-closed contract.
     expect(out.aggregate.verdict).not.toBe('ALLOW');
+  });
+
+  // ── ADR-0020 structural pre-check ──────────────────────────────────────
+
+  it('attaches silent structural field by default (no structured_context)', async () => {
+    let cascadeCalls = 0;
+    const cascade = new ScriptedCascade((axis) => {
+      cascadeCalls += 1;
+      return {
+        axis: axis as AxisResult['axis'],
+        verdict: 'PASS',
+        confidence: 0.9,
+        reasoning: 'ok',
+        objection: '',
+      };
+    });
+
+    const out = await runVerification({
+      request: req,
+      cascade,
+      sandboxCascade: sandbox,
+      requestId: 'test_struct_silent',
+      version: '0.1.0',
+    });
+
+    expect(out.structural).toBeDefined();
+    expect(out.structural!.silent).toBe(true);
+    expect(out.structural!.mode).toBe('shadow');
+    expect(out.structural!.would_block).toBe(false);
+    expect(out.structural!.enforced).toBe(false);
+    expect(cascadeCalls).toBe(5);
+    expect(out.aggregate.verdict).toBe('ALLOW');
+  });
+
+  it('shadow mode detects amount overshoot but still runs cascade', async () => {
+    let cascadeCalls = 0;
+    const cascade = new ScriptedCascade((axis) => {
+      cascadeCalls += 1;
+      return {
+        axis: axis as AxisResult['axis'],
+        verdict: 'PASS',
+        confidence: 0.9,
+        reasoning: 'ok',
+        objection: '',
+      };
+    });
+
+    const out = await runVerification({
+      request: {
+        ...req,
+        gate_mode: 'shadow',
+        structured_context: {
+          granted: { max_amount: 100, amount_currency: 'EUR' },
+          proposed: { amount: 1000, amount_currency: 'EUR' },
+        },
+      },
+      cascade,
+      sandboxCascade: sandbox,
+      requestId: 'test_struct_shadow',
+      version: '0.1.0',
+    });
+
+    expect(out.structural!.would_block).toBe(true);
+    expect(out.structural!.enforced).toBe(false);
+    expect(out.structural!.violations.map((v) => v.kind)).toEqual(['amount_overshoot']);
+    // Cascade still ran — shadow does not gate.
+    expect(cascadeCalls).toBe(5);
+    // Scripted cascade all-PASS → ALLOW despite structural would_block.
+    expect(out.aggregate.verdict).toBe('ALLOW');
+  });
+
+  it('enforce mode short-circuits cascade on hard violation → BLOCK', async () => {
+    let cascadeCalls = 0;
+    const cascade = new ScriptedCascade((axis) => {
+      cascadeCalls += 1;
+      return {
+        axis: axis as AxisResult['axis'],
+        verdict: 'PASS',
+        confidence: 0.9,
+        reasoning: 'should not run',
+        objection: '',
+      };
+    });
+
+    const out = await runVerification({
+      request: {
+        ...req,
+        gate_mode: 'enforce',
+        structured_context: {
+          granted: { max_amount: 200, recipient: 'alice' },
+          proposed: { amount: 2000, recipient: 'mallory' },
+        },
+      },
+      cascade,
+      sandboxCascade: sandbox,
+      requestId: 'test_struct_enforce',
+      version: '0.1.0',
+    });
+
+    expect(cascadeCalls).toBe(0);
+    expect(out.structural!.enforced).toBe(true);
+    expect(out.structural!.would_block).toBe(true);
+    expect(out.aggregate.verdict).toBe('BLOCK');
+    expect(out.meta.models_used).toEqual([]);
+    const scope = out.axes.find((a) => a.axis === 'scope')!;
+    expect(scope.verdict).toBe('FAIL');
+    expect(scope.confidence).toBe(1);
+    expect(scope.objection.length).toBeGreaterThan(0);
+
+    // Probe 2 / MAJOR-1 fix: skipped axes are UNCERTAIN@0 — never fabricated PASS.
+    const skipped = out.axes.filter((a) => a.axis !== 'scope');
+    expect(skipped.length).toBeGreaterThan(0);
+    for (const a of skipped) {
+      expect(a.verdict).toBe('UNCERTAIN');
+      expect(a.confidence).toBe(0);
+      expect(a.reasoning).toMatch(/skipped — structural enforce short-circuit/);
+      expect(a.provider_outcome).toBeUndefined();
+      expect(a.verdict).not.toBe('PASS');
+    }
+  });
+
+  it('enforce mode with clean structured_context still runs cascade', async () => {
+    let cascadeCalls = 0;
+    const cascade = new ScriptedCascade((axis) => {
+      cascadeCalls += 1;
+      return {
+        axis: axis as AxisResult['axis'],
+        verdict: 'PASS',
+        confidence: 0.9,
+        reasoning: 'ok',
+        objection: '',
+      };
+    });
+
+    const out = await runVerification({
+      request: {
+        ...req,
+        gate_mode: 'enforce',
+        structured_context: {
+          granted: { max_amount: 500, recipient: 'alice' },
+          proposed: { amount: 200, recipient: 'Alice' },
+        },
+      },
+      cascade,
+      sandboxCascade: sandbox,
+      requestId: 'test_struct_enforce_clean',
+      version: '0.1.0',
+    });
+
+    expect(cascadeCalls).toBe(5);
+    expect(out.structural!.would_block).toBe(false);
+    expect(out.structural!.enforced).toBe(false);
+    expect(out.aggregate.verdict).toBe('ALLOW');
   });
 });

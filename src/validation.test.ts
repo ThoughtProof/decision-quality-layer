@@ -76,4 +76,82 @@ describe('validateVerifyRequest', () => {
     const r = validateVerifyRequest({ ...good, tier: 'standard' });
     expect(r.valid).toBe(true);
   });
+
+  // ── ADR-0020 structural fields ─────────────────────────────────────────
+
+  it('accepts gate_mode shadow|enforce', () => {
+    const s = validateVerifyRequest({ ...good, gate_mode: 'shadow' });
+    expect(s.valid).toBe(true);
+    if (s.valid) expect(s.request.gate_mode).toBe('shadow');
+
+    const e = validateVerifyRequest({ ...good, gate_mode: 'enforce' });
+    expect(e.valid).toBe(true);
+    if (e.valid) expect(e.request.gate_mode).toBe('enforce');
+  });
+
+  it('rejects invalid gate_mode', () => {
+    const r = validateVerifyRequest({ ...good, gate_mode: 'hard' });
+    expect(r.valid).toBe(false);
+    if (!r.valid) expect(r.errors.some((e) => e.includes('gate_mode'))).toBe(true);
+  });
+
+  it('accepts structured_context with granted/proposed/history', () => {
+    const r = validateVerifyRequest({
+      ...good,
+      gate_mode: 'shadow',
+      structured_context: {
+        granted: { max_amount: 100, recipient: 'alice', amount_currency: 'EUR' },
+        proposed: { amount: 50, recipient: 'alice', allowance: '50' },
+        history: {
+          past_payments_to_same_counterparty: 5,
+          amount_variance_from_history: 0.02,
+        },
+      },
+    });
+    expect(r.valid).toBe(true);
+    if (r.valid) {
+      expect(r.request.structured_context?.granted?.max_amount).toBe(100);
+      expect(r.request.structured_context?.proposed?.amount).toBe(50);
+      expect(r.request.structured_context?.history?.past_payments_to_same_counterparty).toBe(5);
+    }
+  });
+
+  it('rejects structured_context when not an object', () => {
+    const r = validateVerifyRequest({ ...good, structured_context: 'nope' });
+    expect(r.valid).toBe(false);
+  });
+
+  it('rejects non-finite max_amount', () => {
+    const r = validateVerifyRequest({
+      ...good,
+      structured_context: { granted: { max_amount: '100' } },
+    });
+    expect(r.valid).toBe(false);
+    if (!r.valid) {
+      expect(r.errors.some((e) => e.includes('max_amount'))).toBe(true);
+    }
+  });
+
+  it('accepts allowance as string or number', () => {
+    const a = validateVerifyRequest({
+      ...good,
+      structured_context: { proposed: { allowance: 'MAX_UINT256' } },
+    });
+    expect(a.valid).toBe(true);
+
+    const b = validateVerifyRequest({
+      ...good,
+      structured_context: { proposed: { allowance: 1e40 } },
+    });
+    expect(b.valid).toBe(true);
+  });
+
+  it('omits structured_context and gate_mode when not provided', () => {
+    const r = validateVerifyRequest(good);
+    expect(r.valid).toBe(true);
+    if (r.valid) {
+      expect(r.request.structured_context).toBeUndefined();
+      expect(r.request.gate_mode).toBeUndefined();
+    }
+  });
 });

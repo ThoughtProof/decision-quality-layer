@@ -285,6 +285,18 @@ const spec = {
               'Optional extra evidence, tool outputs, or prior conversation turns available to the agent.',
             maxLength: 20000,
           },
+          structured_context: {
+            $ref: '#/components/schemas/DqlStructuredContext',
+            description:
+              'Optional machine-readable fields for the deterministic structural pre-check (ADR-0020). Free-text context is never parsed for this. Incomplete field pairs stay silent (fail-toward-silence). Trust boundary: granted.* MUST be principal-/platform-supplied (session, rail, host policy) — not agent-asserted; agent-controlled granted fields make the gate bypassable (omit → silent).',
+          },
+          gate_mode: {
+            type: 'string',
+            enum: ['shadow', 'enforce'],
+            default: 'shadow',
+            description:
+              "Structural pre-check rollout mode (ADR-0020). 'shadow' (default): compute + attach response.structural, still run the cascade. 'enforce': hard binary violations short-circuit to BLOCK before the LLM cascade.",
+          },
           axes: {
             type: 'array',
             items: { $ref: '#/components/schemas/Axis' },
@@ -296,6 +308,80 @@ const spec = {
             description:
               'If true, returns a deterministic mock response without running the cascade. Free. Useful for integration tests.',
             default: false,
+          },
+        },
+      },
+      DqlStructuredContext: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          granted: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              max_amount: { type: 'number' },
+              amount_currency: { type: 'string' },
+              recipient: { type: 'string' },
+              iban: { type: 'string' },
+              allow_unlimited: { type: 'boolean' },
+            },
+          },
+          proposed: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              amount: { type: 'number' },
+              amount_currency: { type: 'string' },
+              recipient: { type: 'string' },
+              iban: { type: 'string' },
+              allowance: {
+                oneOf: [{ type: 'number' }, { type: 'string' }],
+                description: 'Exact allowance, or unlimited sentinels (unlimited, MAX_UINT256, hex).',
+              },
+            },
+          },
+          history: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              past_payments_to_same_counterparty: { type: 'number' },
+              amount_variance_from_history: {
+                type: 'number',
+                description: 'Relative deviation, e.g. 0.02 = 2%. Hard break only with ≥3 prior payments.',
+              },
+            },
+          },
+        },
+      },
+      StructuralField: {
+        type: 'object',
+        required: ['mode', 'would_block', 'enforced', 'silent', 'violations'],
+        additionalProperties: false,
+        properties: {
+          mode: { type: 'string', enum: ['shadow', 'enforce'] },
+          would_block: { type: 'boolean' },
+          enforced: { type: 'boolean' },
+          silent: { type: 'boolean' },
+          violations: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['kind', 'detail'],
+              additionalProperties: false,
+              properties: {
+                kind: {
+                  type: 'string',
+                  enum: [
+                    'amount_overshoot',
+                    'recipient_mismatch',
+                    'iban_mismatch',
+                    'unlimited_approval',
+                    'history_variance_break',
+                  ],
+                },
+                detail: { type: 'string' },
+              },
+            },
           },
         },
       },
@@ -362,6 +448,11 @@ const spec = {
             items: { $ref: '#/components/schemas/AxisResult' },
           },
           aggregate: { $ref: '#/components/schemas/AggregateResult' },
+          structural: {
+            $ref: '#/components/schemas/StructuralField',
+            description:
+              'Deterministic structural pre-check artifact (ADR-0020). Present after engine run. In shadow mode enforced=false and axes/aggregate still come from the cascade. Optional for older clients.',
+          },
           meta: {
             type: 'object',
             required: ['duration_ms', 'models_used', 'axes_evaluated', 'sandbox'],

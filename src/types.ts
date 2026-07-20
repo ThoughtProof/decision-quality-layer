@@ -178,6 +178,69 @@ export interface AggregateResult {
  * shows nano-solo oscillates on borderline cases, so DQL always runs the full
  * cascade to deliver reliable per-axis verdicts.
  */
+/**
+ * Rollout mode for the deterministic structural pre-check (ADR-0020).
+ * Default 'shadow': compute + attach, do not short-circuit the cascade.
+ * 'enforce': hard violations BLOCK before the LLM cascade runs.
+ */
+export type StructuralGateMode = 'shadow' | 'enforce';
+
+/** Typed granted scope for the structural pre-check. All fields optional. */
+export interface StructuralGranted {
+  max_amount?: number;
+  amount_currency?: string;
+  recipient?: string;
+  iban?: string;
+  allow_unlimited?: boolean;
+}
+
+/** Typed proposed action for the structural pre-check. All fields optional. */
+export interface StructuralProposed {
+  amount?: number;
+  amount_currency?: string;
+  recipient?: string;
+  iban?: string;
+  allowance?: string | number;
+}
+
+/** Optional caller-computed history evidence for the structural pre-check. */
+export interface StructuralHistory {
+  past_payments_to_same_counterparty?: number;
+  amount_variance_from_history?: number;
+}
+
+/**
+ * Machine-readable structured context (ADR-0020). Independent of free-text
+ * `context`. The pre-check only acts on complete field pairs; incomplete
+ * input stays silent and defers to the LLM axes.
+ */
+export interface DqlStructuredContext {
+  granted?: StructuralGranted;
+  proposed?: StructuralProposed;
+  history?: StructuralHistory;
+}
+
+export type StructuralViolationKind =
+  | 'amount_overshoot'
+  | 'recipient_mismatch'
+  | 'iban_mismatch'
+  | 'unlimited_approval'
+  | 'history_variance_break';
+
+export interface StructuralViolation {
+  kind: StructuralViolationKind;
+  detail: string;
+}
+
+/** Shadow/enforce artifact attached to every response that ran the pre-check. */
+export interface StructuralField {
+  mode: StructuralGateMode;
+  would_block: boolean;
+  enforced: boolean;
+  silent: boolean;
+  violations: StructuralViolation[];
+}
+
 export interface DqlRequest {
   /** Free-text description of the user's mandate / instruction. */
   mandate: string;
@@ -187,12 +250,23 @@ export interface DqlRequest {
   reasoning: string;
   /** Optional context — extra evidence, tool outputs, prior turns. */
   context?: string;
+  /**
+   * Optional machine-readable fields for the deterministic structural
+   * pre-check (ADR-0020). Free-text `context` is never parsed for this.
+   */
+  structured_context?: DqlStructuredContext;
+  /**
+   * Structural pre-check rollout mode. Default 'shadow'.
+   * 'enforce' short-circuits the cascade on hard binary violations only.
+   */
+  gate_mode?: StructuralGateMode;
   /** Which axes to evaluate. Defaults to all five. */
   axes?: Axis[];
   /**
    * If true, returns a deterministic mock response without running the cascade.
    * Used by developers to integrate against the API contract without incurring
    * calls or cost. Sandbox responses are marked with `meta.sandbox = true`.
+   * Structural enforce still applies before sandbox mock when gate_mode=enforce.
    */
   sandbox?: boolean;
 }
@@ -202,6 +276,13 @@ export interface DqlResponse {
   version: string;
   axes: AxisResult[];
   aggregate: AggregateResult;
+  /**
+   * Deterministic structural pre-check artifact (ADR-0020).
+   * Always present after engine run. In shadow mode `enforced` is false and
+   * the cascade still produced `axes` / `aggregate`. Callers may ignore this
+   * field without behavior change.
+   */
+  structural?: StructuralField;
   meta: {
     duration_ms: number;
     models_used: string[];
