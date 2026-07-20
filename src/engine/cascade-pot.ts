@@ -296,7 +296,12 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
   });
 
   if (p === 'PASS' && s === 'PASS') {
-    return merged('PASS', Math.min(primary.confidence, secondary.confidence), '[cascade] agreement PASS');
+    // Prefer the informative conf: if one side is degenerate 0, take the other.
+    return merged(
+      'PASS',
+      minInformative(primary.confidence, secondary.confidence),
+      '[cascade] agreement PASS',
+    );
   }
   if (p === 'FAIL' && s === 'FAIL') {
     return merged('FAIL', Math.max(primary.confidence, secondary.confidence), '[cascade] agreement FAIL');
@@ -317,6 +322,20 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
   }
   // Fallback (should be unreachable given the Verdict union).
   return merged('UNCERTAIN', 0, `[cascade] unhandled verdict pair ${p}↔${s}`);
+}
+
+/**
+ * Conservative min for agreement PASS — but do not let a degenerate 0 conf
+ * (model omit) zero out a real conf from the other draw. If both are 0,
+ * floor to 0.7 so the receipt never shows PASS · 0%.
+ */
+function minInformative(a: number, b: number): number {
+  const aOk = Number.isFinite(a) && a > 0;
+  const bOk = Number.isFinite(b) && b > 0;
+  if (aOk && bOk) return Math.min(a, b);
+  if (aOk) return a;
+  if (bOk) return b;
+  return 0.7;
 }
 
 function annotate(r: AxisResult, note: string): AxisResult {

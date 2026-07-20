@@ -308,6 +308,12 @@ describe('combineVerdicts (unit)', () => {
     expect(combineVerdicts(base('PASS', 0.9), base('PASS', 0.5)).confidence).toBe(0.5);
   });
 
+  it('PASS + PASS ignores degenerate 0 conf (no PASS@0%)', () => {
+    expect(combineVerdicts(base('PASS', 0.9), base('PASS', 0)).confidence).toBe(0.9);
+    expect(combineVerdicts(base('PASS', 0), base('PASS', 0.8)).confidence).toBe(0.8);
+    expect(combineVerdicts(base('PASS', 0), base('PASS', 0)).confidence).toBe(0.7);
+  });
+
   it('FAIL + FAIL = FAIL (max conf)', () => {
     expect(combineVerdicts(base('FAIL', 0.4), base('FAIL', 0.8)).confidence).toBe(0.8);
   });
