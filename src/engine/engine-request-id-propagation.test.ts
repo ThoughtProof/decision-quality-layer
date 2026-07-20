@@ -39,7 +39,7 @@ class CaptureCtxCascade implements Cascade {
   }
 }
 
-const req: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> = {
+const req: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> & Pick<DqlRequest, 'context' | 'structured_context' | 'gate_mode'> = {
   mandate: 'noop',
   proposed_action: 'noop',
   reasoning: 'noop',

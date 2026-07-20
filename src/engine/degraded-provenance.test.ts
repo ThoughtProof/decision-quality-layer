@@ -46,7 +46,7 @@ import {
 import type { CallContext } from './call-context.js';
 import type { DqlRequest } from '../types.js';
 
-const REQ: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> = {
+const REQ: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> & Pick<DqlRequest, 'context' | 'structured_context' | 'gate_mode'> = {
   mandate: 'noop',
   proposed_action: 'noop',
   reasoning: 'noop',

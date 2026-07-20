@@ -38,7 +38,7 @@ import type { CallContext } from './call-context.js';
 import { RuntimeDiagnosticsCollector } from './runtime-diagnostics.js';
 import type { DqlRequest } from '../types.js';
 
-const req: Required<Omit<DqlRequest, 'context'>> & Pick<DqlRequest, 'context'> = {
+const req: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> & Pick<DqlRequest, 'context' | 'structured_context' | 'gate_mode'> = {
   mandate: 'noop',
   proposed_action: 'noop',
   reasoning: 'noop',

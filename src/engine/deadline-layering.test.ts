@@ -25,8 +25,8 @@ const BINDING = {
 const ENV = { SERV_API_KEY: 'sk-test' } as NodeJS.ProcessEnv;
 
 function hangUntilAbort(): typeof fetch {
-  return ((_, init) =>
-    new Promise((_, reject) => {
+  return ((_url: RequestInfo | URL, init?: RequestInit) =>
+    new Promise<Response>((_, reject) => {
       const signal = init?.signal;
       if (!signal) return;
       if (signal.aborted) {
