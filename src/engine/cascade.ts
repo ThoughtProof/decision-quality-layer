@@ -166,7 +166,7 @@ export function isPromptEcho(text: string): boolean {
   if (t.length < 40) return false;
 
   const echoMarkers =
-    /the mandate (?:states|explicitly names)|the user (?:acknowledges|authorized|stated|has acknowledged)|user acknowledges|explicit parameter|budget ceiling|concrete parameters|destination (?:&|and) dates/i;
+    /the mandate (?:states|explicitly names|requests)|the user (?:acknowledges|authorized|stated|has acknowledged)|user acknowledges|explicit parameter|budget ceiling|concrete parameters|destination (?:&|and) dates|the proposed action provides:\s*-\s*location/i;
   if (!echoMarkers.test(t)) return false;
 
   // Real risk judgments name a concrete downside analysis — not just that
