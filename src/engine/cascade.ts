@@ -166,17 +166,23 @@ export function isPromptEcho(text: string): boolean {
   if (t.length < 40) return false;
 
   const echoMarkers =
-    /the mandate states|the user (?:acknowledges|authorized|stated)|user acknowledges|explicit parameter|budget ceiling:|duration:\s*one week|destination:\s*/i;
+    /the mandate (?:states|explicitly names)|the user (?:acknowledges|authorized|stated|has acknowledged)|user acknowledges|explicit parameter|budget ceiling|concrete parameters|destination (?:&|and) dates/i;
   if (!echoMarkers.test(t)) return false;
 
-  // Real risk/scope judgments usually contain at least one of these.
+  // Real risk judgments name a concrete downside analysis — not just that
+  // parameters were listed. "acknowledged the material down" alone is still echo.
   const judgmentMarkers =
-    /downside|risk profile|could go wrong|penalty|irreversib|cancel|material stakes|within budget|exceed|overshoot|counterparty|routine|low-stakes|high-stakes|weigh|objection/i;
-  if (judgmentMarkers.test(t)) return false;
+    /risk profile|could go wrong|cancellation (?:fee|penalt)|ordinary booking friction is not|routine travel booking|low-to-moderate stakes|weigh(?:ed|ing) against|no additional material downside|silence about risk is appropriate/i;
+  if (judgmentMarkers.test(t) && !/the mandate (?:states|explicitly names)/i.test(t.slice(0, 80))) {
+    return false;
+  }
 
-  // Mostly restating inputs: high density of mandate-echo phrases, little analysis.
-  const hits = (t.match(/mandate|acknowledges|budget ceiling|explicit parameter|the user/gi) || [])
-    .length;
+  // Mostly restating inputs: high density of mandate-echo phrases.
+  const hits = (
+    t.match(
+      /mandate|acknowledges|acknowledged|budget ceiling|explicit parameter|concrete parameters|the user|destination/gi,
+    ) || []
+  ).length;
   return hits >= 2;
 }
 
