@@ -136,7 +136,48 @@ ${raw}`)) {
     };
   }
 
+  // Prompt-echo / mandate restatement is not a judgment (Guardian 2026-07-21:
+  // Risk UNCERTAIN@0.78 with "The mandate states… The user acknowledges…").
+  // Cap conf below aggregation Rule 5 (0.7) and do NOT set provider_outcome
+  // so Rule 2 does not force REVIEW either. A single low-conf UNCERTAIN with
+  // clean content axes falls through to ALLOW.
+  if (verdict === 'UNCERTAIN' && !objection && isPromptEcho(reasoning)) {
+    return {
+      axis,
+      verdict: 'UNCERTAIN',
+      confidence: 0.4,
+      reasoning:
+        'Axis evaluation incomplete — model restated the mandate instead of judging this axis.',
+      objection: '',
+    };
+  }
+
   return { axis, verdict, confidence, reasoning, objection };
+}
+
+/**
+ * Detect mandate/prompt restatement that is not a decision-quality judgment.
+ * Typical garbage: "The mandate states: … The user acknowledges: - Budget…"
+ * without a downside analysis or concrete objection.
+ */
+export function isPromptEcho(text: string): boolean {
+  if (!text) return false;
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length < 40) return false;
+
+  const echoMarkers =
+    /the mandate states|the user (?:acknowledges|authorized|stated)|user acknowledges|explicit parameter|budget ceiling:|duration:\s*one week|destination:\s*/i;
+  if (!echoMarkers.test(t)) return false;
+
+  // Real risk/scope judgments usually contain at least one of these.
+  const judgmentMarkers =
+    /downside|risk profile|could go wrong|penalty|irreversib|cancel|material stakes|within budget|exceed|overshoot|counterparty|routine|low-stakes|high-stakes|weigh|objection/i;
+  if (judgmentMarkers.test(t)) return false;
+
+  // Mostly restating inputs: high density of mandate-echo phrases, little analysis.
+  const hits = (t.match(/mandate|acknowledges|budget ceiling|explicit parameter|the user/gi) || [])
+    .length;
+  return hits >= 2;
 }
 
 /** Detect policy/safety refusals that are not decision-quality judgments. */
