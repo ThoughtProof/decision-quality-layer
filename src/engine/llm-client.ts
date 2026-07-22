@@ -435,6 +435,12 @@ export function isResponseFormatRejected(body: string): boolean {
   return mentionsFormat && rejected;
 }
 
+/** Models known to reject response_format json_object without a schema. */
+export function modelRejectsJsonObjectResponseFormat(modelId: string): boolean {
+  const id = (modelId ?? '').toLowerCase();
+  return id === 'serv-swift' || id.endsWith('/serv-swift');
+}
+
 // -----------------------------------------------------------------------------
 // Retry-failure telemetry (v0.4.3.1 §C M1)
 //
@@ -1207,6 +1213,11 @@ export class HttpLlmClient implements LlmClient {
       max_completion_tokens: input.maxTokens ?? 512,
     };
 
+    // serv-swift rejects json_object without schema (OpenServ 400, 2026-07-22).
+    // Skip the doomed first hop for known-reject models so we don't burn
+    // attempt budget on a guaranteed 400 before the real completion call.
+    const preferResponseFormat = !modelRejectsJsonObjectResponseFormat(binding.modelId);
+
     const postOnce = async (includeResponseFormat: boolean): Promise<Response> => {
       const body: Record<string, unknown> = includeResponseFormat
         ? { ...baseBody, response_format: { type: 'json_object' } }
@@ -1224,10 +1235,10 @@ export class HttpLlmClient implements LlmClient {
 
     let response: Response;
     try {
-      response = await postOnce(true);
+      response = await postOnce(preferResponseFormat);
       if (!response.ok && response.status === 400) {
         const errBody = await response.text().catch(() => '');
-        if (isResponseFormatRejected(errBody)) {
+        if (preferResponseFormat && isResponseFormatRejected(errBody)) {
           // Same attempt timeout/signal; only drop response_format.
           response = await postOnce(false);
           if (!response.ok) {
