@@ -410,6 +410,31 @@ function remainingMs(deadlineAt?: number): number | undefined {
   return deadlineAt - Date.now();
 }
 
+/**
+ * OpenServ/SERV returns HTTP 400 for some models (notably serv-swift) when
+ * `response_format: { type: 'json_object' }` is sent without a schema:
+ *   "response_format `json_object` is not enforced for model `serv-swift`
+ *    and no schema was provided to promote it"
+ * Detect that class of rejection so we can retry once without the field.
+ * Exported for unit tests.
+ */
+export function isResponseFormatRejected(body: string): boolean {
+  const s = (body ?? '').toLowerCase();
+  if (!s) return false;
+  const mentionsFormat =
+    s.includes('response_format') ||
+    s.includes('json_object') ||
+    s.includes('json mode');
+  const rejected =
+    s.includes('not enforced') ||
+    s.includes('unsupported') ||
+    s.includes('not supported') ||
+    s.includes('unknown parameter') ||
+    s.includes('invalid') ||
+    s.includes('no schema');
+  return mentionsFormat && rejected;
+}
+
 // -----------------------------------------------------------------------------
 // Retry-failure telemetry (v0.4.3.1 §C M1)
 //
@@ -1164,43 +1189,77 @@ export class HttpLlmClient implements LlmClient {
     if (ctx?.requestSignal) signals.push(ctx.requestSignal);
     const combined = combineAbortSignals(signals);
 
-    let response: Response;
-    try {
-      response = await this.fetchImpl(`${binding.baseUrl}/chat/completions`, {
+    // Deterministic decoding — matches Sentinel cascade (temp 0 / seed 42).
+    // SERV requires max_completion_tokens (not legacy max_tokens).
+    // JSON mode: try response_format first. Some SERV models (notably
+    // serv-swift as of 2026-07-22) reject json_object with HTTP 400
+    // "not enforced … no schema". Fall back once without response_format
+    // and let parseAxisResponse handle fenced/plain JSON (probe 2026-07-18
+    // showed swift output is still valid JSON without the field).
+    const baseBody: Record<string, unknown> = {
+      model: binding.modelId,
+      messages: [
+        { role: 'system', content: input.system },
+        { role: 'user', content: input.user },
+      ],
+      temperature: 0,
+      seed: 42,
+      max_completion_tokens: input.maxTokens ?? 512,
+    };
+
+    const postOnce = async (includeResponseFormat: boolean): Promise<Response> => {
+      const body: Record<string, unknown> = includeResponseFormat
+        ? { ...baseBody, response_format: { type: 'json_object' } }
+        : { ...baseBody };
+      return this.fetchImpl(`${binding.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({
-          model: binding.modelId,
-          messages: [
-            { role: 'system', content: input.system },
-            { role: 'user', content: input.user },
-          ],
-          // Deterministic decoding — matches Sentinel's cascade (temperature: 0,
-          // seed: 42). The DQL orthogonality spike was itself run through the
-          // pot-cli grader at temp 0 / seed 42; running the live cascade at 0.1
-          // without a seed would reintroduce exactly the verdict non-determinism
-          // that the Sentinel RCA (2026-07-08) tracked down. Keep it pinned.
-          temperature: 0,
-          seed: 42,
-          // SERV (openserv.ai) requires 'max_completion_tokens', not the legacy
-          // 'max_tokens' (returns HTTP 400 unsupported_parameter otherwise).
-          max_completion_tokens: input.maxTokens ?? 512,
-          // JSON mode: SERV (openserv.ai) is OpenAI-compatible and accepts
-          // response_format. If a model rejects the field we fall back to plain
-          // text and let parseAxisResponse handle it.
-          response_format: { type: 'json_object' },
-        }),
+        body: JSON.stringify(body),
         signal: combined.signal,
       });
+    };
+
+    let response: Response;
+    try {
+      response = await postOnce(true);
+      if (!response.ok && response.status === 400) {
+        const errBody = await response.text().catch(() => '');
+        if (isResponseFormatRejected(errBody)) {
+          // Same attempt timeout/signal; only drop response_format.
+          response = await postOnce(false);
+          if (!response.ok) {
+            const body2 = await response.text().catch(() => '');
+            throw new ProviderCallError(
+              `[llm-client] ${binding.provider} ${response.status}: ${body2.slice(0, 500)}`,
+              binding.provider,
+              response.status,
+            );
+          }
+        } else {
+          throw new ProviderCallError(
+            `[llm-client] ${binding.provider} ${response.status}: ${errBody.slice(0, 500)}`,
+            binding.provider,
+            response.status,
+          );
+        }
+      } else if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new ProviderCallError(
+          `[llm-client] ${binding.provider} ${response.status}: ${body.slice(0, 500)}`,
+          binding.provider,
+          response.status,
+        );
+      }
     } catch (err) {
       // A failed fetch is a provider-interaction failure. Preserve the
       // original message verbatim so RETRYABLE_PATTERN / categorizeFailure /
       // existing message-regex tests behave exactly as before; only the error
       // TYPE changes (→ ProviderCallError) so the engine can attribute
       // structured provider provenance without string-parsing.
+      if (err instanceof ProviderCallError) throw err;
       if (err instanceof Error && err.name === 'AbortError') {
         // Whole-request abort is non-retryable.
         if (ctx?.requestSignal?.aborted && !timedOutByAttempt) {
@@ -1225,15 +1284,6 @@ export class HttpLlmClient implements LlmClient {
     } finally {
       clearTimeout(timeout);
       combined.cleanup();
-    }
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new ProviderCallError(
-        `[llm-client] ${binding.provider} ${response.status}: ${body.slice(0, 500)}`,
-        binding.provider,
-        response.status,
-      );
     }
 
     const json = (await response.json()) as {
