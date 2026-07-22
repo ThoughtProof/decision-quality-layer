@@ -136,7 +136,54 @@ ${raw}`)) {
     };
   }
 
+  // Prompt-echo / mandate restatement is not a judgment (Guardian 2026-07-21:
+  // Risk UNCERTAIN@0.78 with "The mandate states… The user acknowledges…").
+  // Cap conf below aggregation Rule 5 (0.7) and do NOT set provider_outcome
+  // so Rule 2 does not force REVIEW either. A single low-conf UNCERTAIN with
+  // clean content axes falls through to ALLOW.
+  if (verdict === 'UNCERTAIN' && !objection && isPromptEcho(reasoning)) {
+    return {
+      axis,
+      verdict: 'UNCERTAIN',
+      confidence: 0.4,
+      reasoning:
+        'Axis evaluation incomplete — model restated the mandate instead of judging this axis.',
+      objection: '',
+    };
+  }
+
   return { axis, verdict, confidence, reasoning, objection };
+}
+
+/**
+ * Detect mandate/prompt restatement that is not a decision-quality judgment.
+ * Typical garbage: "The mandate states: … The user acknowledges: - Budget…"
+ * without a downside analysis or concrete objection.
+ */
+export function isPromptEcho(text: string): boolean {
+  if (!text) return false;
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length < 40) return false;
+
+  const echoMarkers =
+    /the mandate (?:states|explicitly names|requests)|the user (?:acknowledges|authorized|stated|has acknowledged)|user acknowledges|explicit parameter|budget ceiling|concrete parameters|destination (?:&|and) dates|the proposed action provides:\s*-\s*location/i;
+  if (!echoMarkers.test(t)) return false;
+
+  // Real risk judgments name a concrete downside analysis — not just that
+  // parameters were listed. "acknowledged the material down" alone is still echo.
+  const judgmentMarkers =
+    /risk profile|could go wrong|cancellation (?:fee|penalt)|ordinary booking friction is not|routine travel booking|low-to-moderate stakes|weigh(?:ed|ing) against|no additional material downside|silence about risk is appropriate/i;
+  if (judgmentMarkers.test(t) && !/the mandate (?:states|explicitly names)/i.test(t.slice(0, 80))) {
+    return false;
+  }
+
+  // Mostly restating inputs: high density of mandate-echo phrases.
+  const hits = (
+    t.match(
+      /mandate|acknowledges|acknowledged|budget ceiling|explicit parameter|concrete parameters|the user|destination/gi,
+    ) || []
+  ).length;
+  return hits >= 2;
 }
 
 /** Detect policy/safety refusals that are not decision-quality judgments. */

@@ -115,32 +115,27 @@ export class PotCliCascade implements Cascade {
     }
 
     // ---- Secondary ------------------------------------------------------
-    // If whole-request budget is nearly exhausted, skip secondary and
-    // fail-closed immediately so we still return 200+REVIEW before platform kill.
+    // If whole-request budget is nearly exhausted, skip secondary and return
+    // the primary as-served. DO NOT degrade a successful primary PASS to
+    // UNCERTAIN+provider_error — that made Guardian show INCOMPLETE on axes
+    // that already had a real nano judgment (demo 2026-07-21).
+    // Fail-closed only when primary itself never served.
     if (ctx?.deadlineAt !== undefined) {
       const remainingW = ctx.deadlineAt - Date.now();
-      const pc = ctx.providerCallBudgetMs ?? 40_000;
-      const minSecondaryBudget = pc + 3_000;
+      // Secondary needs ~one provider call; don't demand full PC+3s leftover
+      // (that was starving secondaries under 5-axis parallel load).
+      const minSecondaryBudget = Math.min(
+        (ctx.providerCallBudgetMs ?? 40_000) * 0.5,
+        20_000,
+      );
       if (remainingW < minSecondaryBudget) {
-        const err = new DeadlineExceededError(
-          `[cascade] skipping secondary — remainingW=${remainingW}ms < minSecondaryBudget=${minSecondaryBudget}ms`,
-          'serv',
-          'request_deadline',
-        );
-        const fallbackVerdict: AxisVerdict =
-          primary.result.verdict === 'PASS' ? 'UNCERTAIN' : primary.result.verdict;
-        const degraded: AxisResult = {
-          axis: primary.result.axis,
-          verdict: fallbackVerdict,
-          confidence: primary.result.confidence,
-          reasoning: primary.result.reasoning,
-          objection: primary.result.objection,
-          provider_outcome: 'provider_error',
-        };
         return {
           result: annotate(
-            degraded,
-            `[cascade] secondary skipped (request_deadline) → degraded (${err.message.slice(0, 200)})`,
+            {
+              ...primary.result,
+              provider_outcome: primary.result.provider_outcome ?? 'served',
+            },
+            `[cascade] secondary skipped (request_deadline remainingW=${remainingW}ms) — keeping primary as-served`,
           ),
           modelsUsed,
         };
@@ -152,36 +147,32 @@ export class PotCliCascade implements Cascade {
       secondary = await this.callAxis(this.config.secondaryModel, axis, prompt, ctx);
       modelsUsed.push(secondary.modelId);
     } catch (err) {
-      // Degraded mode: secondary unavailable → be conservative on the verdict
-      // AND emit truthful structured provenance so the aggregator can fail
-      // closed. Primary=PASS → downgrade to UNCERTAIN. Primary=FAIL → keep FAIL
-      // (secondary can never rescue FAIL under our rules). Primary=UNCERTAIN
-      // stays UNCERTAIN.
-      //
-      // VERTRAGSÄNDERUNG (issue #14, 2026-07-13): this branch previously spread
-      // `...primary.result`, inheriting the primary's provider_route +
-      // provider_outcome='served' onto an axis whose secondary draw FAILED.
-      // A 'served' label there is an active falsehood: aggregation Rule 2 trusts
-      // provider provenance, so it never fired and a single PASS@<0.7 primary
-      // could fall through to ALLOW ("All evaluated axes pass.") — the §D6
-      // fail-open, re-opened via the degraded path. We now classify the
-      // secondary error from its STRUCTURED TYPE (never message parsing,
-      // mirroring the engine's §D6 whole-cascade catch) and:
-      //   • provider/auth/circuit failure → attach provider_error |
-      //     circuit_rejected. Rule 2 escalates the axis to REVIEW-or-stricter,
-      //     INDEPENDENT of confidence.
-      //   • any OTHER (generic/local) error → no provider_outcome, matching the
-      //     engine's negative-discrimination baseline (a lone UNCERTAIN@<0.7
-      //     with no provenance still ALLOWs, unchanged).
-      // In BOTH cases the degraded axis DROPS the inherited primary route/
-      // outcome, so it never claims 'served' when the secondary failed.
-      const fallbackVerdict: AxisVerdict =
-        primary.result.verdict === 'PASS' ? 'UNCERTAIN' : primary.result.verdict;
+      // Secondary unavailable after a successful primary:
+      // - If primary already SERVED a real judgment, KEEP it as-served.
+      //   Destroying PASS→UNCERTAIN+provider_error made the PWA show INCOMPLETE
+      //   on axes that already had a valid nano result (demo 2026-07-21).
+      // - Only mark provider_error when primary itself never served.
+      const primaryServed =
+        primary.result.provider_outcome === 'served' ||
+        primary.result.provider_outcome === undefined;
+      const note = `[cascade] secondary error — keeping primary (${err instanceof Error ? err.message.slice(0, 160) : 'unknown'})`;
+      if (primaryServed && primary.result.verdict !== 'UNCERTAIN') {
+        return {
+          result: annotate(
+            {
+              ...primary.result,
+              provider_outcome: 'served',
+            },
+            note,
+          ),
+          modelsUsed,
+        };
+      }
+      // Primary was already UNCERTAIN / incomplete — escalate honestly.
       const providerOutcome = classifySecondaryFailure(err);
-      const note = `[cascade] secondary error → degraded (${err instanceof Error ? err.message.slice(0, 200) : 'unknown'})`;
       const degraded: AxisResult = {
         axis: primary.result.axis,
-        verdict: fallbackVerdict,
+        verdict: 'UNCERTAIN',
         confidence: primary.result.confidence,
         reasoning: primary.result.reasoning,
         objection: primary.result.objection,

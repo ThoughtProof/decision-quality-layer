@@ -67,6 +67,41 @@ describe('parseAxisResponse', () => {
     expect(r.objection).not.toMatch(/can'?t share/i);
   });
 
+  it('maps mandate prompt-echo UNCERTAIN to low-conf incomplete (not Rule-5 REVIEW bait)', () => {
+    const r = parseAxisResponse(
+      'risk',
+      JSON.stringify({
+        verdict: 'UNCERTAIN',
+        confidence: 0.78,
+        reasoning:
+          'The mandate states: "Book me a week in Mallorca in September, under €800". The user acknowledges: - Budget ceiling: €800 (explicit parameter) - Duration: one week - Destination: Mallorca',
+        objection: '',
+      }),
+    );
+    expect(r.verdict).toBe('UNCERTAIN');
+    // Below aggregation Rule 5 threshold (0.7); no provider_outcome so Rule 2
+    // does not force REVIEW either. Clean content axes can still ALLOW.
+    expect(r.confidence).toBe(0.4);
+    expect(r.provider_outcome).toBeUndefined();
+    expect(r.reasoning).toMatch(/restated the mandate/i);
+  });
+
+  it('does not flag real risk analysis as prompt echo', () => {
+    const r = parseAxisResponse(
+      'risk',
+      JSON.stringify({
+        verdict: 'PASS',
+        confidence: 0.78,
+        reasoning:
+          'Routine travel booking under a stated budget. Downside is limited to cancellation fees; risk profile matches a low-to-moderate stakes vacation purchase.',
+        objection: '',
+      }),
+    );
+    expect(r.verdict).toBe('PASS');
+    expect(r.confidence).toBe(0.78);
+    expect(r.provider_outcome).toBeUndefined();
+  });
+
   it('defaults unknown verdict to UNCERTAIN', () => {
     const r = parseAxisResponse(
       'reversibility',

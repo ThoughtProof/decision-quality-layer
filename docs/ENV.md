@@ -42,22 +42,45 @@ Set these in the Vercel dashboard for `dql.thoughtproof.ai`:
 ```
 DQL_CASCADE=pot-cli
 SERV_API_KEY=serv_...
+DQL_API_KEYS={"dqlk_...":{"owner":"raul","dev_access":true,"daily_cap":500}}
 ```
 
-Non-cascade variables (payment, rate-limit) land in Phase 2 and will be
-added to this table as they ship.
+## Auth / billing gate (Phase 2 key layer)
+
+Enforced on every non-sandbox `POST /dql/verify` (see `docs/PAYMENT.md`).
+
+| Variable | Required | Effect |
+|----------|----------|--------|
+| `DQL_API_KEYS` | **yes in prod** for live calls | JSON object of API keys. Empty / unset → every non-sandbox call returns **402 PAYMENT_REQUIRED** (fail-closed). Format: `{"dqlk_<hex>":{"owner":"name","dev_access":true,"daily_cap":500}}`. `dev_access:true` → free (manual grant). `dev_access:false` → billable (Stripe/x402 meter rails TBD; usage line already emitted). |
+| `UPSTASH_REDIS_REST_URL` | optional | Daily-cap brake + usage counter. Absent → cap enforcement disabled (key validation still active). |
+| `UPSTASH_REDIS_REST_TOKEN` | optional | Pair with URL above. |
+
+Header: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or `Authorization: Bearer dqlk_...`.
+
+Sandbox (`{"sandbox":true}`) stays free and keyless.
+
+**Deploy order:** set `DQL_API_KEYS` on Vercel **before** shipping the gate-enabled code, then update clients (extension, guardian-pwa, live drills) with real keys. Shipping the gate with an empty registry locks out all live traffic.
 
 ## Local development
 
-Simplest reproducible dev setup — no keys required:
+Simplest reproducible dev setup — sandbox only, no keys required:
 
 ```bash
 DQL_CASCADE=stub npx vercel dev
+# then POST with {"sandbox": true, ...}
 ```
 
-To exercise the real cascade locally, drop the two keys into `.env.local`
-and set `DQL_CASCADE=pot-cli`. `.env.local` is gitignored by the default
-Vercel template.
+For non-sandbox local calls:
+
+```bash
+export DQL_API_KEYS='{"dqlk_dev":{"owner":"local","dev_access":true,"daily_cap":1000}}'
+DQL_CASCADE=stub npx vercel dev
+# header: X-DQL-Key: dqlk_dev
+```
+
+To exercise the real cascade locally, also drop `SERV_API_KEY` into
+`.env.local` and set `DQL_CASCADE=pot-cli`. `.env.local` is gitignored by
+the default Vercel template.
 
 ## Auditing what a call used
 
