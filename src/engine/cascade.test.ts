@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseAxisResponse, StubCascade } from './cascade.js';
+import { parseAxisResponse, StubCascade, isConsistencyChecklistMatch, isMaterialImmediateSettle, isModelRefusal } from './cascade.js';
 
 describe('parseAxisResponse', () => {
   it('parses clean JSON', () => {
@@ -126,5 +126,74 @@ describe('StubCascade', () => {
     });
     expect(out.result.verdict).toBe('UNCERTAIN');
     expect(out.modelsUsed).toEqual(['stub']);
+  });
+});
+
+
+describe('calib helpers FAR/FBR', () => {
+  it('detects bare refusal objection alone', () => {
+    expect(isModelRefusal("I can't share that.")).toBe(true);
+    const r = parseAxisResponse(
+      'reversibility',
+      JSON.stringify({
+        verdict: 'UNCERTAIN',
+        confidence: 0.98,
+        reasoning: 'Long analysis about payroll windows and history signals that is not itself a refusal.',
+        objection: "I can't share that.",
+      }),
+    );
+    expect(r.confidence).toBe(0);
+    expect(r.provider_outcome).toBe('provider_error');
+    expect(r.objection).toMatch(/refusal/i);
+  });
+
+  it('rewrites consistency checklist dump UNCERTAIN → PASS', () => {
+    const dump = `# CONSISTENCY VERIFICATION
+
+## STEP 1 — Direct Execution Check
+
+**Mandate parameters:**
+- Action: Draft a follow-up email
+- Recipient: the customer
+
+**Proposed action parameters:**
+- action: email.create_draft ✓
+- send_immediately: false ✓
+- save_to: drafts_folder ✓
+
+Checklist: Action match ✓ Recipient match ✓ No send ✓
+`;
+    expect(isConsistencyChecklistMatch(dump)).toBe(true);
+    const r = parseAxisResponse(
+      'consistency',
+      JSON.stringify({
+        verdict: 'UNCERTAIN',
+        confidence: 0.86,
+        reasoning: dump,
+        objection: dump,
+      }),
+    );
+    expect(r.verdict).toBe('PASS');
+    expect(r.objection).toBe('');
+  });
+
+  it('floors material immediate settle reversibility conf to trigger REVIEW', () => {
+    expect(
+      isMaterialImmediateSettle(
+        'Human confirmation is required before executing an immediate market sell that settles externally',
+      ),
+    ).toBe(true);
+    const r = parseAxisResponse(
+      'reversibility',
+      JSON.stringify({
+        verdict: 'UNCERTAIN',
+        confidence: 0.55,
+        reasoning: 'Immediate market order at material size.',
+        objection:
+          'Human confirmation is required before executing an immediate market sell that settles externally; no cancel window.',
+      }),
+    );
+    expect(r.verdict).toBe('UNCERTAIN');
+    expect(r.confidence).toBeGreaterThanOrEqual(0.75);
   });
 });

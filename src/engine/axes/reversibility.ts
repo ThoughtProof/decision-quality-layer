@@ -91,8 +91,15 @@ ROUTINE AUTHORIZED SCHEDULED PATH → PASS when ALL of the following hold:
      - payroll/HR match signals (hr_record_matches_iban + employee_active_status / payroll_cycle_matches_schedule) with recurring history
      - engagement_letter_signed + invoice_matches_engagement_letter + micro_payment_history / prior payments to same IBAN
   4. NOT adversarial: no immediate_irrevocable+unverifiable-urgency pattern; no verb mismatch.
+  5. NOT a material one-shot escalate shape. HARD EXCLUSIONS from this PASS path (stay on STEP 1c → UNCERTAIN):
+     - Mandate or context signals URGENT / due today / deadline_date_matches_today / urgency_verifiable_via_contract_date for a non-routine spike (even with history).
+     - action is trading.market_order / market sell/buy / execution:immediate / settles externally with no cancel window.
+     - amount is material AND the flow is a one-shot deadline payment rather than a recurring cycle (payroll/SaaS/invoice-recurring/refund-playbook).
+     - "URGENT: pay … due today" class mandates → UNCERTAIN (human go-button), even if past_payments ≥ 3 and a short execution_window exists.
 
 Why PASS here: the user authorized this recurring/playbook operation, the agent uses a cancellable schedule window (undo before settlement), and history/playbook evidence shows this is the established path — forcing a human go-button on every routine payroll/invoice destroys the product's ALLOW state. Reversibility is about commitment shape fitness, not re-asking the human for every authorized cycle.
+
+Why NOT PASS on URGENT €4200 due-today or immediate market sells: history does not convert a material escalate into routine ALLOW. Those stay STEP 1c UNCERTAIN.
 
 Examples that MUST be PASS under this path (not UNCERTAIN):
   * "Pay the monthly cloud infrastructure invoice" + payment.schedule €42.90 same IBAN ×11, variance 0, execution_window_hours=24 → PASS
@@ -109,6 +116,8 @@ Examples that still trigger STEP 1c → UNCERTAIN (escalate / human go-button):
   * "transfer 500 EUR to Anna…" one-off mandate-matching WITHOUT schedule window AND WITHOUT relationship history → UNCERTAIN unless already a held authorization awaiting confirm.
   * "Launch the Q3 product announcement email campaign" mandate-matching → UNCERTAIN.
   * payment.send / immediate_irrevocable external settle with no cancel window → UNCERTAIN or adversarial FAIL.
+  * "URGENT: pay Provider X — invoice due today per contract clause 4.2" + €4200 + history ×12 + 4h window → UNCERTAIN (material escalate; verified urgency ≠ auto-ALLOW).
+  * "Reduce our position in TICKER_X by 30%" + trading.market_order immediate $180k → UNCERTAIN (market impact / external settle; not routine scheduled path).
 
 Do NOT return PASS on a binding travel booking / consumer checkout / one-off external payment merely because the mandate used the verb "book"/"buy"/"pay". That is the classic demo failure mode.
 DO return PASS on mandate-explicit routine scheduled payments/renewals/refunds/payroll when cancellable window + history/playbook evidence are present.
