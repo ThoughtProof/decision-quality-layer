@@ -36,7 +36,11 @@
 import type { AxisPrompt } from './axes/types.js';
 import type { AxisResult, Axis, AxisVerdict } from '../types.js';
 import type { Cascade, CascadeInput, CascadeOutput } from './cascade.js';
-import { parseAxisResponse } from './cascade.js';
+import {
+  parseAxisResponse,
+  isModelRefusal,
+  isConsistencyChecklistMatch,
+} from './cascade.js';
 import type { LlmClient } from './llm-client.js';
 import {
   HttpLlmClient,
@@ -305,6 +309,24 @@ export function combineVerdicts(primary: AxisResult, secondary: AxisResult): Axi
     );
   }
   if (p === 'UNCERTAIN' || s === 'UNCERTAIN') {
+    // Lane-A FBR fix: primary PASS + secondary checklist-dump/refusal UNCERTAIN
+    // must not force REVIEW. Secondary often emits STEP-1 match prose as
+    // unparsed/uncertain while primary already judged PASS correctly.
+    const uncertainSide = p === 'UNCERTAIN' ? primary : secondary;
+    const passSide = p === 'PASS' ? primary : s === 'PASS' ? secondary : null;
+    const uncertainBlob = `${uncertainSide.reasoning}\n${uncertainSide.objection}`;
+    const uncertainIsNoise =
+      uncertainSide.provider_outcome === 'provider_error' ||
+      isModelRefusal(uncertainBlob) ||
+      isConsistencyChecklistMatch(uncertainBlob) ||
+      /Could not parse model output as JSON/i.test(uncertainSide.reasoning);
+    if (passSide && uncertainIsNoise) {
+      return merged(
+        'PASS',
+        Math.max(passSide.confidence, 0.7),
+        `[cascade] PASS kept — counterpart UNCERTAIN was checklist/refusal/parse noise (${p}↔${s})`,
+      );
+    }
     return merged(
       'UNCERTAIN',
       Math.max(primary.confidence, secondary.confidence),
