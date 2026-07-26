@@ -200,7 +200,16 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
 
   const axisResults: AxisResult[] = perAxis.map((p) => p.result);
   const modelsUsed = uniqueStrings(perAxis.flatMap((p) => p.modelsUsed));
-  const aggregateResult = aggregate(axisResults);
+  let aggregateResult = aggregate(axisResults);
+
+  // Principal materiality ceiling (autonomy bound): amount >= ceiling → REVIEW.
+  // Independent of history/schedule/recurrence. Not a carve-out list — the
+  // principal sets the bound; the gate enforces. Distinct from max_amount
+  // (authorization). Does not BLOCK — human go-button only.
+  aggregateResult = applyMaterialityCeiling(
+    aggregateResult,
+    input.request.structured_context,
+  );
 
   emitStructuralMetrics({
     requestId: input.requestId,
@@ -337,4 +346,50 @@ function buildEnforcedBlockResponse(args: {
 
 function uniqueStrings(xs: string[]): string[] {
   return Array.from(new Set(xs));
+}
+
+/**
+ * Principal materiality ceiling (autonomy bound).
+ *
+ * When structured_context supplies both:
+ *   granted.materiality_ceiling  (principal policy)
+ *   proposed.amount              (action size)
+ * and amount >= ceiling, escalate ALLOW → REVIEW.
+ *
+ * Design (not case carve-outs):
+ * - Boundary comes from the principal, not the gate's gut feel.
+ * - Independent of history / schedule / recurrence labels.
+ * - Distinct from max_amount (authorization). Ceiling = autonomy.
+ * - Never hard-BLOCKs — human go-button only.
+ * - Silent when fields incomplete (fail toward silence).
+ * - Never weakens a stricter aggregate (BLOCK/REVIEW stay).
+ */
+export function applyMaterialityCeiling(
+  aggregateResult: AggregateResult,
+  structured?: DqlRequest['structured_context'],
+): AggregateResult {
+  if (!structured) return aggregateResult;
+  const ceiling = structured.granted?.materiality_ceiling;
+  const amount = structured.proposed?.amount;
+  if (
+    typeof ceiling !== 'number' ||
+    !Number.isFinite(ceiling) ||
+    ceiling < 0 ||
+    typeof amount !== 'number' ||
+    !Number.isFinite(amount)
+  ) {
+    return aggregateResult;
+  }
+  if (amount < ceiling) return aggregateResult;
+  // Already at least REVIEW — leave alone (BLOCK/REVIEW unchanged).
+  if (aggregateResult.verdict !== 'ALLOW') return aggregateResult;
+  return {
+    verdict: 'REVIEW',
+    confidence: Math.max(aggregateResult.confidence, 0.85),
+    triggered_by: aggregateResult.triggered_by,
+    rationale:
+      `Materiality ceiling exceeded: proposed amount ${amount} >= principal ceiling ${ceiling}. ` +
+      `Autonomy bound requires human go-button (REVIEW), independent of history/schedule. ` +
+      `(Prior cascade aggregate was ALLOW.)`,
+  };
 }

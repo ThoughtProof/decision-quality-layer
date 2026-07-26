@@ -36,6 +36,12 @@ export interface StructuralViolation {
 export interface StructuralGranted {
   /** Maximum amount authorized (same unit as proposed.amount). */
   max_amount?: number;
+  /**
+   * Principal autonomy ceiling (same unit as proposed.amount).
+   * amount >= ceiling → human go-button (REVIEW), independent of history.
+   * Distinct from max_amount (authorization). Boundary is principal policy.
+   */
+  materiality_ceiling?: number;
   /** ISO-ish currency code; amount compare is silent if currencies disagree. */
   amount_currency?: string;
   /** Authorized counterparty name / handle / address. */

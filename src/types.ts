@@ -188,6 +188,14 @@ export type StructuralGateMode = 'shadow' | 'enforce';
 /** Typed granted scope for the structural pre-check. All fields optional. */
 export interface StructuralGranted {
   max_amount?: number;
+  /**
+   * Principal autonomy ceiling (same unit as proposed.amount).
+   * When proposed.amount >= materiality_ceiling, the gate MUST escalate to
+   * human review (REVIEW) even if mandate/history/schedule would otherwise
+   * allow. Distinct from max_amount (authorization bound): ceiling is the
+   * autonomy bound. Boundary comes from the principal; the gate enforces.
+   */
+  materiality_ceiling?: number;
   amount_currency?: string;
   recipient?: string;
   iban?: string;

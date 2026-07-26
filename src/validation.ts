@@ -149,6 +149,20 @@ function parseGranted(
     const n = requireFiniteNumber(o.max_amount, 'structured_context.granted.max_amount', errors);
     if (n !== undefined) g.max_amount = n;
   }
+  if (o.materiality_ceiling !== undefined) {
+    const n = requireFiniteNumber(
+      o.materiality_ceiling,
+      'structured_context.granted.materiality_ceiling',
+      errors,
+    );
+    if (n !== undefined) {
+      if (n < 0) {
+        errors.push('structured_context.granted.materiality_ceiling must be >= 0');
+      } else {
+        g.materiality_ceiling = n;
+      }
+    }
+  }
   if (o.amount_currency !== undefined) {
     const s = requireNonEmptyString(
       o.amount_currency,
