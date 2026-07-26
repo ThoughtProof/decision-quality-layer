@@ -196,9 +196,11 @@ export function isConsistencyChecklistMatch(text: string): boolean {
   const hasChecklist =
     /STEP 1|Direct Execution Check|Mandate parameters|Proposed action parameters/i.test(t);
   const checkmarks = (t.match(/[✓✔]|\bPASS\b|\bmatch(?:es|ed)?\b|\balign(?:s|ed)?\b/gi) || []).length;
+  // NOTE: do NOT match bare "inconsisten" — that false-positives on the word CONSISTENCY.
   const contradiction =
-    /\bcontradict|does not follow|non-sequitur|\bmismatch\b|inconsisten/i.test(t) &&
-    !/no contradiction|without contradiction|no mismatch/i.test(t);
+    /\bcontradict(?:s|ed|ion|ory)?\b|does not follow|non-sequitur|\bmismatch(?:es|ed)?\b|\binconsistent\b/i.test(
+      t,
+    ) && !/no contradiction|without contradiction|no mismatch|not inconsistent/i.test(t);
   // Heuristic: structured match dump with multiple positive markers, no real break
   return hasChecklist && checkmarks >= 2 && !contradiction;
 }
