@@ -196,6 +196,13 @@ export interface StructuralGranted {
    * autonomy bound. Boundary comes from the principal; the gate enforces.
    */
   materiality_ceiling?: number;
+  /**
+   * Principal autonomy ceiling for shared finite resources (0–1 fraction).
+   * When proposed.shared_resource_fraction >= ceiling, escalate ALLOW→REVIEW.
+   * Covers non-monetary blast radius: API quota, rate budget, seat pool, etc.
+   * Budget-affordable ≠ undoable. Boundary from principal; gate enforces.
+   */
+  shared_resource_fraction_ceiling?: number;
   amount_currency?: string;
   recipient?: string;
   iban?: string;
@@ -205,6 +212,11 @@ export interface StructuralGranted {
 /** Typed proposed action for the structural pre-check. All fields optional. */
 export interface StructuralProposed {
   amount?: number;
+  /**
+   * Fraction of a shared finite resource this action consumes (0–1),
+   * e.g. monthly API quota, concurrent seat pool, rate budget.
+   */
+  shared_resource_fraction?: number;
   amount_currency?: string;
   recipient?: string;
   iban?: string;

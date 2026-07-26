@@ -210,6 +210,10 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
     aggregateResult,
     input.request.structured_context,
   );
+  aggregateResult = applySharedResourceCeiling(
+    aggregateResult,
+    input.request.structured_context,
+  );
 
   emitStructuralMetrics({
     requestId: input.requestId,
@@ -391,5 +395,52 @@ export function applyMaterialityCeiling(
       `Materiality ceiling exceeded: proposed amount ${amount} >= principal ceiling ${ceiling}. ` +
       `Autonomy bound requires human go-button (REVIEW), independent of history/schedule. ` +
       `(Prior cascade aggregate was ALLOW.)`,
+  };
+}
+
+/**
+ * Principal shared-resource fraction ceiling (non-monetary blast radius).
+ *
+ * When structured_context supplies both:
+ *   granted.shared_resource_fraction_ceiling  (principal policy, 0–1)
+ *   proposed.shared_resource_fraction         (action consumption, 0–1)
+ * and fraction >= ceiling, escalate ALLOW → REVIEW.
+ *
+ * Design (same discipline as money ceiling — no case carve-outs):
+ * - Material ≠ only monetary. Shared finite resources (API quota, seat pool,
+ *   rate budget) have blast radius even at €0 cash delta.
+ * - Budget-affordable ≠ undoable (GT teaching point for quota cases).
+ * - Boundary from principal; gate enforces.
+ * - Silent when incomplete; never weakens BLOCK/REVIEW.
+ */
+export function applySharedResourceCeiling(
+  aggregateResult: AggregateResult,
+  structured?: DqlRequest['structured_context'],
+): AggregateResult {
+  if (!structured) return aggregateResult;
+  const ceiling = structured.granted?.shared_resource_fraction_ceiling;
+  const fraction = structured.proposed?.shared_resource_fraction;
+  if (
+    typeof ceiling !== 'number' ||
+    !Number.isFinite(ceiling) ||
+    ceiling < 0 ||
+    ceiling > 1 ||
+    typeof fraction !== 'number' ||
+    !Number.isFinite(fraction) ||
+    fraction < 0 ||
+    fraction > 1
+  ) {
+    return aggregateResult;
+  }
+  if (fraction < ceiling) return aggregateResult;
+  if (aggregateResult.verdict !== 'ALLOW') return aggregateResult;
+  return {
+    verdict: 'REVIEW',
+    confidence: Math.max(aggregateResult.confidence, 0.85),
+    triggered_by: aggregateResult.triggered_by,
+    rationale:
+      `Shared-resource fraction ceiling exceeded: proposed fraction ${fraction} >= principal ceiling ${ceiling}. ` +
+      `Shared finite resource consumption is hard to undo and affects other workflows — human go-button (REVIEW). ` +
+      `Budget-available ≠ reversible. (Prior cascade aggregate was ALLOW.)`,
   };
 }

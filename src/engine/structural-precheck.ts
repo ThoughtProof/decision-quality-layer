@@ -42,6 +42,11 @@ export interface StructuralGranted {
    * Distinct from max_amount (authorization). Boundary is principal policy.
    */
   materiality_ceiling?: number;
+  /**
+   * Principal autonomy ceiling for shared finite resources (0–1).
+   * fraction >= ceiling → human go-button. Non-monetary blast radius.
+   */
+  shared_resource_fraction_ceiling?: number;
   /** ISO-ish currency code; amount compare is silent if currencies disagree. */
   amount_currency?: string;
   /** Authorized counterparty name / handle / address. */
@@ -55,6 +60,8 @@ export interface StructuralGranted {
 /** What the agent proposes (typed). All fields optional. */
 export interface StructuralProposed {
   amount?: number;
+  /** Fraction of shared finite resource consumed (0–1), e.g. monthly API quota. */
+  shared_resource_fraction?: number;
   amount_currency?: string;
   recipient?: string;
   iban?: string;
