@@ -308,6 +308,18 @@ export interface DqlResponse {
     models_used: string[];
     axes_evaluated: Axis[];
     sandbox: boolean;
+    /**
+     * Present only when objection-evidence-bind gated at least one axis
+     * objection/reasoning string. Axis + aggregate verdicts are never changed.
+     */
+    objection_evidence_bind?: {
+      surface_gated: boolean;
+      n_evidence_fail: number;
+      n_unverified: number;
+      n_verified: number;
+      codes: string[];
+      verdict_unchanged: true;
+    };
   };
 }
 

@@ -35,6 +35,7 @@ import {
   logStructuralShadowSample,
   recordStructuralSample,
 } from './structural-metrics.js';
+import { bindAxisResults } from '../objection-evidence-bind.js';
 
 export interface EngineInput {
   request: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> &
@@ -215,10 +216,22 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
     input.request.structured_context,
   );
 
+  // Surface gate: numeric objections/reasons are claims. Bind checkable
+  // exceed/within text against structured_context + free-text fields before
+  // client/replan/attest surfaces. Axis + aggregate verdicts unchanged.
+  const bind = bindAxisResults(axisResults, {
+    mandate: input.request.mandate,
+    proposed_action: input.request.proposed_action,
+    reasoning: input.request.reasoning,
+    context: input.request.context,
+    structured_context: input.request.structured_context,
+  });
+  const surfaceAxes = bind.surface_axes;
+
   emitStructuralMetrics({
     requestId: input.requestId,
     structural: structuralField,
-    axes: axisResults,
+    axes: surfaceAxes,
     aggregateVerdict: aggregateResult.verdict,
     sandbox: input.request.sandbox,
   });
@@ -226,7 +239,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   return {
     id: input.requestId,
     version: input.version,
-    axes: axisResults,
+    axes: surfaceAxes,
     aggregate: aggregateResult,
     structural: structuralField,
     meta: {
@@ -234,6 +247,18 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
       models_used: modelsUsed,
       axes_evaluated: axes as Axis[],
       sandbox: input.request.sandbox,
+      ...(bind.surface_gated
+        ? {
+            objection_evidence_bind: {
+              surface_gated: true,
+              n_evidence_fail: bind.n_evidence_fail,
+              n_unverified: bind.n_unverified,
+              n_verified: bind.n_verified,
+              codes: bind.codes,
+              verdict_unchanged: true as const,
+            },
+          }
+        : {}),
     },
   };
   } finally {
@@ -333,17 +358,34 @@ function buildEnforcedBlockResponse(args: {
     };
   }
 
+  // Enforce short-circuit path: still bind surface text (gate details are
+  // deterministic, but keep one code path for clients).
+  const bind = bindAxisResults(axisResults, {});
+  const surfaceAxes = bind.surface_axes;
+
   return {
     id: args.requestId,
     version: args.version,
-    axes: axisResults,
+    axes: surfaceAxes,
     aggregate: aggregateResult,
     structural: args.structuralField,
     meta: {
       duration_ms: Date.now() - args.started,
       models_used: [],
-      axes_evaluated: axisResults.map((r) => r.axis),
+      axes_evaluated: surfaceAxes.map((r) => r.axis),
       sandbox: args.sandbox,
+      ...(bind.surface_gated
+        ? {
+            objection_evidence_bind: {
+              surface_gated: true,
+              n_evidence_fail: bind.n_evidence_fail,
+              n_unverified: bind.n_unverified,
+              n_verified: bind.n_verified,
+              codes: bind.codes,
+              verdict_unchanged: true as const,
+            },
+          }
+        : {}),
     },
   };
 }
