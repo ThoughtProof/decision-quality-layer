@@ -16,7 +16,7 @@
  *     --out scenarios/pilot-live.json
  *
  * Env:
- *   DQL_API_KEY  optional, sent as x-api-key header if set
+ *   DQL_API_KEY  optional, sent as X-DQL-Key header if set (gate does not accept x-api-key)
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -51,7 +51,10 @@ console.log(`Running ${filtered.length} scenarios against ${baseUrl}/dql/verify\
 
 const results = [];
 const headers = { 'content-type': 'application/json' };
-if (process.env.DQL_API_KEY) headers['x-api-key'] = process.env.DQL_API_KEY;
+if (process.env.DQL_API_KEY) {
+  // Gate reads X-DQL-Key (primary) or Authorization: Bearer — not x-api-key (#22).
+  headers['x-dql-key'] = process.env.DQL_API_KEY;
+}
 
 for (const s of filtered) {
   const t0 = Date.now();
