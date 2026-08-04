@@ -24,6 +24,8 @@
  * Unknown fields are ignored so the format can grow without a gate change.
  */
 
+import { timingSafeEqual } from 'node:crypto';
+
 import { PRICE_USD_PER_CALL } from '../pricing.js';
 
 export interface ApiKeyRecord {
@@ -125,7 +127,7 @@ export async function authorizeCall(opts: {
     };
   }
 
-  const record = opts.keys.get(key);
+  const record = lookupKeyConstantTime(opts.keys, key);
   if (!record) {
     return {
       kind: 'deny',
@@ -153,4 +155,65 @@ export async function authorizeCall(opts: {
   }
 
   return { kind: 'allow', key, record };
+}
+
+/**
+ * Constant-time key lookup over the registry Map (issue #24 hardening).
+ *
+ * Plain `Map.get(key)` short-circuits on the FIRST byte/length mismatch
+ * inside V8's string-equality check, which is a theoretical timing side
+ * channel: an attacker measuring response latency could infer how many
+ * leading bytes of a guess matched a real key. This still uses the Map as
+ * the lookup structure (O(1) average iteration order is irrelevant here —
+ * registries are small, single-digit-to-low-hundreds of keys), but every
+ * candidate is compared with `crypto.timingSafeEqual`, which runs in time
+ * proportional only to buffer length, never to the position of the first
+ * differing byte.
+ *
+ * `timingSafeEqual` throws if the two buffers differ in length, so a naive
+ * `if (a.length !== b.length) return false` early-exit BEFORE calling it
+ * would reintroduce a length-based timing leak. Instead we pad the shorter
+ * buffer up to the longer one's length before comparing (the padded
+ * comparison can never match, so it safely returns false without leaking
+ * which candidate had the matching length via an early return).
+ */
+function lookupKeyConstantTime(
+  keys: Map<string, ApiKeyRecord>,
+  candidate: string,
+): ApiKeyRecord | undefined {
+  const candidateBuf = Buffer.from(candidate, 'utf8');
+  let match: ApiKeyRecord | undefined;
+  for (const [registeredKey, record] of keys) {
+    const registeredBuf = Buffer.from(registeredKey, 'utf8');
+    if (constantTimeBufferEqual(candidateBuf, registeredBuf)) {
+      match = record;
+      // Do not break early: bailing out on first match reintroduces a
+      // timing signal correlated with registry iteration order. The
+      // registry is small, so scanning the rest is cheap and keeps the
+      // total comparison count independent of where the match landed.
+    }
+  }
+  return match;
+}
+
+/** Compare two buffers in constant time regardless of length. */
+function constantTimeBufferEqual(a: Buffer, b: Buffer): boolean {
+  if (a.length === b.length) {
+    return timingSafeEqual(a, b);
+  }
+  // Length differs: timingSafeEqual would throw, so compare same-length
+  // buffers (candidate vs. itself, then a zero buffer of the OTHER length
+  // vs. that same zero buffer) to keep the work proportional to length and
+  // avoid an early-exit branch keyed directly off the length check outcome.
+  const longer = Math.max(a.length, b.length);
+  const aPadded = Buffer.alloc(longer);
+  const bPadded = Buffer.alloc(longer);
+  a.copy(aPadded);
+  b.copy(bPadded);
+  // XOR in a constant that guarantees inequality even if both inputs were
+  // all-zero, then run the same timingSafeEqual path as the equal-length
+  // case so both branches perform one Buffer alloc + one timingSafeEqual.
+  bPadded[longer - 1] = (bPadded[longer - 1] ?? 0) ^ 0xff;
+  timingSafeEqual(aPadded, bPadded);
+  return false;
 }

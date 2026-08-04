@@ -14,6 +14,8 @@
  * still rejects strangers.
  */
 
+import { createHash } from 'node:crypto';
+
 import { Redis } from '@upstash/redis';
 import type { UsageGate } from './keys.js';
 
@@ -66,6 +68,13 @@ export function createUsageGate(env: NodeJS.ProcessEnv): UsageGate {
  * Structured usage line for Vercel logs — the billing record until the
  * Stripe/x402 meter rails land (docs/PAYMENT.md Phase 2). One JSON line per
  * allowed non-sandbox call; grepable as `dql_usage`.
+ *
+ * Issue #24 hardening: never log the raw API key. Vercel log access can be
+ * broader than the key-holder set, and the full secret in plaintext on every
+ * call is avoidable exposure surface for a "billing record". Instead we log
+ * `key_fingerprint`, a truncated sha256 hash (first 12 hex chars) plus the
+ * last 4 characters of the key — enough to correlate/deduplicate a specific
+ * key across log lines for ops purposes, without ever reconstructing it.
  */
 export function emitUsageLine(opts: {
   requestId: string;
@@ -79,7 +88,7 @@ export function emitUsageLine(opts: {
     JSON.stringify({
       type: 'dql_usage',
       request_id: opts.requestId,
-      key: opts.key,
+      key_fingerprint: fingerprintKey(opts.key),
       owner: opts.owner,
       dev_access: opts.devAccess,
       price_usd: opts.priceUsd,
@@ -87,4 +96,19 @@ export function emitUsageLine(opts: {
       ts: new Date().toISOString(),
     }),
   );
+}
+
+/**
+ * Derive a non-reversible, log-safe identifier for an API key: the first 12
+ * hex characters of its sha256 hash, plus the literal last 4 characters of
+ * the key (e.g. `a1b2c3d4e5f6…af42`). The hash prefix lets ops correlate the
+ * SAME key across log lines without storing/searching the raw secret; the
+ * last-4 gives a human-recognizable suffix matching common billing-UI
+ * conventions (like card-number masking), without materially increasing
+ * brute-force risk for a high-entropy `dqlk_<hex>` key.
+ */
+function fingerprintKey(key: string): string {
+  const hashPrefix = createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 12);
+  const last4 = key.slice(-4);
+  return `${hashPrefix}…${last4}`;
 }
