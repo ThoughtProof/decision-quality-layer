@@ -188,6 +188,21 @@ export type StructuralGateMode = 'shadow' | 'enforce';
 /** Typed granted scope for the structural pre-check. All fields optional. */
 export interface StructuralGranted {
   max_amount?: number;
+  /**
+   * Principal autonomy ceiling (same unit as proposed.amount).
+   * When proposed.amount >= materiality_ceiling, the gate MUST escalate to
+   * human review (REVIEW) even if mandate/history/schedule would otherwise
+   * allow. Distinct from max_amount (authorization bound): ceiling is the
+   * autonomy bound. Boundary comes from the principal; the gate enforces.
+   */
+  materiality_ceiling?: number;
+  /**
+   * Principal autonomy ceiling for shared finite resources (0–1 fraction).
+   * When proposed.shared_resource_fraction >= ceiling, escalate ALLOW→REVIEW.
+   * Covers non-monetary blast radius: API quota, rate budget, seat pool, etc.
+   * Budget-affordable ≠ undoable. Boundary from principal; gate enforces.
+   */
+  shared_resource_fraction_ceiling?: number;
   amount_currency?: string;
   recipient?: string;
   iban?: string;
@@ -197,6 +212,11 @@ export interface StructuralGranted {
 /** Typed proposed action for the structural pre-check. All fields optional. */
 export interface StructuralProposed {
   amount?: number;
+  /**
+   * Fraction of a shared finite resource this action consumes (0–1),
+   * e.g. monthly API quota, concurrent seat pool, rate budget.
+   */
+  shared_resource_fraction?: number;
   amount_currency?: string;
   recipient?: string;
   iban?: string;
@@ -288,6 +308,18 @@ export interface DqlResponse {
     models_used: string[];
     axes_evaluated: Axis[];
     sandbox: boolean;
+    /**
+     * Present only when objection-evidence-bind gated at least one axis
+     * objection/reasoning string. Axis + aggregate verdicts are never changed.
+     */
+    objection_evidence_bind?: {
+      surface_gated: boolean;
+      n_evidence_fail: number;
+      n_unverified: number;
+      n_verified: number;
+      codes: string[];
+      verdict_unchanged: true;
+    };
   };
 }
 

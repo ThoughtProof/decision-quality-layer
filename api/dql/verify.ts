@@ -33,6 +33,9 @@ import { runVerification } from '../../src/engine/index.js';
 import { StubCascade } from '../../src/engine/cascade.js';
 import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
+import { authorizeCall, parseApiKeys } from '../../src/auth/keys.js';
+import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
+import { priceForCall } from '../../src/pricing.js';
 import {
   createProductionRuntime,
   type ProductionRuntime,
@@ -82,6 +85,14 @@ function pickRuntime(): RuntimeInit {
 }
 const RUNTIME = pickRuntime();
 const sandboxCascade = new SandboxCascade();
+
+// Phase 2 key gate (docs/PAYMENT.md decision matrix): env-held key list,
+// parsed once at cold start. A malformed DQL_API_KEYS yields an EMPTY map —
+// every non-sandbox call fails closed (402), the safe direction for billing.
+// USAGE_GATE is Upstash-backed when configured, otherwise a no-op (the
+// daily-cap brake degrades; key validation is env-based and still holds).
+const API_KEYS = parseApiKeys(process.env.DQL_API_KEYS);
+const USAGE_GATE = createUsageGate(process.env);
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const requestId = `dql_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -137,38 +148,73 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         status = 413;
         payload = { error: 'Request too large', code: 'PAYLOAD_TOO_LARGE', max_bytes: MAX_BODY_SIZE };
       } else {
-        const validation = validateVerifyRequest(req.body);
-        if (!validation.valid) {
-          status = 400;
-          payload = { error: 'Validation failed', code: 'INVALID_REQUEST', details: validation.errors };
-        } else if (RUNTIME.kind === 'error') {
-          // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
-          // resolver failed for a Live-configured deploy, EVERY POST
-          // returns 503, including sandbox=true.
-          status = 503;
-          payload = {
-            error: 'Runtime not initialised',
-            code: 'CONFIG_INVALID',
-            reasons: RUNTIME.reason.reasons,
-          };
+        // Phase 2 key gate: sandbox stays free (integration testing);
+        // everything else needs a valid X-DQL-Key (PAYMENT.md matrix).
+        // Auth runs BEFORE validation — strangers don't get parsing work.
+        const auth = await authorizeCall({
+          headers: req.headers as Record<string, unknown>,
+          sandbox: (req.body as { sandbox?: unknown } | undefined)?.sandbox === true,
+          keys: API_KEYS,
+          usage: USAGE_GATE,
+        });
+        if (auth.kind === 'deny') {
+          status = auth.status;
+          payload = auth.payload;
         } else {
-          const response = await runVerification({
-            request: validation.request,
-            cascade: RUNTIME.cascade,
-            sandboxCascade,
-            requestId,
-            version: VERSION,
-            collector: collector ?? undefined,
-            ...(RUNTIME.kind === 'production' &&
-            RUNTIME.production.config.deadline_enforcement_enabled
-              ? {
-                  requestDeadlineMs: RUNTIME.production.config.request_deadline_ms,
-                  providerCallBudgetMs: RUNTIME.production.config.provider_call_budget_ms,
-                }
-              : {}),
-          });
-          status = 200;
-          payload = response;
+          const validation = validateVerifyRequest(req.body);
+          if (!validation.valid) {
+            status = 400;
+            payload = { error: 'Validation failed', code: 'INVALID_REQUEST', details: validation.errors };
+          } else if (RUNTIME.kind === 'error') {
+            // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
+            // resolver failed for a Live-configured deploy, EVERY POST
+            // returns 503, including sandbox=true.
+            status = 503;
+            payload = {
+              error: 'Runtime not initialised',
+              code: 'CONFIG_INVALID',
+              reasons: RUNTIME.reason.reasons,
+            };
+          } else {
+            const response = await runVerification({
+              request: validation.request,
+              cascade: RUNTIME.cascade,
+              sandboxCascade,
+              requestId,
+              version: VERSION,
+              collector: collector ?? undefined,
+              ...(RUNTIME.kind === 'production' &&
+              RUNTIME.production.config.deadline_enforcement_enabled
+                ? {
+                    requestDeadlineMs: RUNTIME.production.config.request_deadline_ms,
+                    providerCallBudgetMs: RUNTIME.production.config.provider_call_budget_ms,
+                  }
+                : {}),
+            });
+            status = 200;
+            payload = response;
+            // Billing surface: informational headers + the structured usage
+            // line that becomes the meter record once Stripe/x402 rails land.
+            if (auth.kind === 'allow') {
+              const price = priceForCall({
+                sandbox: false,
+                dev_access: auth.record.dev_access,
+              });
+              res.setHeader('X-DQL-Billing', auth.record.dev_access ? 'dev-access' : 'metered');
+              res.setHeader('X-DQL-Price-Usd', price.toFixed(2));
+              emitUsageLine({
+                requestId,
+                key: auth.key,
+                owner: auth.record.owner,
+                devAccess: auth.record.dev_access,
+                priceUsd: price,
+                verdict: (response as { verdict?: string }).verdict,
+              });
+            } else {
+              res.setHeader('X-DQL-Billing', 'sandbox');
+              res.setHeader('X-DQL-Price-Usd', '0.00');
+            }
+          }
         }
       }
     }

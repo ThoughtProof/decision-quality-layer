@@ -112,7 +112,7 @@ describe('deadline layering', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(0); // rejected before attempt when W already exhausted
   });
 
-  it('skips secondary when remaining W < PC + reserve and still returns REVIEW path', async () => {
+  it('skips secondary when remaining W is tight and keeps primary PASS as-served', async () => {
     let calls = 0;
     const fetchImpl = vi.fn().mockImplementation(async () => {
       calls += 1;
@@ -146,7 +146,7 @@ describe('deadline layering', () => {
       secondaryModel: 'serv-swift',
       confirmFail: false,
     });
-    // Only enough budget for primary, not secondary (PC=40s + 3s reserve).
+    // Only enough budget for primary, not secondary — keep primary as-served.
     const response = await runVerification({
       request: {
         mandate: 'm',
@@ -162,12 +162,12 @@ describe('deadline layering', () => {
       requestDeadlineMs: 1_000, // tiny W → secondary skipped after primary
       providerCallBudgetMs: 40_000,
     });
-    expect(response.aggregate.verdict).not.toBe('ALLOW');
-    // Primary may still complete; secondary skip forces degraded path → no ALLOW.
+    // Product contract: successful primary is kept as-served, not degraded to REVIEW.
+    expect(response.aggregate.verdict).toBe('ALLOW');
     expect(calls).toBeLessThanOrEqual(1);
-    expect(response.axes[0]?.provider_outcome === 'provider_error' || response.aggregate.verdict === 'REVIEW').toBe(
-      true,
-    );
+    expect(response.axes[0]?.provider_outcome).toBe('served');
+    expect(response.axes[0]?.verdict).toBe('PASS');
+    expect(response.axes[0]?.reasoning).toMatch(/secondary skipped|keeping primary as-served/);
   });
 
   it('hanging fetch is aborted by attempt timeout as ProviderCallError', async () => {

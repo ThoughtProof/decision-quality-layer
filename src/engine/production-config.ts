@@ -766,22 +766,26 @@ export function resolveProductionConfig(
     return n;
   }
 
+  // Deadline defaults raised 2026-07-22 after live cascade restore:
+  // serv-swift completions regularly exceed the old T=30s / PC=40s window
+  // (secondary timeouts ~8–9s residual after first-attempt burn; historical
+  // swift load probes were multi-minute). Keep W >= PC >= T.
   const requestDeadlineMs = readPositiveInt(
     env.DQL_REQUEST_DEADLINE_MS,
     'DQL_REQUEST_DEADLINE_MS',
-    deadlineEnforcementEnabled ? 90_000 : 60_000,
+    deadlineEnforcementEnabled ? 150_000 : 60_000,
     reasons,
   );
   const providerCallBudgetMs = readPositiveInt(
     env.DQL_PROVIDER_CALL_BUDGET_MS,
     'DQL_PROVIDER_CALL_BUDGET_MS',
-    deadlineEnforcementEnabled ? 40_000 : 60_000,
+    deadlineEnforcementEnabled ? 90_000 : 60_000,
     reasons,
   );
   const attemptTimeoutMs = readPositiveInt(
     env.DQL_ATTEMPT_TIMEOUT_MS,
     'DQL_ATTEMPT_TIMEOUT_MS',
-    deadlineEnforcementEnabled ? 30_000 : 60_000,
+    deadlineEnforcementEnabled ? 60_000 : 60_000,
     reasons,
   );
   const maxAttempts = readPositiveInt(

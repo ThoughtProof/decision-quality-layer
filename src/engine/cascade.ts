@@ -122,9 +122,15 @@ const hasConf =
   // Treat as evaluation failure: UNCERTAIN@0 with an honest infra note.
   // High-conf UNCERTAIN + refusal text is the worst product surface (seen live
   // on Guardian 2026-07-20: consistency/reversibility @ 86–95%).
-  if (isModelRefusal(`${reasoning}
+  // Check objection ALONE first — live payroll case had long reasoning + short
+  // refusal objection, which previously missed the length-gated detector.
+  if (
+    isModelRefusal(objection) ||
+    isModelRefusal(reasoning) ||
+    isModelRefusal(`${reasoning}
 ${objection}
-${raw}`)) {
+${raw}`)
+  ) {
     return {
       axis,
       verdict: 'UNCERTAIN',
@@ -136,17 +142,132 @@ ${raw}`)) {
     };
   }
 
+  // Consistency checklist dump → PASS. Models often emit STEP-1 match lists with
+  // checkmarks then still return UNCERTAIN. Match-without-contradiction IS PASS.
+  if (axis === 'consistency' && verdict === 'UNCERTAIN') {
+    const blob = `${reasoning}
+${objection}`;
+    if (isConsistencyChecklistMatch(blob)) {
+      return {
+        axis,
+        verdict: 'PASS',
+        confidence: Math.max(confidence, 0.7),
+        reasoning:
+          'Direct mandate match checklist present with no contradiction — consistency PASS.',
+        objection: '',
+      };
+    }
+  }
+
+  // Material immediate external settle on reversibility: floor conf so a single
+  // low-conf UNCERTAIN cannot fall through aggregation Rule 6 → ALLOW (trading FA).
+  if (axis === 'reversibility' && verdict === 'UNCERTAIN') {
+    const blob = `${reasoning}
+${objection}`;
+    if (isMaterialImmediateSettle(blob) && confidence < 0.75) {
+      confidence = 0.75;
+    }
+  }
+
+  // Prompt-echo / mandate restatement is not a judgment (Guardian 2026-07-21:
+  // Risk UNCERTAIN@0.78 with "The mandate states… The user acknowledges…").
+  // Cap conf below aggregation Rule 5 (0.7) and do NOT set provider_outcome
+  // so Rule 2 does not force REVIEW either. A single low-conf UNCERTAIN with
+  // clean content axes falls through to ALLOW.
+  if (verdict === 'UNCERTAIN' && !objection && isPromptEcho(reasoning)) {
+    return {
+      axis,
+      verdict: 'UNCERTAIN',
+      confidence: 0.4,
+      reasoning:
+        'Axis evaluation incomplete — model restated the mandate instead of judging this axis.',
+      objection: '',
+    };
+  }
+
   return { axis, verdict, confidence, reasoning, objection };
+}
+
+
+/** Consistency STEP-1 checklist with matches and no contradiction → PASS. */
+export function isConsistencyChecklistMatch(text: string): boolean {
+  if (!text) return false;
+  const t = text.replace(/\s+/g, ' ');
+  const hasChecklist =
+    /STEP 1|Direct Execution Check|Mandate parameters|Proposed action parameters/i.test(t);
+  const checkmarks = (t.match(/[✓✔]|\bPASS\b|\bmatch(?:es|ed)?\b|\balign(?:s|ed)?\b/gi) || []).length;
+  // NOTE: do NOT match bare "inconsisten" — that false-positives on the word CONSISTENCY.
+  const contradiction =
+    /\bcontradict(?:s|ed|ion|ory)?\b|does not follow|non-sequitur|\bmismatch(?:es|ed)?\b|\binconsistent\b/i.test(
+      t,
+    ) && !/no contradiction|without contradiction|no mismatch|not inconsistent/i.test(t);
+  // Heuristic: structured match dump with multiple positive markers, no real break
+  return hasChecklist && checkmarks >= 2 && !contradiction;
+}
+
+/** Immediate external settle / market impact — must not low-conf fall through to ALLOW. */
+export function isMaterialImmediateSettle(text: string): boolean {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  const immediate =
+    /immediate|market (?:order|sell|buy)|settles externally|execution["']?\s*:\s*["']?immediate|trading\.market_order|no cancel|cannot be undone|market impact/i.test(
+      t,
+    );
+  const humanGo =
+    /human confirmation|go-button|before (?:bind|execut|settling)|material (?:external )?(?:commit|trade|sell)/i.test(
+      t,
+    );
+  return immediate || (humanGo && /sell|trade|market|external/.test(t));
+}
+
+/**
+ * Detect mandate/prompt restatement that is not a decision-quality judgment.
+ * Typical garbage: "The mandate states: … The user acknowledges: - Budget…"
+ * without a downside analysis or concrete objection.
+ */
+export function isPromptEcho(text: string): boolean {
+  if (!text) return false;
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length < 40) return false;
+
+  const echoMarkers =
+    /the mandate (?:states|explicitly names|requests)|the user (?:acknowledges|authorized|stated|has acknowledged)|user acknowledges|explicit parameter|budget ceiling|concrete parameters|destination (?:&|and) dates|the proposed action provides:\s*-\s*location/i;
+  if (!echoMarkers.test(t)) return false;
+
+  // Real risk judgments name a concrete downside analysis — not just that
+  // parameters were listed. "acknowledged the material down" alone is still echo.
+  const judgmentMarkers =
+    /risk profile|could go wrong|cancellation (?:fee|penalt)|ordinary booking friction is not|routine travel booking|low-to-moderate stakes|weigh(?:ed|ing) against|no additional material downside|silence about risk is appropriate/i;
+  if (judgmentMarkers.test(t) && !/the mandate (?:states|explicitly names)/i.test(t.slice(0, 80))) {
+    return false;
+  }
+
+  // Mostly restating inputs: high density of mandate-echo phrases.
+  const hits = (
+    t.match(
+      /mandate|acknowledges|acknowledged|budget ceiling|explicit parameter|concrete parameters|the user|destination/gi,
+    ) || []
+  ).length;
+  return hits >= 2;
 }
 
 /** Detect policy/safety refusals that are not decision-quality judgments. */
 export function isModelRefusal(text: string): boolean {
   if (!text) return false;
-  const t = text.toLowerCase();
-  // Short pure refusals
+  const t = text.toLowerCase().replace(/\s+/g, ' ').trim();
+  // Short pure refusals (including bare objection fields)
   if (
     /^\s*i (can'?t|cannot|won'?t) (share|help with|provide|discuss|assist).{0,40}\.?\s*$/im.test(
       text,
+    )
+  ) {
+    return true;
+  }
+  // Exact/near-exact short refusal phrases regardless of surrounding whitespace
+  if (
+    t.length <= 80 &&
+    /^(i can'?t share that\.?|i cannot share that\.?|i'?m not able to share that\.?|i must refuse\.?)$/i.test(
+      t,
     )
   ) {
     return true;

@@ -35,6 +35,7 @@ import {
   logStructuralShadowSample,
   recordStructuralSample,
 } from './structural-metrics.js';
+import { bindAxisResults } from '../objection-evidence-bind.js';
 
 export interface EngineInput {
   request: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> &
@@ -200,12 +201,37 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
 
   const axisResults: AxisResult[] = perAxis.map((p) => p.result);
   const modelsUsed = uniqueStrings(perAxis.flatMap((p) => p.modelsUsed));
-  const aggregateResult = aggregate(axisResults);
+  let aggregateResult = aggregate(axisResults);
+
+  // Principal materiality ceiling (autonomy bound): amount >= ceiling → REVIEW.
+  // Independent of history/schedule/recurrence. Not a carve-out list — the
+  // principal sets the bound; the gate enforces. Distinct from max_amount
+  // (authorization). Does not BLOCK — human go-button only.
+  aggregateResult = applyMaterialityCeiling(
+    aggregateResult,
+    input.request.structured_context,
+  );
+  aggregateResult = applySharedResourceCeiling(
+    aggregateResult,
+    input.request.structured_context,
+  );
+
+  // Surface gate: numeric objections/reasons are claims. Bind checkable
+  // exceed/within text against structured_context + free-text fields before
+  // client/replan/attest surfaces. Axis + aggregate verdicts unchanged.
+  const bind = bindAxisResults(axisResults, {
+    mandate: input.request.mandate,
+    proposed_action: input.request.proposed_action,
+    reasoning: input.request.reasoning,
+    context: input.request.context,
+    structured_context: input.request.structured_context,
+  });
+  const surfaceAxes = bind.surface_axes;
 
   emitStructuralMetrics({
     requestId: input.requestId,
     structural: structuralField,
-    axes: axisResults,
+    axes: surfaceAxes,
     aggregateVerdict: aggregateResult.verdict,
     sandbox: input.request.sandbox,
   });
@@ -213,7 +239,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
   return {
     id: input.requestId,
     version: input.version,
-    axes: axisResults,
+    axes: surfaceAxes,
     aggregate: aggregateResult,
     structural: structuralField,
     meta: {
@@ -221,6 +247,18 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
       models_used: modelsUsed,
       axes_evaluated: axes as Axis[],
       sandbox: input.request.sandbox,
+      ...(bind.surface_gated
+        ? {
+            objection_evidence_bind: {
+              surface_gated: true,
+              n_evidence_fail: bind.n_evidence_fail,
+              n_unverified: bind.n_unverified,
+              n_verified: bind.n_verified,
+              codes: bind.codes,
+              verdict_unchanged: true as const,
+            },
+          }
+        : {}),
     },
   };
   } finally {
@@ -320,21 +358,131 @@ function buildEnforcedBlockResponse(args: {
     };
   }
 
+  // Enforce short-circuit path: still bind surface text (gate details are
+  // deterministic, but keep one code path for clients).
+  const bind = bindAxisResults(axisResults, {});
+  const surfaceAxes = bind.surface_axes;
+
   return {
     id: args.requestId,
     version: args.version,
-    axes: axisResults,
+    axes: surfaceAxes,
     aggregate: aggregateResult,
     structural: args.structuralField,
     meta: {
       duration_ms: Date.now() - args.started,
       models_used: [],
-      axes_evaluated: axisResults.map((r) => r.axis),
+      axes_evaluated: surfaceAxes.map((r) => r.axis),
       sandbox: args.sandbox,
+      ...(bind.surface_gated
+        ? {
+            objection_evidence_bind: {
+              surface_gated: true,
+              n_evidence_fail: bind.n_evidence_fail,
+              n_unverified: bind.n_unverified,
+              n_verified: bind.n_verified,
+              codes: bind.codes,
+              verdict_unchanged: true as const,
+            },
+          }
+        : {}),
     },
   };
 }
 
 function uniqueStrings(xs: string[]): string[] {
   return Array.from(new Set(xs));
+}
+
+/**
+ * Principal materiality ceiling (autonomy bound).
+ *
+ * When structured_context supplies both:
+ *   granted.materiality_ceiling  (principal policy)
+ *   proposed.amount              (action size)
+ * and amount >= ceiling, escalate ALLOW → REVIEW.
+ *
+ * Design (not case carve-outs):
+ * - Boundary comes from the principal, not the gate's gut feel.
+ * - Independent of history / schedule / recurrence labels.
+ * - Distinct from max_amount (authorization). Ceiling = autonomy.
+ * - Never hard-BLOCKs — human go-button only.
+ * - Silent when fields incomplete (fail toward silence).
+ * - Never weakens a stricter aggregate (BLOCK/REVIEW stay).
+ */
+export function applyMaterialityCeiling(
+  aggregateResult: AggregateResult,
+  structured?: DqlRequest['structured_context'],
+): AggregateResult {
+  if (!structured) return aggregateResult;
+  const ceiling = structured.granted?.materiality_ceiling;
+  const amount = structured.proposed?.amount;
+  if (
+    typeof ceiling !== 'number' ||
+    !Number.isFinite(ceiling) ||
+    ceiling < 0 ||
+    typeof amount !== 'number' ||
+    !Number.isFinite(amount)
+  ) {
+    return aggregateResult;
+  }
+  if (amount < ceiling) return aggregateResult;
+  // Already at least REVIEW — leave alone (BLOCK/REVIEW unchanged).
+  if (aggregateResult.verdict !== 'ALLOW') return aggregateResult;
+  return {
+    verdict: 'REVIEW',
+    confidence: Math.max(aggregateResult.confidence, 0.85),
+    triggered_by: aggregateResult.triggered_by,
+    rationale:
+      `Materiality ceiling exceeded: proposed amount ${amount} >= principal ceiling ${ceiling}. ` +
+      `Autonomy bound requires human go-button (REVIEW), independent of history/schedule. ` +
+      `(Prior cascade aggregate was ALLOW.)`,
+  };
+}
+
+/**
+ * Principal shared-resource fraction ceiling (non-monetary blast radius).
+ *
+ * When structured_context supplies both:
+ *   granted.shared_resource_fraction_ceiling  (principal policy, 0–1)
+ *   proposed.shared_resource_fraction         (action consumption, 0–1)
+ * and fraction >= ceiling, escalate ALLOW → REVIEW.
+ *
+ * Design (same discipline as money ceiling — no case carve-outs):
+ * - Material ≠ only monetary. Shared finite resources (API quota, seat pool,
+ *   rate budget) have blast radius even at €0 cash delta.
+ * - Budget-affordable ≠ undoable (GT teaching point for quota cases).
+ * - Boundary from principal; gate enforces.
+ * - Silent when incomplete; never weakens BLOCK/REVIEW.
+ */
+export function applySharedResourceCeiling(
+  aggregateResult: AggregateResult,
+  structured?: DqlRequest['structured_context'],
+): AggregateResult {
+  if (!structured) return aggregateResult;
+  const ceiling = structured.granted?.shared_resource_fraction_ceiling;
+  const fraction = structured.proposed?.shared_resource_fraction;
+  if (
+    typeof ceiling !== 'number' ||
+    !Number.isFinite(ceiling) ||
+    ceiling < 0 ||
+    ceiling > 1 ||
+    typeof fraction !== 'number' ||
+    !Number.isFinite(fraction) ||
+    fraction < 0 ||
+    fraction > 1
+  ) {
+    return aggregateResult;
+  }
+  if (fraction < ceiling) return aggregateResult;
+  if (aggregateResult.verdict !== 'ALLOW') return aggregateResult;
+  return {
+    verdict: 'REVIEW',
+    confidence: Math.max(aggregateResult.confidence, 0.85),
+    triggered_by: aggregateResult.triggered_by,
+    rationale:
+      `Shared-resource fraction ceiling exceeded: proposed fraction ${fraction} >= principal ceiling ${ceiling}. ` +
+      `Shared finite resource consumption is hard to undo and affects other workflows — human go-button (REVIEW). ` +
+      `Budget-available ≠ reversible. (Prior cascade aggregate was ALLOW.)`,
+  };
 }

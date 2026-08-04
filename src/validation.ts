@@ -149,6 +149,36 @@ function parseGranted(
     const n = requireFiniteNumber(o.max_amount, 'structured_context.granted.max_amount', errors);
     if (n !== undefined) g.max_amount = n;
   }
+  if (o.materiality_ceiling !== undefined) {
+    const n = requireFiniteNumber(
+      o.materiality_ceiling,
+      'structured_context.granted.materiality_ceiling',
+      errors,
+    );
+    if (n !== undefined) {
+      if (n < 0) {
+        errors.push('structured_context.granted.materiality_ceiling must be >= 0');
+      } else {
+        g.materiality_ceiling = n;
+      }
+    }
+  }
+  if (o.shared_resource_fraction_ceiling !== undefined) {
+    const n = requireFiniteNumber(
+      o.shared_resource_fraction_ceiling,
+      'structured_context.granted.shared_resource_fraction_ceiling',
+      errors,
+    );
+    if (n !== undefined) {
+      if (n < 0 || n > 1) {
+        errors.push(
+          'structured_context.granted.shared_resource_fraction_ceiling must be in [0, 1]',
+        );
+      } else {
+        g.shared_resource_fraction_ceiling = n;
+      }
+    }
+  }
   if (o.amount_currency !== undefined) {
     const s = requireNonEmptyString(
       o.amount_currency,
@@ -192,6 +222,22 @@ function parseProposed(
   if (o.amount !== undefined) {
     const n = requireFiniteNumber(o.amount, 'structured_context.proposed.amount', errors);
     if (n !== undefined) p.amount = n;
+  }
+  if (o.shared_resource_fraction !== undefined) {
+    const n = requireFiniteNumber(
+      o.shared_resource_fraction,
+      'structured_context.proposed.shared_resource_fraction',
+      errors,
+    );
+    if (n !== undefined) {
+      if (n < 0 || n > 1) {
+        errors.push(
+          'structured_context.proposed.shared_resource_fraction must be in [0, 1]',
+        );
+      } else {
+        p.shared_resource_fraction = n;
+      }
+    }
   }
   if (o.amount_currency !== undefined) {
     const s = requireNonEmptyString(

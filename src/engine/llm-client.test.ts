@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CircuitAllOpenError, HttpLlmClient, type ModelBinding } from './llm-client.js';
+import {
+  CircuitAllOpenError,
+  HttpLlmClient,
+  isResponseFormatRejected,
+  modelRejectsJsonObjectResponseFormat,
+  type ModelBinding,
+} from './llm-client.js';
 
 const BINDING: Record<string, ModelBinding> = {
   'test-model': {
@@ -96,6 +102,73 @@ describe('HttpLlmClient retry + timeout', () => {
     await expect(client.call('test-model', { system: 's', user: 'u' })).rejects.toThrow(/400/);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('retries once without response_format when SERV rejects json_object (serv-swift 400)', async () => {
+    const rejectFormat = new Response(
+      JSON.stringify({
+        error: {
+          message:
+            'response_format `json_object` is not enforced for model `serv-swift` and no schema was provided to promote it.',
+        },
+      }),
+      { status: 400 },
+    );
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(rejectFormat)
+      .mockResolvedValueOnce(makeOkResponse('{"verdict":"PASS","confidence":0.88}'));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    const client = new HttpLlmClient(BINDING, ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep,
+      maxAttempts: 6,
+    });
+
+    const out = await client.call('test-model', { system: 's', user: 'u' });
+    expect(out.raw).toContain('PASS');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // First attempt includes response_format; fallback drops it.
+    const body1 = JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body ?? '{}'));
+    const body2 = JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body ?? '{}'));
+    expect(body1.response_format).toEqual({ type: 'json_object' });
+    expect(body2.response_format).toBeUndefined();
+    expect(sleep).not.toHaveBeenCalled(); // in-attempt fallback, not outer retry backoff
+  });
+
+  it('isResponseFormatRejected detects OpenServ swift rejection copy', () => {
+    expect(
+      isResponseFormatRejected(
+        'response_format `json_object` is not enforced for model `serv-swift` and no schema was provided to promote it.',
+      ),
+    ).toBe(true);
+    expect(isResponseFormatRejected('bad input')).toBe(false);
+    expect(isResponseFormatRejected('rate limit')).toBe(false);
+  });
+
+  it('skips response_format entirely for serv-swift (known reject)', async () => {
+    const swiftBinding: Record<string, ModelBinding> = {
+      'test-model': {
+        provider: 'serv',
+        modelId: 'serv-swift',
+        apiKeyEnv: 'TEST_API_KEY',
+        baseUrl: 'https://example.test/v1',
+      },
+    };
+    const fetchImpl = vi.fn().mockResolvedValueOnce(makeOkResponse('{"verdict":"PASS","confidence":0.9}'));
+    const client = new HttpLlmClient(swiftBinding, ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: vi.fn().mockResolvedValue(undefined),
+      maxAttempts: 2,
+    });
+    const out = await client.call('test-model', { system: 's', user: 'u' });
+    expect(out.raw).toContain('PASS');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body ?? '{}'));
+    expect(body.response_format).toBeUndefined();
+    expect(modelRejectsJsonObjectResponseFormat('serv-swift')).toBe(true);
+    expect(modelRejectsJsonObjectResponseFormat('serv-nano')).toBe(false);
   });
 
   it('throws after exhausting all attempts on persistent fetch failed', async () => {
