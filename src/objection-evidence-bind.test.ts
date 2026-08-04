@@ -107,10 +107,13 @@ describe('bindAxisResults', () => {
     });
     expect(b.surface_gated).toBe(true);
     expect(b.n_evidence_fail).toBeGreaterThanOrEqual(1);
-    expect(b.surface_axes[0].verdict).toBe('FAIL'); // unchanged
-    expect(b.surface_axes[0].objection).toMatch(/objection_evidence_fail/);
-    expect(b.surface_axes[0].reasoning).toMatch(/objection_evidence_fail/);
-    expect(b.surface_axes[1].reasoning).toBe('Action matches stated mandate.');
+    expect(b.surface_axes.length).toBeGreaterThanOrEqual(2);
+    const surface0 = b.surface_axes[0]!;
+    const surface1 = b.surface_axes[1]!;
+    expect(surface0.verdict).toBe('FAIL'); // unchanged
+    expect(surface0.objection).toMatch(/objection_evidence_fail/);
+    expect(surface0.reasoning).toMatch(/objection_evidence_fail/);
+    expect(surface1.reasoning).toBe('Action matches stated mandate.');
     expect(b.codes).toContain('numeric_exceed_false');
   });
 });
