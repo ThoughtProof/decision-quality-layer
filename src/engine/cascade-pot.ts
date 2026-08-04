@@ -164,6 +164,16 @@ export class PotCliCascade implements Cascade {
       //   aggregation Rule 2 (src/aggregation.ts, untouched) depends on this
       //   provenance to fail closed, and explicitly excludes 'served' axes,
       //   so mislabeling let provider failures leak through to ALLOW.
+      // - NEVER carry a served route (`provider_route`) on this path (PR #25
+      //   review fix): `provider_route` documents which route SERVED a
+      //   response (types.ts AxisResult docs; api/openapi.ts) and is
+      //   mutually exclusive with a fail-closed `provider_outcome`
+      //   ('provider_error'/'circuit_rejected'). Copying the PRIMARY's own
+      //   served route onto this composite (secondary-failed) axis produced
+      //   a self-contradictory result — a fail-closed axis claiming a route
+      //   served it — reachable in production any time a live secondary
+      //   fails after a served primary. Pre-regression PR #15 never carried
+      //   provider_route on this path either; restored that behavior.
       const note = `[cascade] secondary error — keeping primary verdict, attaching failure provenance (${err instanceof Error ? err.message.slice(0, 160) : 'unknown'})`;
       const providerOutcome = classifySecondaryFailure(err);
       const degraded: AxisResult = {
@@ -172,7 +182,6 @@ export class PotCliCascade implements Cascade {
         confidence: primary.result.confidence,
         reasoning: primary.result.reasoning,
         objection: primary.result.objection,
-        ...(primary.result.provider_route ? { provider_route: primary.result.provider_route } : {}),
         ...(providerOutcome ? { provider_outcome: providerOutcome } : {}),
       };
       return {

@@ -267,7 +267,10 @@ describe('PotCliCascade: secondary-unavailable provenance (primary as-served)', 
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('PASS'); // verdict preserved
     expect(out.result.provider_outcome).toBe('provider_error'); // truthful provenance, not 'served'
-    expect(out.result.provider_route).toBe('primary'); // primary's own route is still preserved
+    // PR #25 review fix: provider_route must NEVER co-occur with a
+    // fail-closed provider_outcome — primary's own served route is dropped
+    // on this degraded path, even though primary itself did carry one.
+    expect(out.result.provider_route).toBeUndefined();
     expect(out.result.reasoning).toMatch(/keeping primary/);
   });
 
@@ -279,7 +282,7 @@ describe('PotCliCascade: secondary-unavailable provenance (primary as-served)', 
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('PASS');
     expect(out.result.provider_outcome).toBe('circuit_rejected');
-    expect(out.result.provider_route).toBe('primary');
+    expect(out.result.provider_route).toBeUndefined(); // never co-occurs with fail-closed provenance
   });
 
   it('CircuitAllOpenError (attemptedRoutes=[primary]) secondary + primary PASS → PASS kept, provider_error attached', async () => {
@@ -301,11 +304,13 @@ describe('PotCliCascade: secondary-unavailable provenance (primary as-served)', 
     expect(out.result.verdict).toBe('PASS');
     // Not classifiable → classifySecondaryFailure returns undefined → no
     // provider_outcome key is set by the degraded-result branch at all.
-    // provider_route, however, is copied independently from the primary's
-    // own served route (set because this mock's primary call carried
-    // providerRoute: 'primary') — the two fields are decoupled by design.
+    // provider_route is dropped UNCONDITIONALLY on this degraded path (PR #25
+    // review fix) — even here, where provider_outcome ends up undefined,
+    // because the secondary DID fail (just non-classifiably) and this is not
+    // a "served" result; only the genuine deadline-skip (never-attempted)
+    // branch is allowed to claim a served route.
     expect(out.result.provider_outcome).toBeUndefined();
-    expect(out.result.provider_route).toBe('primary');
+    expect(out.result.provider_route).toBeUndefined();
   });
 
   it('primary FAIL (low-conf) + ProviderCallError secondary → FAIL kept, provider_error attached', async () => {

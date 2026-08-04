@@ -149,6 +149,10 @@ describe('Issue #24 — secondary-failure provenance decoupled from verdict pres
     expect(axis.verdict).toBe('PASS'); // verdict preserved — NOT demoted to UNCERTAIN
     expect(axis.confidence).toBe(0.6);
     expect(axis.provider_outcome).toBe('provider_error');
+    // PR #25 review fix: provider_route must never co-occur with a
+    // fail-closed provider_outcome, even though the primary step itself
+    // carried providerRoute: 'primary' (ScriptedClient's 'served' case).
+    expect(axis.provider_route).toBeUndefined();
     expect(response.aggregate.verdict).toBe('REVIEW');
     expect(response.aggregate.triggered_by).toEqual(['intent']);
     expect(response.aggregate.rationale).not.toBe('All evaluated axes pass.');
@@ -197,6 +201,7 @@ describe('Issue #24 — secondary-failure provenance decoupled from verdict pres
     expect(axis.verdict).toBe('FAIL'); // secondary failure must NOT weaken FAIL → UNCERTAIN
     expect(axis.confidence).toBe(0.6);
     expect(axis.provider_outcome).toBe('provider_error');
+    expect(axis.provider_route).toBeUndefined(); // never co-occurs with fail-closed provenance
     expect(response.aggregate.verdict).toBe('REVIEW'); // Rule 2 (provider provenance)
   });
 
@@ -258,6 +263,11 @@ describe('Issue #24 — secondary-failure provenance decoupled from verdict pres
     const response = await result;
     const axis = response.axes[0]!;
     expect(axis.provider_outcome).not.toBe('served');
+    // PR #25 review fix: a degraded (fail-closed-provenance) axis must never
+    // simultaneously claim a served route — that combination is a
+    // self-contradictory result the type contract (types.ts/openapi.ts)
+    // forbids.
+    expect(axis.provider_route).toBeUndefined();
     expect(axis.verdict).toBe('PASS'); // verdict preservation still holds
     expect(response.aggregate.verdict).not.toBe('ALLOW');
     expect(response.aggregate.rationale).not.toBe('All evaluated axes pass.');
@@ -272,6 +282,7 @@ describe('Issue #24 — secondary-failure provenance decoupled from verdict pres
     const axis = response.axes[0]!;
     expect(axis.verdict).toBe('UNCERTAIN');
     expect(axis.provider_outcome).toBe('provider_error');
+    expect(axis.provider_route).toBeUndefined(); // never co-occurs with fail-closed provenance
     expect(response.aggregate.verdict).toBe('REVIEW');
     expect(response.aggregate.rationale).toMatch(/provider\/auth failure/);
   });
