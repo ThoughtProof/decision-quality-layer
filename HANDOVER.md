@@ -2,8 +2,8 @@
 
 > **Language note:** This is a German one-page status doc (per the OpenClaw `DRAFTS/2026-08-04-dql-now-next-not.md` it replaces). Deep doc is in `docs/`. This file is the **current** single source of truth; prefer it over the old 2026-07-08 v0.2 HANDOVER.
 
-**Stand:** 2026-08-04 CEST (aktualisiert nach P0 #1)
-**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok`
+**Stand:** 2026-08-04 CEST (aktualisiert nach P0 #1 Redeploy + Issue #24)
+**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=face93d7…`
 **Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim.
 
 ---
@@ -15,7 +15,7 @@
 | Endpoint | `https://dql.thoughtproof.ai` |
 | Health | `status=ok` · cascade `pot-cli` · SERV key bound |
 | Runtime schema | `0.4.3.2-deadline-1` · `v0431_active=true` |
-| Deploy commit | `4238bf2` — objection evidence bind (axis surface) — Prod-Bereitstellung **unverändert** |
+| Deploy commit | **`face93d7`** — P0 #1 merge (API-key gate + prod line) · Health-SHA == main-SHA |
 | npm/package label | noch `0.2.0` (Label ≠ Runtime — nicht als Product-Version zitieren) |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
 | Flags | `capital_path_mode=true` · `disable_circuit_breaker=true` · `alias_gate_ready=false` · diagnostics on |
@@ -29,8 +29,8 @@
 
 | | |
 |---|---|
-| **`origin/main`** | **`face93d`** — squash `feat(dql): enforce API-key gate on non-sandbox /dql/verify (#22)` · CI **grün** (typecheck, test, build, Vercel) |
-| **Prod deploy** | weiterhin `4238bf2` (Code-Linie = die nach main gemergte; **Redeploy von main für einen kanonischen SHA ist der verbleibende Schritt**) |
+| **`origin/main`** | **`face93d7`** — squash `feat(dql): enforce API-key gate on non-sandbox /dql/verify (#22)` · CI **grün** (typecheck, test, build, Vercel) |
+| **Prod deploy** | **`face93d7`** — live via Health verifiziert (Redeploy erledigt; kanonischer SHA) |
 | DNS | `try.thoughtproof.ai` **NXDOMAIN** · `guardian.thoughtproof.ai` **NXDOMAIN** |
 | `HANDOVER.md` | ersetzt durch *dieses* Dok. |
 | `docs/ROADMAP.md` | **fehlt** im Tree |
@@ -44,24 +44,25 @@
 Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fest.
 
 ### P0 — Repo/Prod Hygiene
-1. ✅ **Prod-Linie nach `main` bringen** — **DONE 2026-08-04** (PR #22, main=`face93d`, CI grün). Offen: Prod-Redeploy von `main`, damit Health-SHA == main-SHA.
-2. ✅ **HANDOVER 1-pager ersetzen** — **dieses Dokument** (P0 #2).
+1. ✅ **Prod-Linie nach `main` bringen + Prod-Redeploy** — **DONE 2026-08-04** (PR #22, main=`face93d7`, CI grün, Health=`face93d7`).
+2. ✅ **HANDOVER 1-pager ersetzen** — **dieses Dokument** (P0 #2; PR #23).
 3. **Versionssemantik:** entweder package auf `0.4.3.2` heben oder public copy nur `config_schema_version` nennen.
+4. **P0 #4: Cascade-Provenienz-Regression fixen — [Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24)** — Secondary-Catch erzwingt `provider_outcome:"served"` auch bei echten `ProviderCallError`/`CircuitAllOpenError` → Aggregation Rule 2 tot → fail-open ALLOW (reopens #13/#14). Fix: primary **Verdict** behalten, Provenienz via `classifySecondaryFailure()`; Deadline-Skip bleibt as-served. Plus low-sev auth: constant-time key compare (`keys.ts:128`), API-Key nicht im Klartext in `emitUsageLine` (`usage.ts:82`).
 
 ### P1 — Product-usable Demo (ohne Launch-Theater)
-4. **Ein stabiler Demo-URL** (DNS *oder* klarer Canonical): Option A `app.thoughtproof.ai` / `guardian.thoughtproof.ai` → PWA · Option B bewusst nur `guardian-pwa.vercel.app`
-5. **try.thoughtproof.ai** — Playground stub **oder** Redirect — kein toter Name in Pitches
-6. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
+5. **Ein stabiler Demo-URL** (DNS *oder* klarer Canonical): Option A `app.thoughtproof.ai` / `guardian.thoughtproof.ai` → PWA · Option B bewusst nur `guardian-pwa.vercel.app`
+6. **try.thoughtproof.ai** — Playground stub **oder** Redirect — kein toter Name in Pitches
+7. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
 
 ### P2 — Gate vollständig (wenn Self-Serve gewollt)
-7. Stripe meter `dql_verify_call` @ **$0.05** (PAYMENT.md) — Raul-Hold erst bei Bedarf heben
-8. x402-Rail port von Sentinel (gleiche Wallet) — optional parallel
-9. Upstash/global rate-limit multi-instance verifizieren
+8. Stripe meter `dql_verify_call` @ **$0.05** (PAYMENT.md) — Raul-Hold erst bei Bedarf heben
+9. x402-Rail port von Sentinel (gleiche Wallet) — optional parallel
+10. Upstash/global rate-limit multi-instance verifizieren
 
 ### P3 — Reliability debt (nur wenn capital/high-SLA)
-10. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)
-11. Saubere **swift-primary recert** 100×N *nach* Recovery
-12. `alias_gate_ready=true` erst nach nachgewiesenem healthy-alias fraction Verhalten
+11. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)
+12. Saubere **swift-primary recert** 100×N *nach* Recovery
+13. `alias_gate_ready=true` erst nach nachgewiesenem healthy-alias fraction Verhalten
 
 ### Owned-verifiers Kopplung (nicht DQL-Roadmap, aber Reihenfolge)
 - Method order bleibt: **DQL validate → Sentinel economic shadow → authority last**
@@ -90,7 +91,7 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 
 ## 3 Moves (wenn nur 3)
 
-1. **Main = Prod** — main=`face93d` (DONE); Prod-Redeploy von main für kanonischen SHA
+1. **Cascade-Provenienz (#24)** — secondary error: Verdict behalten, `provider_error`/`circuit_rejected` setzen (fail-closed)
 2. **Ein Demo-Hostname** der auflöst (DNS oder Docs bereinigen)
 3. **Stripe an oder hard „invite-only key“** als ehrliche Public-Story — kein Halb-Gate
 
@@ -98,16 +99,17 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 
 ## Claim-Guard (Copy)
 
-**OK:** live DQL · 5 axes · nano→swift cascade · key-gated · sandbox free · consumer mandate check · objection-bound surface
+**OK:** live DQL · 5 axes · nano→swift cascade · key-gated · sandbox free · consumer mandate check · objection-bound surface · main=prod `face93d7`
 
 **Nicht OK ohne Denominator/SHA:** „100% accurate“, „prevents bad actions“, „capital-path CB proven in prod“, „try.thoughtproof.ai live“, package `0.2.0` als Feature-Stand
 
 ---
 
-## Quellen (Check 2026-08-04)
+## Quellen (Check 2026-08-04, abends)
 
-- Live: `dql.thoughtproof.ai/dql/health` → commit `4238bf2…`, schema `0.4.3.2-deadline-1`
-- Git: main=`face93d` (PR #22 gemergt 2026-08-04, CI success run `30945813537`); Prod-Depoly unverändert `4238bf2`
+- Live: `dql.thoughtproof.ai/dql/health` → `commit_sha: face93d7affb3f56a13459075a53c466c0c4f08a`, schema `0.4.3.2-deadline-1` (Prod-Redeploy verifiziert)
+- Git: main=`face93d7` (PR #22 gemergt 2026-08-04, CI success run `30945813537` auf main; branch tip CI `30945662873`)
+- Cascade-Provenienz-Regression: [Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24) (reopens #13/#14 composition gap)
 - DNS fail: `try.thoughtproof.ai`, `guardian.thoughtproof.ai`
 - PWA: `guardian-pwa.vercel.app` → 200
 - Memory: Jul Kalibrierungsbogen · 28.07 objection-bind · PAYMENT.md Phase-2
