@@ -1,136 +1,118 @@
-# HANDOVER — Decision Quality Layer (DQL)
+# DQL — Now / Next / Not (replaces old v0.2 HANDOVER)
 
-**Status:** v0.2 **live on production** at [`https://dql.thoughtproof.ai`](https://dql.thoughtproof.ai). Signed off with Spike-80 regression baseline. Dev-access only (no payment gate yet).
+> **Language note:** This is a German one-page status doc (per the OpenClaw `DRAFTS/2026-08-04-dql-now-next-not.md` it replaces). Deep doc is in `docs/`. This file is the **current** single source of truth; prefer it over the old 2026-07-08 v0.2 HANDOVER.
 
-**Owner handoff:** Raul (product / repo / baseline sign-off) → Hermes (merge policy / deploy discipline / on-call).
-
-**Last updated:** 2026-07-08 21:25 CEST, at commit `0800638`.
-
----
-
-## What is live now (v0.2)
-
-- **Public repo:** [ThoughtProof/decision-quality-layer](https://github.com/ThoughtProof/decision-quality-layer), MIT, `main` at `0800638`.
-- **Live URL:** [`https://dql.thoughtproof.ai`](https://dql.thoughtproof.ai) — version `0.2.0` on `GET /` and `GET /dql/health`.
-- **Cascade:** `DQL_CASCADE=pot-cli` — real `serv-nano` → `serv-swift` via SERV (`inference-api.openserv.ai`).
-- **Determinism:** temperature 0, seed 42 (Sentinel-congruent).
-- **Endpoints:** `GET /`, `GET /dql/health`, `GET /dql/axes`, `GET /openapi.json`, `POST /dql/verify` (`sandbox: true` for free deterministic test).
-- **Tests:** 73/73 hermetic, TypeScript clean, build clean.
-- **Regression baseline:** Spike-80 (see below) signed off on live SERV cascade.
-
-## Spike-80 regression baseline (2026-07-08)
-
-The canonical regression set. Any code change that could affect cascade output must re-run `npm run scenarios:spike-80-live` before merge.
-
-| Metric | Coarse-40 | Subtle-40 | **Spike-80** | Floor | Status |
-|---|---:|---:|---:|---:|:--:|
-| Parse rate | 100 % | 100 % | **100 %** | 100 % | ✅ |
-| Axis-hit rate | 97.5 % | 97.5 % | **97.5 %** (78/80) | ≥ 90 % | ✅ |
-| Mean pairwise correlation | 0.184 | **0.043** | **0.109** | ≤ 0.20 | ✅ |
-
-Full analysis, per-pair correlation table, approved marketing framing, and rejected framings all live in [`docs/SPIKE-RESULTS.md`](./docs/SPIKE-RESULTS.md).
-
-Files:
-- `scenarios/spike-40-coarse.jsonl` (40 coarse cases, 8 per axis)
-- `scenarios/spike-40-subtle.jsonl` (40 subtle cases, 8 per axis, real reasoning)
-- `scenarios/spike-80.jsonl` (concat, 80 cases)
-- `scenarios/spike-80-baseline-2026-07-08.json` (signed run report)
-
-Runners (in `package.json`):
-- `scenarios:spike-coarse` / `scenarios:spike-subtle` / `scenarios:spike-80` — local cascade, needs `SERV_API_KEY`
-- `scenarios:spike-80-live` — POST to `https://dql.thoughtproof.ai/dql/verify`, no local key needed, ~$1.60 per full run
+**Stand:** 2026-08-04 CEST (aktualisiert nach P0 #1 Redeploy + Issue #24)
+**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=face93d7…`
+**Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim.
 
 ---
 
-## Nine fixes that must not regress
+## NOW (was wirklich live ist)
 
-Committed today. Any PR must preserve these:
+| Feld | Wert |
+|---|---|
+| Endpoint | `https://dql.thoughtproof.ai` |
+| Health | `status=ok` · cascade `pot-cli` · SERV key bound |
+| Runtime schema | `0.4.3.2-deadline-1` · `v0431_active=true` |
+| Deploy commit | **`face93d7`** — P0 #1 merge (API-key gate + prod line) · Health-SHA == main-SHA |
+| npm/package label | noch `0.2.0` (Label ≠ Runtime — nicht als Product-Version zitieren) |
+| Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
+| Flags | `capital_path_mode=true` · `disable_circuit_breaker=true` · `alias_gate_ready=false` · diagnostics on |
+| Cascade | `serv-nano` → `serv-swift` (OpenServ) |
+| Product lane | **Consumer Trust** (mandate vs geplante Aktion) — **nicht** Sentinel/PLV Banking |
+| Surfaces | API live · Extension DQL-path (dogfood) · Guardian PWA demo `200` (`guardian-pwa.vercel.app`) |
+| Proof artifacts | ADSB S4 claims mit Denominator · Blog decision-quality · Paris BLOCK receipt (Dmitry) |
+| Objection integrity | P1 surface-bind live (28.07) — verdicts unverändert, objections/reasoning gebunden |
 
-**Congruence (`a6c401a`):**
-1. SERV bindings (not OpenAI/Groq) — `serv-nano` → `serv-swift` via `SERV_API_KEY`.
-2. Determinism pinned — `temperature: 0`, `seed: 42`.
-3. `confirmFail` optionality — env-gated `DQL_CONFIRM_FAIL`, default OFF, mirrors Sentinel `confirmBlocks`.
-4. ADR-0007 corrected — DQL runs two SERV capability tiers, not two vendor families.
-5. Docs / OpenAPI / scenarios aligned to one key (`SERV_API_KEY`).
+### Git-Stand nach P0 #1 (2026-08-04)
 
-**Deploy:**
-6. Functions-only build (`15677f0`) — `buildCommand: ""`, `outputDirectory: "."`, no `public/`.
-7. `max_completion_tokens` for SERV (`05eb863`) — legacy `max_tokens` returned HTTP 400, silently defaulted cascade to `UNCERTAIN@0` (parse-rate looked fine while nothing evaluated).
-8. `DQL_CASCADE` env-trim (`2040ce6`) — trailing newline in Vercel env value silently disabled real cascade.
+| | |
+|---|---|
+| **`origin/main`** | **`face93d7`** — squash `feat(dql): enforce API-key gate on non-sandbox /dql/verify (#22)` · CI **grün** (typecheck, test, build, Vercel) |
+| **Prod deploy** | **`face93d7`** — live via Health verifiziert (Redeploy erledigt; kanonischer SHA) |
+| DNS | `try.thoughtproof.ai` **NXDOMAIN** · `guardian.thoughtproof.ai` **NXDOMAIN** |
+| `HANDOVER.md` | ersetzt durch *dieses* Dok. |
+| `docs/ROADMAP.md` | **fehlt** im Tree |
 
-**Test coverage:**
-9. 73/73 tests green.
-
----
-
-## Merge policy (Hermes-owned)
-
-For any PR into `main`:
-
-- Must rebase cleanly on current `origin/main` (do not merge stale branches — they may re-introduce fixed bugs).
-- `npm test` must be 73/73 green.
-- If the PR touches `src/engine/**` or `api/dql/verify.ts`, additionally require a `spike-80-live` re-run (~$1.60) before merge.
-- Post-merge, verify `dql.thoughtproof.ai/dql/health` returns 0.2.x within 90 seconds of the Vercel deploy.
-
-## Marketing / product-copy discipline
-
-**Approved framing** (from `docs/SPIKE-RESULTS.md`):
-> "Five axes that isolate different failure types. On coarse errors many axes fire in agreement (genuine multi-axis violation). On subtle errors the axes separate: mean pairwise correlation is 0.04 on a subtle-only test set and 0.11 on a mixed set, with six of ten axis-pairs near-zero correlated."
-
-**Rejected framings — enforce:**
-- "prevents malicious actions" / "stops X" / "schützt vor" — DQL grades reasoning, does not guarantee action safety
-- "one axis per failure" / "cleanly isolates each error" — data doesn't support this on coarse errors
-- "5-dimensional Sentinel" — Sentinel is a different product, single-verdict, separate deploy
-
-## Constraints — do not violate
-
-1. **Do NOT modify `thoughtproof-sentinel`.** DQL is a separate product on its own repo, own endpoint, own cascade config. Sentinel carries live money and stays untouched.
-2. **Do NOT re-brand DQL as a Sentinel variant** in public copy.
-3. **Standard-only cascade.** Do NOT expose a "checkpoint" / nano-solo tier — nano-solo oscillates on borderline cases in prod Sentinel.
-4. **No freemium.** Consumer decisions are low-frequency; a monthly free tier would let 99 % never pay. See [docs/PAYMENT.md](./docs/PAYMENT.md).
-5. **BrowseSafe is not a DQL cross-benchmark.** See [ADR-0008](./docs/adr/ADR-0008-reject-browsesafe-cross-benchmark.md). Content classifiers ≠ decision-reasoning classifiers.
-
-## Decisions locked
-
-- **Domain:** `dql.thoughtproof.ai` — deployed.
-- **Cascade:** `serv-nano` → `serv-swift`, temp 0 / seed 42.
-- **x402 wallet:** same as Sentinel — `0xAB9f84864662f980614bD1453dB9950Ef2b82E83`. No separate DQL wallet.
-- **Stripe:** reuse the existing ThoughtProof Stripe account. New meter `dql_verify_call` inside it.
-- **Waitlist comms:** hold. No announcement until Spike-80 has held over at least one non-trivial code change — i.e. the watchdog is proven in anger, not just at initial setup.
-- **BrowseSafe cross-benchmark:** closed permanently (ADR-0008).
+**Regel:** Health-JSON + Deploy-SHA schlagen README.
 
 ---
 
-## What is NOT done (v0.3 roadmap)
+## NEXT (priorisiert, klein)
 
-### 1. Payment gates (Stripe metered + x402)
+Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fest.
 
-Spec'd in [`docs/PAYMENT.md`](./docs/PAYMENT.md), not wired yet. v0.2 is dev-access only. Requires:
+### P0 — Repo/Prod Hygiene
+1. ✅ **Prod-Linie nach `main` bringen + Prod-Redeploy** — **DONE 2026-08-04** (PR #22, main=`face93d7`, CI grün, Health=`face93d7`).
+2. ✅ **HANDOVER 1-pager ersetzen** — **dieses Dokument** (P0 #2; PR #23).
+3. **Versionssemantik:** entweder package auf `0.4.3.2` heben oder public copy nur `config_schema_version` nennen.
+4. **P0 #4: Cascade-Provenienz-Regression fixen — [Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24)** — Secondary-Catch erzwingt `provider_outcome:"served"` auch bei echten `ProviderCallError`/`CircuitAllOpenError` → Aggregation Rule 2 tot → fail-open ALLOW (reopens #13/#14). Fix: primary **Verdict** behalten, Provenienz via `classifySecondaryFailure()`; Deadline-Skip bleibt as-served. Plus low-sev auth: constant-time key compare (`keys.ts:128`), API-Key nicht im Klartext in `emitUsageLine` (`usage.ts:82`).
 
-- Port `src/auth.ts` from `thoughtproof-sentinel` (API-key validation + Upstash rate limiting).
-- Emit `dql_verify_call` Stripe meter event per non-sandbox call.
-- Port `src/middleware/x402.ts` from `thoughtproof-sentinel` with DQL prices.
-- Sandbox path (`sandbox: true`) already implemented in v0.2, skips gate entirely.
+### P1 — Product-usable Demo (ohne Launch-Theater)
+5. **Ein stabiler Demo-URL** (DNS *oder* klarer Canonical): Option A `app.thoughtproof.ai` / `guardian.thoughtproof.ai` → PWA · Option B bewusst nur `guardian-pwa.vercel.app`
+6. **try.thoughtproof.ai** — Playground stub **oder** Redirect — kein toter Name in Pitches
+7. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
 
-**Blocked by:** waitlist-comms gate — Spike-80 must hold across one real code change first.
+### P2 — Gate vollständig (wenn Self-Serve gewollt)
+8. Stripe meter `dql_verify_call` @ **$0.05** (PAYMENT.md) — Raul-Hold erst bei Bedarf heben
+9. x402-Rail port von Sentinel (gleiche Wallet) — optional parallel
+10. Upstash/global rate-limit multi-instance verifizieren
 
-### 2. External reasoning benchmark (τ-bench / AgentBench / WebArena)
+### P3 — Reliability debt (nur wenn capital/high-SLA)
+11. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)
+12. Saubere **swift-primary recert** 100×N *nach* Recovery
+13. `alias_gate_ready=true` erst nach nachgewiesenem healthy-alias fraction Verhalten
 
-If external legitimation is required later, this is the right family (agentic reasoning benches with native task-trace shape). Not started, not on this week's roadmap.
-
-### 3. HF endpoint (BrowseSafe-Bench track — now closed)
-
-Track sunset alongside ADR-0008. The HF-token rotation (`hf_PdI...` → new token in `~/Desktop/HF.pdf`) is decoupled from DQL and lives on Raul's personal-security list, not on this repo's roadmap.
-
-### 4. `confirmFail=ON` A/B on live traffic
-
-`DQL_CONFIRM_FAIL` env exists, defaults OFF. Once we have payment traffic and a signal source, run an A/B to measure whether ON reduces false-positives on high-confidence FAIL without impacting recall. Deferred until payment lands.
+### Owned-verifiers Kopplung (nicht DQL-Roadmap, aber Reihenfolge)
+- Method order bleibt: **DQL validate → Sentinel economic shadow → authority last**
+- **KEEP_RUN1 · Authority 0 · no train without explicit go**
 
 ---
 
-## Timing
+## NOT (bewusst nein / geparkt)
 
-- Today: 2026-07-08 → 7 weeks runway to the 2026-09-01 wind-down deadline.
-- v0.2 live: 2026-07-08 (today). Ahead of the 10–15-day build plan by ~1 week.
-- Payment landing target: mid-to-late July, gated on Spike-80 in-anger validation.
-- Launch window: second half of August, if payment lands and no v0.2 regressions surface.
+| Item | Warum |
+|---|---|
+| DQL = Banking/PLV/Sentinel rebrand | Andere Lane; vermischen killt Positionierung |
+| Option E Aggregation „härter“ auf v041d | Engpass war Achse/Curation, nicht Agg; Recall-Risiko |
+| capitalPathMode=false + CB on in Prod „weil Code da“ | Recert nie clean grün; Recovery-Blindspot live gesehen |
+| Freemium / monthly free tier | PAYMENT.md: low-frequency consumer → nie pay |
+| BYOK tier | Surface-Komplexität ohne Segment-Gewinn |
+| Product Hunt / PWA-as-Launch | Demo-only; rate-limit, no self-serve loop |
+| BrowseSafe als DQL-Bench | ADR-0008 permanent reject |
+| try.thoughtproof.ai als „Launch live“ claimen | DNS tot (Stand Check) |
+| Railway/alt-host als „schneller als Vercel“ | PoC negativ (22.07) |
+| AgentDojo/WebArena diese Woche | Post-stable external legitimation only |
+| Owned-verifier Training / Authority>0 | Explizites Go fehlt; STOP gilt |
+| GCP Credits als DQL-Blocker | Unrelated; Credits geparkt |
+
+---
+
+## 3 Moves (wenn nur 3)
+
+1. **Cascade-Provenienz (#24)** — secondary error: Verdict behalten, `provider_error`/`circuit_rejected` setzen (fail-closed)
+2. **Ein Demo-Hostname** der auflöst (DNS oder Docs bereinigen)
+3. **Stripe an oder hard „invite-only key“** als ehrliche Public-Story — kein Halb-Gate
+
+---
+
+## Claim-Guard (Copy)
+
+**OK:** live DQL · 5 axes · nano→swift cascade · key-gated · sandbox free · consumer mandate check · objection-bound surface · main=prod `face93d7`
+
+**Nicht OK ohne Denominator/SHA:** „100% accurate“, „prevents bad actions“, „capital-path CB proven in prod“, „try.thoughtproof.ai live“, package `0.2.0` als Feature-Stand
+
+---
+
+## Quellen (Check 2026-08-04, abends)
+
+- Live: `dql.thoughtproof.ai/dql/health` → `commit_sha: face93d7affb3f56a13459075a53c466c0c4f08a`, schema `0.4.3.2-deadline-1` (Prod-Redeploy verifiziert)
+- Git: main=`face93d7` (PR #22 gemergt 2026-08-04, CI success run `30945813537` auf main; branch tip CI `30945662873`)
+- Cascade-Provenienz-Regression: [Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24) (reopens #13/#14 composition gap)
+- DNS fail: `try.thoughtproof.ai`, `guardian.thoughtproof.ai`
+- PWA: `guardian-pwa.vercel.app` → 200
+- Memory: Jul Kalibrierungsbogen · 28.07 objection-bind · PAYMENT.md Phase-2
+- ADSB/Blog: controlled autonomy / decision quality framing
+
+**Owner:** Raul product calls · Paul/Hermes exec only on explicit go for merge/DNS/Stripe.
