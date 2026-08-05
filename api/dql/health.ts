@@ -43,8 +43,10 @@ import {
   ProductionConfigError,
   CONFIG_SCHEMA_VERSION,
 } from '../../src/engine/production-config.js';
+import { PACKAGE_VERSION } from '../../src/package-version.js';
 
-const VERSION = '0.2.0';
+/** Artifact version (package.json). See docs/ENV.md § Version semantics. */
+const VERSION = PACKAGE_VERSION;
 
 function readCommitSha(env: NodeJS.ProcessEnv): string | null {
   // Vercel populates VERCEL_GIT_COMMIT_SHA automatically on git-integration
