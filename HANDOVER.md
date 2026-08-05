@@ -2,8 +2,8 @@
 
 > **Language note:** This is a German one-page status doc (per the OpenClaw `DRAFTS/2026-08-04-dql-now-next-not.md` it replaces). Deep doc is in `docs/`. This file is the **current** single source of truth; prefer it over the old 2026-07-08 v0.2 HANDOVER.
 
-**Stand:** 2026-08-04 CEST (aktualisiert nach P0 #1 Redeploy + Issue #24)
-**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=face93d7…`
+**Stand:** 2026-08-05 CEST (nach PR #25 merge + Prod-Deploy; P0 Recovery → #26)
+**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=e2e62179…`
 **Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim.
 
 ---
@@ -15,7 +15,7 @@
 | Endpoint | `https://dql.thoughtproof.ai` |
 | Health | `status=ok` · cascade `pot-cli` · SERV key bound |
 | Runtime schema | `0.4.3.2-deadline-1` · `v0431_active=true` |
-| Deploy commit | **`face93d7`** — P0 #1 merge (API-key gate + prod line) · Health-SHA == main-SHA |
+| Deploy commit | **`e2e62179`** — PR #25 merge (provenance decoupling + auth harden) · Health-SHA == main-SHA |
 | npm/package label | noch `0.2.0` (Label ≠ Runtime — nicht als Product-Version zitieren) |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
 | Flags | `capital_path_mode=true` · `disable_circuit_breaker=true` · `alias_gate_ready=false` · diagnostics on |
@@ -25,17 +25,19 @@
 | Proof artifacts | ADSB S4 claims mit Denominator · Blog decision-quality · Paris BLOCK receipt (Dmitry) |
 | Objection integrity | P1 surface-bind live (28.07) — verdicts unverändert, objections/reasoning gebunden |
 
-### Git-Stand nach P0 #1 (2026-08-04)
+### Git-Stand nach PR #25 (2026-08-05)
 
 | | |
 |---|---|
-| **`origin/main`** | **`face93d7`** — squash `feat(dql): enforce API-key gate on non-sandbox /dql/verify (#22)` · CI **grün** (typecheck, test, build, Vercel) |
-| **Prod deploy** | **`face93d7`** — live via Health verifiziert (Redeploy erledigt; kanonischer SHA) |
+| **`origin/main`** | **`e2e62179`** — merge `fix(cascade): decouple… (#25)` · CI **grün** |
+| **Prod deploy** | **`e2e62179`** — live via Health verifiziert (`dql.thoughtproof.ai`) |
+| **Provenance track** | ✅ closed — Secondary-Outage → ehrliches REVIEW (nicht silent ALLOW); reopens #13/#14 closed via #24/#25 |
 | DNS | `try.thoughtproof.ai` **NXDOMAIN** · `guardian.thoughtproof.ai` **NXDOMAIN** |
-| `HANDOVER.md` | ersetzt durch *dieses* Dok. |
-| `docs/ROADMAP.md` | **fehlt** im Tree |
+| `HANDOVER.md` | dieses Dokument |
 
 **Regel:** Health-JSON + Deploy-SHA schlagen README.
+
+**Ops:** Mehr REVIEW nach #25 = Fix bei der Arbeit (Secondary-Failure ehrlich), kein neuer Bug.
 
 ---
 
@@ -44,25 +46,26 @@
 Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fest.
 
 ### P0 — Repo/Prod Hygiene
-1. ✅ **Prod-Linie nach `main` bringen + Prod-Redeploy** — **DONE 2026-08-04** (PR #22, main=`face93d7`, CI grün, Health=`face93d7`).
+1. ✅ **Prod-Linie nach `main` bringen + Prod-Redeploy** — **DONE 2026-08-04** (PR #22, then superseded by later main).
 2. ✅ **HANDOVER 1-pager ersetzen** — **dieses Dokument** (P0 #2; PR #23).
 3. **Versionssemantik:** entweder package auf `0.4.3.2` heben oder public copy nur `config_schema_version` nennen.
-4. **P0 #4: Cascade-Provenienz-Regression fixen — [Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24)** — Secondary-Catch erzwingt `provider_outcome:"served"` auch bei echten `ProviderCallError`/`CircuitAllOpenError` → Aggregation Rule 2 tot → fail-open ALLOW (reopens #13/#14). Fix: primary **Verdict** behalten, Provenienz via `classifySecondaryFailure()`; Deadline-Skip bleibt as-served. Plus low-sev auth: constant-time key compare (`keys.ts:128`), API-Key nicht im Klartext in `emitUsageLine` (`usage.ts:82`).
+4. ✅ **Cascade-Provenienz-Regression** — **DONE 2026-08-05** ([Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24) / [PR #25](https://github.com/ThoughtProof/decision-quality-layer/pull/25) → main/`e2e62179`). Verdict preservation decoupled from truthful `provider_outcome`; auth constant-time + key fingerprint logs. Preview spike ≈ prod; interim engine-merge gate documented on PR.
+5. **P0 #5: Prod spike-80 recovery ≥90%** — [Issue #26](https://github.com/ThoughtProof/decision-quality-layer/issues/26). Live axis-hit ~66% vs July baseline 97.5%. Bisect config/model/latency (4s→17s); risk/consistency/reversibility; UNCERTAIN@0.95 cluster. P1: persist `provider_outcome`/`provider_route` in HTTP spike report. **Interim gate** (≤5 pp vs current prod + fail-open ban) **expires when this closes** → absolute floor gate returns.
 
 ### P1 — Product-usable Demo (ohne Launch-Theater)
-5. **Ein stabiler Demo-URL** (DNS *oder* klarer Canonical): Option A `app.thoughtproof.ai` / `guardian.thoughtproof.ai` → PWA · Option B bewusst nur `guardian-pwa.vercel.app`
-6. **try.thoughtproof.ai** — Playground stub **oder** Redirect — kein toter Name in Pitches
-7. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
+6. **Ein stabiler Demo-URL** (DNS *oder* klarer Canonical): Option A `app.thoughtproof.ai` / `guardian.thoughtproof.ai` → PWA · Option B bewusst nur `guardian-pwa.vercel.app`
+7. **try.thoughtproof.ai** — Playground stub **oder** Redirect — kein toter Name in Pitches
+8. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
 
 ### P2 — Gate vollständig (wenn Self-Serve gewollt)
-8. Stripe meter `dql_verify_call` @ **$0.05** (PAYMENT.md) — Raul-Hold erst bei Bedarf heben
-9. x402-Rail port von Sentinel (gleiche Wallet) — optional parallel
-10. Upstash/global rate-limit multi-instance verifizieren
+9. Stripe meter `dql_verify_call` @ **$0.05** (PAYMENT.md) — Raul-Hold erst bei Bedarf heben
+10. x402-Rail port von Sentinel (gleiche Wallet) — optional parallel
+11. Upstash/global rate-limit multi-instance verifizieren
 
 ### P3 — Reliability debt (nur wenn capital/high-SLA)
-11. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)
-12. Saubere **swift-primary recert** 100×N *nach* Recovery
-13. `alias_gate_ready=true` erst nach nachgewiesenem healthy-alias fraction Verhalten
+12. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)
+13. Saubere **swift-primary recert** 100×N *nach* Recovery
+14. `alias_gate_ready=true` erst nach nachgewiesenem healthy-alias fraction Verhalten
 
 ### Owned-verifiers Kopplung (nicht DQL-Roadmap, aber Reihenfolge)
 - Method order bleibt: **DQL validate → Sentinel economic shadow → authority last**
