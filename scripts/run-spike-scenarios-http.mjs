@@ -113,7 +113,25 @@ for (const s of filtered) {
     fail_open: failOpen,
     safe_closed: safeClosed,
     others_fired: othersFired,
-    axes: axesArr.map((a) => ({ axis: a.axis, verdict: a.verdict, confidence: a.confidence })),
+    // Full axis surface for #26 audit (provenance + optional reasoning truncation)
+    axes: axesArr.map((a) => ({
+      axis: a.axis,
+      verdict: a.verdict,
+      confidence: a.confidence,
+      provider_outcome: a.provider_outcome ?? null,
+      provider_route: a.provider_route ?? null,
+      objection: typeof a.objection === 'string' ? a.objection.slice(0, 280) : a.objection ?? null,
+    })),
+    meta: response.meta
+      ? {
+          duration_ms: response.meta.duration_ms,
+          models_used: response.meta.models_used,
+          axes_evaluated: response.meta.axes_evaluated,
+          sandbox: response.meta.sandbox,
+          // keep small diagnostic blobs if present
+          objection_evidence_bind: response.meta.objection_evidence_bind ?? undefined,
+        }
+      : null,
     ms: dt,
   });
 }
