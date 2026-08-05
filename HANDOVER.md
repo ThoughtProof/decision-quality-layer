@@ -2,8 +2,8 @@
 
 > **Language note:** This is a German one-page status doc (per the OpenClaw `DRAFTS/2026-08-04-dql-now-next-not.md` it replaces). Deep doc is in `docs/`. This file is the **current** single source of truth; prefer it over the old 2026-07-08 v0.2 HANDOVER.
 
-**Stand:** 2026-08-05 CEST (nach PR #25 merge + Prod-Deploy; P0 Recovery → #26)
-**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=e2e62179…`
+**Stand:** 2026-08-05 CEST (PR #28 hybrid gate live; #26 partial — risk matops + fail_open metrics)
+**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=f9b33990…`
 **Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim.
 
 ---
@@ -15,7 +15,7 @@
 | Endpoint | `https://dql.thoughtproof.ai` |
 | Health | `status=ok` · cascade `pot-cli` · SERV key bound |
 | Runtime schema | `0.4.3.2-deadline-1` · `v0431_active=true` |
-| Deploy commit | **`e2e62179`** — PR #25 merge (provenance decoupling + auth harden) · Health-SHA == main-SHA |
+| Deploy commit | **`f9b33990`** — PR #28 (#26 hybrid: risk material-ops recall + spike fail_open/safe_closed gate) · Health-SHA == main-SHA |
 | npm/package label | noch `0.2.0` (Label ≠ Runtime — nicht als Product-Version zitieren) |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
 | Flags | `capital_path_mode=true` · `disable_circuit_breaker=true` · `alias_gate_ready=false` · diagnostics on |
@@ -50,7 +50,7 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 2. ✅ **HANDOVER 1-pager ersetzen** — **dieses Dokument** (P0 #2; PR #23).
 3. **Versionssemantik:** entweder package auf `0.4.3.2` heben oder public copy nur `config_schema_version` nennen.
 4. ✅ **Cascade-Provenienz-Regression** — **DONE 2026-08-05** ([Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24) / [PR #25](https://github.com/ThoughtProof/decision-quality-layer/pull/25) → main/`e2e62179`). Verdict preservation decoupled from truthful `provider_outcome`; auth constant-time + key fingerprint logs. Preview spike ≈ prod; interim engine-merge gate documented on PR.
-5. **P0 #5: Prod spike-80 recovery ≥90%** — [Issue #26](https://github.com/ThoughtProof/decision-quality-layer/issues/26). Live axis-hit ~66% vs July baseline 97.5%. Bisect config/model/latency (4s→17s); risk/consistency/reversibility; UNCERTAIN@0.95 cluster. P1: persist `provider_outcome`/`provider_route` in HTTP spike report. **Interim gate** (≤5 pp vs current prod + fail-open ban) **expires when this closes** → absolute floor gate returns.
+5. **P0 #5: Prod spike-80 recovery ≥90%** — [Issue #26](https://github.com/ThoughtProof/decision-quality-layer/issues/26). **Partial 2026-08-05:** [PR #28](https://github.com/ThoughtProof/decision-quality-layer/pull/28) shipped risk INFRA material-ops prose + hybrid gate (`fail_open=0` hard, `safe_closed≥95%` over misses; axis-hit soft). Preview DoD: fail_open **0**, safe_closed **100%**, rev-06 **REVIEW**, hybrid **PASSED** (axis-hit still ~69% soft). Open: drive axis-hit toward ≥90% vs July; UNCERTAIN@0.95 cluster; optional provenance fields in spike report. Interim relative gate still time-boxed to this issue.
 
 ### P1 — Product-usable Demo (ohne Launch-Theater)
 6. **Ein stabiler Demo-URL** (DNS *oder* klarer Canonical): Option A `app.thoughtproof.ai` / `guardian.thoughtproof.ai` → PWA · Option B bewusst nur `guardian-pwa.vercel.app`
