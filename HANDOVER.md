@@ -51,7 +51,9 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 2. ✅ **HANDOVER 1-pager ersetzen** — **dieses Dokument** (P0 #2; PR #23).
 3. ✅ **Versionssemantik (P0 #3)** — **DONE 2026-08-05:** keep package `0.2.0` (artifact); `config_schema_version` = runtime. One-sentence rule in `docs/ENV.md`; `PACKAGE_VERSION` single source from `package.json` (health/verify); CI hermetic test asserts health==package and axes stay distinct.
 4. ✅ **Cascade-Provenienz-Regression** — **DONE 2026-08-05** ([Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24) / [PR #25](https://github.com/ThoughtProof/decision-quality-layer/pull/25) → main/`e2e62179`). Verdict preservation decoupled from truthful `provider_outcome`; auth constant-time + key fingerprint logs. Preview spike ≈ prod; interim engine-merge gate documented on PR.
-5. **P0 #5: Prod spike-80 recovery ≥90%** — [Issue #26](https://github.com/ThoughtProof/decision-quality-layer/issues/26). **Partial 2026-08-05:** [PR #28](https://github.com/ThoughtProof/decision-quality-layer/pull/28) hybrid gate live (fail_open 0). **Recovery sketch:** `docs/issues/ISSUE26_AXIS_HIT_RECOVERY.md` — 25 misses: consistency PASS×9, reversibility UNCERTAIN-cluster×7 (often STEP 1c by design — do not force FAIL), residual risk×4. HTTP spike now persists provenance/meta. **Metric honesty DONE (PR #29):** dual axis_hit_strict/useful forever; sole UNCERTAIN-ok=`subtle-rev-01` (Honey-approved). Next: optional consistency recall PR — **not** blanket UNCERTAIN→FAIL.
+5. ✅ **P0 #5 / Issue #26 CLOSED (option 3 · 2026-08-05)** — fail_open 0 + safe_closed floors; consistency #31 + risk lockin #33; dual axis-hit forever (#29); rev useful-ok only stable STEP 1c (`subtle-rev-01`); `rev-06` → risk with `expected_v1=reversibility`. Close doc: `docs/issues/ISSUE26_CLOSE.md`. Follow-ups: rev-01/02 drift ops only — **not** % chase.
+
+
 
 ### P1 — Product-usable Demo (ohne Launch-Theater)
 6. **Ein stabiler Demo-URL** (DNS *oder* klarer Canonical): Option A `app.thoughtproof.ai` / `guardian.thoughtproof.ai` → PWA · Option B bewusst nur `guardian-pwa.vercel.app`
