@@ -1,29 +1,50 @@
 /**
- * Secondary-unavailable composition (engine↔aggregation) after the
- * primary-as-served product contract (demo 2026-07-21).
+ * Issue #24 (decouple primary-verdict preservation from provider-failure
+ * provenance suppression) — restores the issue #14 fail-closed guarantee
+ * while keeping the legitimate Guardian-UX verdict-preservation fix from
+ * PR #22.
  *
  * Complements the §D6 whole-cascade tests in `engine-provider-outcome.test.ts`.
  * D6 covers "the ENTIRE cascade throws" (engine catch sets provenance). This
- * file covers: "primary SERVED a real judgment, secondary THROWS". The error
- * is caught INSIDE PotCliCascade.run — the cascade returns normally.
+ * file covers the complementary composition path D6 did NOT: "primary
+ * SERVED, secondary THROWS". There the error is caught INSIDE
+ * PotCliCascade.run — the cascade returns normally, the engine's D6 catch
+ * never fires.
  *
- * Product contract (cascade-pot.ts):
- *   - Primary PASS/FAIL + secondary down → KEEP primary as-served.
- *     Do NOT destroy PASS→UNCERTAIN+provider_error (that made Guardian show
- *     INCOMPLETE on axes that already had a valid nano result).
- *   - Primary already UNCERTAIN + secondary down → escalate with
- *     provider_error | circuit_rejected (primary never served a real judgment).
+ * Product contract (cascade-pot.ts, post issue #24 fix):
+ *   - Primary PASS/FAIL/UNCERTAIN + secondary real failure → KEEP the
+ *     primary's verdict/confidence/reasoning (do NOT demote PASS/FAIL to
+ *     UNCERTAIN — that was the legitimate Guardian-UX fix from PR #22,
+ *     demo 2026-07-21) BUT attach truthful provider_error | circuit_rejected
+ *     provenance via classifySecondaryFailure(), never 'served'.
+ *   - Aggregation Rule 2 (src/aggregation.ts, untouched by this fix) then
+ *     escalates ANY axis carrying that provenance to REVIEW-or-stricter,
+ *     independent of confidence — this is what closes the fail-open gap.
+ *   - Generic (non-provider) secondary errors carry NO provider provenance
+ *     (mirrors the engine's §D6 negative discrimination) — verdict is still
+ *     kept, but Rule 2 does not fire for those.
  *
- * Discriminating cases:
- *   a  secondary ProviderCallError + primary PASS conf<0.7   → ALLOW (as-served)
- *   b  secondary ProviderCallError + primary PASS conf>=0.7  → ALLOW (as-served)
- *   c  generic secondary error + primary PASS                → ALLOW (as-served)
- *   d  primary FAIL conf 0.5–0.7 + secondary failure          → REVIEW, FAIL kept
+ * Mapping to the original issue #14 acceptance table (pre-face93d7, PR #15,
+ * commit f297e7e) — same discriminating cases, updated for verdict
+ * preservation (axis verdict now stays PASS/FAIL instead of being demoted to
+ * UNCERTAIN; the REVIEW/BLOCK/ALLOW outcome and provenance truthfulness
+ * guarantees are unchanged):
+ *   a  secondary ProviderCallError + primary PASS conf<0.7   → REVIEW, PASS kept
+ *   b  secondary ProviderCallError + primary PASS conf>=0.7  → REVIEW via
+ *      provenance (NOT confidence), PASS kept
+ *   c  generic (non-provider) secondary error                → baseline policy
+ *      preserved (PASS kept, no provenance → ALLOW)
+ *   d  primary FAIL conf 0.5–0.7 + secondary failure          → REVIEW, FAIL
+ *      not weakened
  *   e  primary high-conf FAIL early-exit (secondary skipped)  → BLOCK
  *   f  both draws served                                      → unchanged
- *   g  CircuitAllOpenError secondary + primary PASS           → ALLOW (as-served)
- *   h  truth: secondary-unavailable note present; served retained on PASS
- *   i  primary UNCERTAIN + secondary ProviderCallError        → REVIEW via provenance
+ *   g1 CircuitAllOpenError attemptedRoutes=[] → circuit_rejected, REVIEW, PASS kept
+ *   g2 CircuitAllOpenError attemptedRoutes=[primary] → provider_error, REVIEW, PASS kept
+ *   h  truth assertions: degraded axis never carries 'served'; rationale is
+ *      truthful (NEVER "All evaluated axes pass." when a real provider
+ *      failure occurred)
+ *   i  primary UNCERTAIN + secondary ProviderCallError        → REVIEW via
+ *      provenance, verdict stays UNCERTAIN
  */
 
 import { describe, it, expect } from 'vitest';
@@ -111,29 +132,33 @@ function run(plan: Step[]) {
       request: REQ,
       cascade,
       sandboxCascade: new SandboxCascade(),
-      requestId: 'dql_primary_as_served',
+      requestId: 'dql_issue24',
       version: '0.4.3.1-test',
     }),
   };
 }
 
-describe('Primary as-served — secondary-unavailable composition (engine↔aggregation)', () => {
-  it('a) secondary ProviderCallError + primary PASS conf<0.7 → ALLOW (as-served)', async () => {
+describe('Issue #24 — secondary-failure provenance decoupled from verdict preservation (engine↔aggregation)', () => {
+  it('a) secondary ProviderCallError + primary PASS conf<0.7 → REVIEW, PASS kept (not ALLOW)', async () => {
     const { result } = run([
       { kind: 'served', verdict: 'PASS', confidence: 0.6 },
       { kind: 'provider-error', httpStatus: 401 },
     ]);
     const response = await result;
     const axis = response.axes[0]!;
-    expect(axis.verdict).toBe('PASS');
-    expect(axis.provider_outcome).toBe('served');
-    expect(axis.provider_route).toBe('primary');
-    expect(axis.reasoning).toMatch(/keeping primary/);
-    expect(response.aggregate.verdict).toBe('ALLOW');
-    expect(response.aggregate.rationale).toBe('All evaluated axes pass.');
+    expect(axis.verdict).toBe('PASS'); // verdict preserved — NOT demoted to UNCERTAIN
+    expect(axis.confidence).toBe(0.6);
+    expect(axis.provider_outcome).toBe('provider_error');
+    // PR #25 review fix: provider_route must never co-occur with a
+    // fail-closed provider_outcome, even though the primary step itself
+    // carried providerRoute: 'primary' (ScriptedClient's 'served' case).
+    expect(axis.provider_route).toBeUndefined();
+    expect(response.aggregate.verdict).toBe('REVIEW');
+    expect(response.aggregate.triggered_by).toEqual(['intent']);
+    expect(response.aggregate.rationale).not.toBe('All evaluated axes pass.');
   });
 
-  it('b) secondary ProviderCallError + primary PASS conf>=0.7 → ALLOW (as-served)', async () => {
+  it('b) secondary ProviderCallError + primary PASS conf>=0.7 → REVIEW via PROVENANCE, not confidence; PASS kept', async () => {
     const { result } = run([
       { kind: 'served', verdict: 'PASS', confidence: 0.85 },
       { kind: 'provider-error', httpStatus: 503 },
@@ -141,12 +166,16 @@ describe('Primary as-served — secondary-unavailable composition (engine↔aggr
     const response = await result;
     const axis = response.axes[0]!;
     expect(axis.verdict).toBe('PASS');
-    expect(axis.provider_outcome).toBe('served');
-    expect(response.aggregate.verdict).toBe('ALLOW');
-    expect(response.aggregate.rationale).toBe('All evaluated axes pass.');
+    expect(axis.confidence).toBe(0.85);
+    expect(axis.provider_outcome).toBe('provider_error');
+    expect(response.aggregate.verdict).toBe('REVIEW');
+    // Prove it is Rule 2 (provider provenance), NOT a confidence-driven rule:
+    // Rule 2's rationale names a provider/auth failure.
+    expect(response.aggregate.rationale).toMatch(/provider\/auth failure/);
+    expect(response.aggregate.rationale).not.toBe('All evaluated axes pass.');
   });
 
-  it('c) generic secondary error + primary PASS → ALLOW (as-served)', async () => {
+  it('c) generic (non-provider) secondary error → baseline preserved (PASS kept, no provenance, ALLOW)', async () => {
     const { result } = run([
       { kind: 'served', verdict: 'PASS', confidence: 0.6 },
       { kind: 'generic-error' },
@@ -154,8 +183,10 @@ describe('Primary as-served — secondary-unavailable composition (engine↔aggr
     const response = await result;
     const axis = response.axes[0]!;
     expect(axis.verdict).toBe('PASS');
-    expect(axis.provider_outcome).toBe('served');
-    expect(axis.provider_route).toBe('primary');
+    // Deliberate policy: a generic (non-classifiable) error carries NO
+    // provider provenance (mirrors the engine's §D6 negative discrimination),
+    // so Rule 2 does not fire and the primary verdict stands as-is.
+    expect(axis.provider_outcome).toBeUndefined();
     expect(response.aggregate.verdict).toBe('ALLOW');
     expect(response.aggregate.rationale).toBe('All evaluated axes pass.');
   });
@@ -167,10 +198,11 @@ describe('Primary as-served — secondary-unavailable composition (engine↔aggr
     ]);
     const response = await result;
     const axis = response.axes[0]!;
-    expect(axis.verdict).toBe('FAIL'); // secondary down must NOT weaken FAIL → UNCERTAIN
+    expect(axis.verdict).toBe('FAIL'); // secondary failure must NOT weaken FAIL → UNCERTAIN
     expect(axis.confidence).toBe(0.6);
-    expect(axis.provider_outcome).toBe('served');
-    expect(response.aggregate.verdict).toBe('REVIEW'); // mid-conf FAIL rule
+    expect(axis.provider_outcome).toBe('provider_error');
+    expect(axis.provider_route).toBeUndefined(); // never co-occurs with fail-closed provenance
+    expect(response.aggregate.verdict).toBe('REVIEW'); // Rule 2 (provider provenance)
   });
 
   it('e) primary high-conf FAIL early-exit (secondary skipped) → BLOCK, unchanged', async () => {
@@ -199,7 +231,7 @@ describe('Primary as-served — secondary-unavailable composition (engine↔aggr
     expect(response.aggregate.verdict).toBe('ALLOW');
   });
 
-  it('g1) secondary CircuitAllOpenError attemptedRoutes=[] + primary PASS → ALLOW (as-served)', async () => {
+  it('g1) secondary CircuitAllOpenError attemptedRoutes=[] + primary PASS → circuit_rejected, REVIEW, PASS kept', async () => {
     const { result } = run([
       { kind: 'served', verdict: 'PASS', confidence: 0.6 },
       { kind: 'circuit-all-open', attemptedRoutes: [] },
@@ -207,12 +239,11 @@ describe('Primary as-served — secondary-unavailable composition (engine↔aggr
     const response = await result;
     const axis = response.axes[0]!;
     expect(axis.verdict).toBe('PASS');
-    expect(axis.provider_outcome).toBe('served');
-    expect(axis.provider_route).toBe('primary');
-    expect(response.aggregate.verdict).toBe('ALLOW');
+    expect(axis.provider_outcome).toBe('circuit_rejected');
+    expect(response.aggregate.verdict).toBe('REVIEW');
   });
 
-  it('g2) secondary CircuitAllOpenError attemptedRoutes=[primary] + primary PASS → ALLOW (as-served)', async () => {
+  it('g2) secondary CircuitAllOpenError attemptedRoutes=[primary] + primary PASS → provider_error, REVIEW, PASS kept', async () => {
     const { result } = run([
       { kind: 'served', verdict: 'PASS', confidence: 0.6 },
       { kind: 'circuit-all-open', attemptedRoutes: ['primary'] },
@@ -220,26 +251,29 @@ describe('Primary as-served — secondary-unavailable composition (engine↔aggr
     const response = await result;
     const axis = response.axes[0]!;
     expect(axis.verdict).toBe('PASS');
-    expect(axis.provider_outcome).toBe('served');
-    expect(response.aggregate.verdict).toBe('ALLOW');
+    expect(axis.provider_outcome).toBe('provider_error');
+    expect(response.aggregate.verdict).toBe('REVIEW');
   });
 
-  it('h) truth: primary PASS retained as-served; secondary-unavailable note present', async () => {
+  it('h) truth: degraded axis never carries served; rationale is truthful (not "All evaluated axes pass.")', async () => {
     const { result } = run([
       { kind: 'served', verdict: 'PASS', confidence: 0.65 },
       { kind: 'provider-error', httpStatus: 401 },
     ]);
     const response = await result;
     const axis = response.axes[0]!;
-    expect(axis.provider_outcome).toBe('served');
-    expect(axis.verdict).toBe('PASS');
-    expect(axis.reasoning).toMatch(/keeping primary|secondary error/);
-    expect(response.aggregate.verdict).toBe('ALLOW');
-    expect(response.aggregate.rationale).toBe('All evaluated axes pass.');
+    expect(axis.provider_outcome).not.toBe('served');
+    // PR #25 review fix: a degraded (fail-closed-provenance) axis must never
+    // simultaneously claim a served route — that combination is a
+    // self-contradictory result the type contract (types.ts/openapi.ts)
+    // forbids.
+    expect(axis.provider_route).toBeUndefined();
+    expect(axis.verdict).toBe('PASS'); // verdict preservation still holds
+    expect(response.aggregate.verdict).not.toBe('ALLOW');
+    expect(response.aggregate.rationale).not.toBe('All evaluated axes pass.');
   });
 
-  it('i) primary UNCERTAIN + secondary ProviderCallError → REVIEW via provider provenance', async () => {
-    // Escalation path only: primary never served a real judgment.
+  it('i) primary UNCERTAIN + secondary ProviderCallError → REVIEW via provider provenance, verdict stays UNCERTAIN', async () => {
     const { result } = run([
       { kind: 'served', verdict: 'UNCERTAIN', confidence: 0.4 },
       { kind: 'provider-error', httpStatus: 503 },
@@ -248,6 +282,7 @@ describe('Primary as-served — secondary-unavailable composition (engine↔aggr
     const axis = response.axes[0]!;
     expect(axis.verdict).toBe('UNCERTAIN');
     expect(axis.provider_outcome).toBe('provider_error');
+    expect(axis.provider_route).toBeUndefined(); // never co-occurs with fail-closed provenance
     expect(response.aggregate.verdict).toBe('REVIEW');
     expect(response.aggregate.rationale).toMatch(/provider\/auth failure/);
   });

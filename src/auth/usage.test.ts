@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { describe, it, expect, vi } from 'vitest';
 import { NoopUsageGate, UpstashUsageGate, createUsageGate, emitUsageLine } from './usage.js';
 
@@ -74,6 +76,52 @@ describe('emitUsageLine', () => {
     const line = JSON.parse(spy.mock.calls[0]![0] as string);
     expect(line.type).toBe('dql_usage');
     expect(line.owner).toBe('raul');
+    spy.mockRestore();
+  });
+
+  // Issue #24 hardening: the raw key must never appear in the emitted line.
+  it('never logs the raw API key value', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const rawKey = 'dqlk_super-secret-do-not-leak-1234';
+    emitUsageLine({
+      requestId: 'dql_y',
+      key: rawKey,
+      owner: 'acme',
+      devAccess: false,
+      priceUsd: 0.05,
+      verdict: 'allow',
+    });
+    const raw = spy.mock.calls[0]![0] as string;
+    expect(raw).not.toContain(rawKey);
+    const line = JSON.parse(raw);
+    expect(line.key).toBeUndefined();
+    spy.mockRestore();
+  });
+
+  it('logs a key_fingerprint of sha256-prefix + last 4 chars, not reversible', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const rawKey = 'dqlk_abcdefabcdefabcdefabcdef1234';
+    emitUsageLine({
+      requestId: 'dql_z',
+      key: rawKey,
+      owner: 'acme',
+      devAccess: false,
+      priceUsd: 0.05,
+    });
+    const line = JSON.parse(spy.mock.calls[0]![0] as string);
+    const expectedHashPrefix = createHash('sha256').update(rawKey, 'utf8').digest('hex').slice(0, 12);
+    expect(line.key_fingerprint).toContain(expectedHashPrefix);
+    expect(line.key_fingerprint).toContain(rawKey.slice(-4));
+    spy.mockRestore();
+  });
+
+  it('different keys produce different fingerprints', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    emitUsageLine({ requestId: 'r1', key: 'dqlk_keyone11111111', owner: 'a', devAccess: false, priceUsd: 0 });
+    emitUsageLine({ requestId: 'r2', key: 'dqlk_keytwo22222222', owner: 'a', devAccess: false, priceUsd: 0 });
+    const line1 = JSON.parse(spy.mock.calls[0]![0] as string);
+    const line2 = JSON.parse(spy.mock.calls[1]![0] as string);
+    expect(line1.key_fingerprint).not.toBe(line2.key_fingerprint);
     spy.mockRestore();
   });
 });

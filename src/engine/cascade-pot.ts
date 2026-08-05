@@ -151,32 +151,34 @@ export class PotCliCascade implements Cascade {
       secondary = await this.callAxis(this.config.secondaryModel, axis, prompt, ctx);
       modelsUsed.push(secondary.modelId);
     } catch (err) {
-      // Secondary unavailable after a successful primary:
-      // - If primary already SERVED a real judgment, KEEP it as-served.
-      //   Destroying PASS→UNCERTAIN+provider_error made the PWA show INCOMPLETE
-      //   on axes that already had a valid nano result (demo 2026-07-21).
-      // - Only mark provider_error when primary itself never served.
-      const primaryServed =
-        primary.result.provider_outcome === 'served' ||
-        primary.result.provider_outcome === undefined;
-      const note = `[cascade] secondary error — keeping primary (${err instanceof Error ? err.message.slice(0, 160) : 'unknown'})`;
-      if (primaryServed && primary.result.verdict !== 'UNCERTAIN') {
-        return {
-          result: annotate(
-            {
-              ...primary.result,
-              provider_outcome: 'served',
-            },
-            note,
-          ),
-          modelsUsed,
-        };
-      }
-      // Primary was already UNCERTAIN / incomplete — escalate honestly.
+      // Secondary unavailable after a successful primary (issue #24 fix —
+      // decouples two previously-conflated concerns):
+      // - KEEP the primary's verdict/confidence/reasoning as-is. Destroying a
+      //   served PASS/FAIL into UNCERTAIN made the PWA show INCOMPLETE on
+      //   axes that already had a valid nano judgment (demo 2026-07-21). This
+      //   half of the original fix (Guardian UX) is legitimate and preserved.
+      // - BUT always attach TRUTHFUL provenance for the secondary failure via
+      //   classifySecondaryFailure() (provider_error / circuit_rejected)
+      //   instead of forcing provider_outcome:'served'. Forcing 'served'
+      //   masked a real provider/circuit fault and reopened issues #13/#14:
+      //   aggregation Rule 2 (src/aggregation.ts, untouched) depends on this
+      //   provenance to fail closed, and explicitly excludes 'served' axes,
+      //   so mislabeling let provider failures leak through to ALLOW.
+      // - NEVER carry a served route (`provider_route`) on this path (PR #25
+      //   review fix): `provider_route` documents which route SERVED a
+      //   response (types.ts AxisResult docs; api/openapi.ts) and is
+      //   mutually exclusive with a fail-closed `provider_outcome`
+      //   ('provider_error'/'circuit_rejected'). Copying the PRIMARY's own
+      //   served route onto this composite (secondary-failed) axis produced
+      //   a self-contradictory result — a fail-closed axis claiming a route
+      //   served it — reachable in production any time a live secondary
+      //   fails after a served primary. Pre-regression PR #15 never carried
+      //   provider_route on this path either; restored that behavior.
+      const note = `[cascade] secondary error — keeping primary verdict, attaching failure provenance (${err instanceof Error ? err.message.slice(0, 160) : 'unknown'})`;
       const providerOutcome = classifySecondaryFailure(err);
       const degraded: AxisResult = {
         axis: primary.result.axis,
-        verdict: 'UNCERTAIN',
+        verdict: primary.result.verdict,
         confidence: primary.result.confidence,
         reasoning: primary.result.reasoning,
         objection: primary.result.objection,

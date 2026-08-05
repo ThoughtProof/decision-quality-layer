@@ -112,6 +112,13 @@ describe('deadline layering', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(0); // rejected before attempt when W already exhausted
   });
 
+  // Issue #24 note: this deadline-skip test is intentionally UNCHANGED by
+  // the #24 fix. The secondary is never attempted here (request budget ran
+  // out before it could be called) — no provider failure occurred, so
+  // keeping primary as-served (ALLOW) remains correct. This is distinct from
+  // the secondary-THROWS cases covered in degraded-provenance.test.ts, where
+  // a real ProviderCallError/CircuitAllOpenError now must attach
+  // provider_error/circuit_rejected provenance instead of 'served'.
   it('skips secondary when remaining W is tight and keeps primary PASS as-served', async () => {
     let calls = 0;
     const fetchImpl = vi.fn().mockImplementation(async () => {

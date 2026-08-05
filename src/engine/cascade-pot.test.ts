@@ -183,11 +183,16 @@ describe('PotCliCascade: UNCERTAIN handling', () => {
 });
 
 describe('PotCliCascade: secondary unavailable (primary as-served)', () => {
-  // Product contract (demo 2026-07-21): a successful primary judgment must not
-  // be destroyed when secondary is down. Keep PASS/FAIL as-served; only
-  // escalate when primary itself never produced a real judgment (UNCERTAIN).
+  // Product contract (demo 2026-07-21, decoupled by issue #24): a successful
+  // primary judgment must not be DESTROYED (PASS/FAIL demoted to UNCERTAIN)
+  // when secondary is down. Verdict/confidence/reasoning are kept as-is.
+  // BUT (issue #24 fix): when the secondary throws a classifiable provider
+  // error, truthful provider_error/circuit_rejected provenance is attached
+  // instead of forcing 'served' — a generic (non-classifiable) local error
+  // still carries no provenance (policy explicit, matches engine's §D6
+  // negative discrimination) and IS reported as 'served' in that case only.
 
-  it('primary PASS + secondary error → PASS kept as-served', async () => {
+  it('primary PASS + secondary generic error → PASS kept, no provenance (served)', async () => {
     let n = 0;
     const client = new MockLlmClient((model) => {
       n++;
@@ -203,12 +208,15 @@ describe('PotCliCascade: secondary unavailable (primary as-served)', () => {
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('PASS');
     expect(out.result.confidence).toBe(0.9);
-    expect(out.result.provider_outcome).toBe('served');
+    // Generic Error (not ProviderCallError/CircuitAllOpenError) classifies to
+    // undefined provenance; primary never set provider_outcome either
+    // (no providerRoute in this mock), so it stays undefined — never falsely 'served'.
+    expect(out.result.provider_outcome).toBeUndefined();
     expect(out.result.reasoning).toMatch(/keeping primary/);
     expect(out.modelsUsed).toEqual(['mock:serv-nano']);
   });
 
-  it('primary FAIL (low-conf) + secondary error → FAIL kept as-served', async () => {
+  it('primary FAIL (low-conf) + secondary generic error → FAIL kept, no provenance', async () => {
     let n = 0;
     const client = new MockLlmClient((model) => {
       n++;
@@ -224,7 +232,7 @@ describe('PotCliCascade: secondary unavailable (primary as-served)', () => {
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('FAIL');
     expect(out.result.confidence).toBe(0.5);
-    expect(out.result.provider_outcome).toBe('served');
+    expect(out.result.provider_outcome).toBeUndefined();
     expect(out.result.reasoning).toMatch(/keeping primary/);
   });
 });
@@ -251,62 +259,72 @@ describe('PotCliCascade: secondary-unavailable provenance (primary as-served)', 
     });
   }
 
-  it('ProviderCallError secondary + primary PASS → PASS kept as-served', async () => {
+  it('ProviderCallError secondary + primary PASS → PASS kept, provider_error attached (issue #24)', async () => {
     const client = servedPrimaryThenThrow(
       { verdict: 'PASS', confidence: 0.6 },
       new ProviderCallError('[llm-client] serv 401: nope', 'serv', 401),
     );
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
-    expect(out.result.verdict).toBe('PASS');
-    expect(out.result.provider_outcome).toBe('served');
-    expect(out.result.provider_route).toBe('primary');
+    expect(out.result.verdict).toBe('PASS'); // verdict preserved
+    expect(out.result.provider_outcome).toBe('provider_error'); // truthful provenance, not 'served'
+    // PR #25 review fix: provider_route must NEVER co-occur with a
+    // fail-closed provider_outcome — primary's own served route is dropped
+    // on this degraded path, even though primary itself did carry one.
+    expect(out.result.provider_route).toBeUndefined();
     expect(out.result.reasoning).toMatch(/keeping primary/);
   });
 
-  it('CircuitAllOpenError (attemptedRoutes=[]) secondary + primary PASS → as-served', async () => {
+  it('CircuitAllOpenError (attemptedRoutes=[]) secondary + primary PASS → PASS kept, circuit_rejected attached', async () => {
     const client = servedPrimaryThenThrow(
       { verdict: 'PASS', confidence: 0.6 },
       new CircuitAllOpenError('serv-swift', null, 'open', 'open', []),
     );
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('PASS');
-    expect(out.result.provider_outcome).toBe('served');
-    expect(out.result.provider_route).toBe('primary');
+    expect(out.result.provider_outcome).toBe('circuit_rejected');
+    expect(out.result.provider_route).toBeUndefined(); // never co-occurs with fail-closed provenance
   });
 
-  it('CircuitAllOpenError (attemptedRoutes=[primary]) secondary + primary PASS → as-served', async () => {
+  it('CircuitAllOpenError (attemptedRoutes=[primary]) secondary + primary PASS → PASS kept, provider_error attached', async () => {
     const client = servedPrimaryThenThrow(
       { verdict: 'PASS', confidence: 0.6 },
       new CircuitAllOpenError('serv-swift', null, 'open', 'open', ['primary']),
     );
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('PASS');
-    expect(out.result.provider_outcome).toBe('served');
+    expect(out.result.provider_outcome).toBe('provider_error');
   });
 
-  it('generic (non-provider) secondary error + primary PASS → as-served', async () => {
+  it('generic (non-provider) secondary error + primary PASS → PASS kept, no provenance (policy explicit)', async () => {
     const client = servedPrimaryThenThrow(
       { verdict: 'PASS', confidence: 0.6 },
       new Error('parser blew up'),
     );
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
     expect(out.result.verdict).toBe('PASS');
-    expect(out.result.provider_outcome).toBe('served');
-    expect(out.result.provider_route).toBe('primary');
+    // Not classifiable → classifySecondaryFailure returns undefined → no
+    // provider_outcome key is set by the degraded-result branch at all.
+    // provider_route is dropped UNCONDITIONALLY on this degraded path (PR #25
+    // review fix) — even here, where provider_outcome ends up undefined,
+    // because the secondary DID fail (just non-classifiably) and this is not
+    // a "served" result; only the genuine deadline-skip (never-attempted)
+    // branch is allowed to claim a served route.
+    expect(out.result.provider_outcome).toBeUndefined();
+    expect(out.result.provider_route).toBeUndefined();
   });
 
-  it('primary FAIL (low-conf) + ProviderCallError secondary → FAIL kept as-served', async () => {
+  it('primary FAIL (low-conf) + ProviderCallError secondary → FAIL kept, provider_error attached', async () => {
     const client = servedPrimaryThenThrow(
       { verdict: 'FAIL', confidence: 0.6 },
       new ProviderCallError('[llm-client] serv 500', 'serv', 500),
     );
     const out = await new PotCliCascade(client).run(AXIS_INPUT);
-    expect(out.result.verdict).toBe('FAIL');
-    expect(out.result.provider_outcome).toBe('served');
+    expect(out.result.verdict).toBe('FAIL'); // secondary failure must not weaken FAIL
+    expect(out.result.provider_outcome).toBe('provider_error');
   });
 
   it('primary UNCERTAIN + ProviderCallError secondary → escalate with provider_error', async () => {
-    // Only path that still classifies secondary failure: primary never served a real judgment.
+    // primary never served a real judgment; verdict stays UNCERTAIN either way.
     const client = servedPrimaryThenThrow(
       { verdict: 'UNCERTAIN', confidence: 0.3 },
       new ProviderCallError('[llm-client] serv 503', 'serv', 503),
