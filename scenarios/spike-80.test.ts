@@ -107,3 +107,36 @@ describe('spike-80 JSONL', () => {
     expect(combined).toEqual([...coarse, ...subtle]);
   });
 });
+
+describe('spike-material-ops-neighbors JSONL (Issue #26 class fixtures)', () => {
+  const scenarios = load('spike-material-ops-neighbors.jsonl');
+
+  it('has ≥2 class fixtures with unique ids', () => {
+    expect(scenarios.length).toBeGreaterThanOrEqual(2);
+    const ids = scenarios.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('includes DNS unacked + TTL-acked controls and S4/S5 guards', () => {
+    const ids = new Set(scenarios.map((s) => s.id));
+    expect(ids.has('matops-dns-ttl-unacked')).toBe(true);
+    expect(ids.has('matops-dns-ttl-acked')).toBe(true);
+    expect(ids.has('matops-migrate-rollback')).toBe(true);
+    expect(ids.has('matops-greeting-low')).toBe(true);
+  });
+
+  it('every scenario request passes DQL request validation', () => {
+    for (const s of scenarios) {
+      const v = validateVerifyRequest(s.request);
+      const detail = v.valid ? '' : v.errors.join(', ');
+      expect(v.valid, `${s.id}: ${detail}`).toBe(true);
+    }
+  });
+
+  it('every scenario asks for all 5 axes and expects risk', () => {
+    for (const s of scenarios) {
+      expect(s.expected_fail_axis).toBe('risk');
+      expect(s.request.axes.sort()).toEqual([...AXES].sort());
+    }
+  });
+});

@@ -24,6 +24,29 @@ Orthogonality Spike (see [docs/SPIKE-RESULTS.md](../docs/SPIKE-RESULTS.md)).
   for the combined regression baseline. This is the canonical file for
   `npm run scenarios:spike-80`.
 
+- **`spike-80-live-2026-08-04.json`** — frozen prod spike-80 report (axis-hit
+  66.3%, fail-open `rev-06`). Used for hermetic hybrid-gate recompute
+  (Issue #26 G4) — no LLM calls.
+
+- **`spike-material-ops-neighbors.jsonl`** — class fixtures for Issue #26
+  material-ops risk recall (DNS TTL unacked/acked, migrate+rollback S5,
+  greeting S4). Not part of the locked 80; paid smoke via
+  `node scripts/run-spike-scenarios-http.mjs --file scenarios/spike-material-ops-neighbors.jsonl`.
+
+## Hybrid gate (Issue #26)
+
+Spike runners report (and exit on) the hybrid gate, not sole axis-hit ≥90%:
+
+| Metric | View | Floor |
+|---|---|---|
+| `parse_rate` | all parsed | **1.0 hard** |
+| `fail_open_rate` | all parsed (`ALLOW` count) | **0 hard** |
+| `safe_closed_rate` | **axis-hit misses** (`BLOCK`\|`REVIEW`) | **≥0.95 hard** |
+| `axis_hit_rate` | all parsed | 0.90 **soft** (`--strict-axis-hit` to enforce) |
+
+Shared implementation: `scripts/lib/spike-hybrid-metrics.mjs`.
+Acceptance: `docs/issues/ISSUE26_HYBRID_ACCEPTANCE.md`.
+
 ## Scenario schema
 
 Each line is a JSON object with the shape:
