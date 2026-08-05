@@ -3,7 +3,7 @@
 > **Language note:** This is a German one-page status doc (per the OpenClaw `DRAFTS/2026-08-04-dql-now-next-not.md` it replaces). Deep doc is in `docs/`. This file is the **current** single source of truth; prefer it over the old 2026-07-08 v0.2 HANDOVER.
 
 **Stand:** 2026-08-05 CEST (PR #28 hybrid gate live; #26 partial — risk matops + fail_open metrics)
-**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=f9b33990…`
+**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=df652752…`
 **Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim.
 
 ---
@@ -15,7 +15,7 @@
 | Endpoint | `https://dql.thoughtproof.ai` |
 | Health | `status=ok` · cascade `pot-cli` · SERV key bound |
 | Runtime schema | `0.4.3.2-deadline-1` · `v0431_active=true` |
-| Deploy commit | **`f9b33990`** — PR #28 (#26 hybrid: risk material-ops recall + spike fail_open/safe_closed gate) · Health-SHA == main-SHA |
+| Deploy commit | **`df652752`** — PR #31 consistency Class-B recall + prior hybrid stack · Health-SHA == main-SHA
 | npm/package label | noch `0.2.0` (Label ≠ Runtime — nicht als Product-Version zitieren) |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
 | Flags | `capital_path_mode=true` · `disable_circuit_breaker=true` · `alias_gate_ready=false` · diagnostics on |
