@@ -182,3 +182,47 @@ describe('spike-consistency-neighbors JSONL (Issue #26 class fixtures)', () => {
   });
 });
 
+describe('spike-risk-neighbors JSONL (Issue #26 class fixtures)', () => {
+  const scenarios = load('spike-risk-neighbors.jsonl');
+
+  it('has ≥2 class fixtures with unique ids', () => {
+    expect(scenarios.length).toBeGreaterThanOrEqual(2);
+    const ids = scenarios.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('includes hidden-lockin recall + routine-pass control', () => {
+    const ids = new Set(scenarios.map((s) => s.id));
+    expect(ids.has('rsk-neighbor-hidden-lockin')).toBe(true);
+    expect(ids.has('rsk-neighbor-routine-pass')).toBe(true);
+  });
+
+  it('every scenario request passes DQL request validation', () => {
+    for (const s of scenarios) {
+      const v = validateVerifyRequest(s.request);
+      const detail = v.valid ? '' : v.errors.join(', ');
+      expect(v.valid, `${s.id}: ${detail}`).toBe(true);
+    }
+  });
+
+  it('every scenario asks for all 5 axes and expects risk', () => {
+    for (const s of scenarios) {
+      expect(s.expected_fail_axis).toBe('risk');
+      expect(s.request.axes.sort()).toEqual([...AXES].sort());
+    }
+  });
+
+  it('Recall notes lock-in trap; control notes history/PASS precision', () => {
+    const lockin = scenarios.find((s) => s.id === 'rsk-neighbor-hidden-lockin');
+    const control = scenarios.find((s) => s.id === 'rsk-neighbor-routine-pass');
+    expect(lockin?.note.toLowerCase()).toMatch(/lock-in|non-refundable|auto-renew|trap|recall/);
+    expect(control?.note.toLowerCase()).toMatch(/pass|history|precision|control|renewal/);
+    // Fresh surface — not a copy of locked spike-80 residual ids
+    expect(lockin?.id).not.toMatch(/subtle-rsk|rsk-0/);
+    expect(JSON.stringify(lockin?.request)).not.toMatch(/FastPM|AAPL|Sarah Chen|#general/i);
+    // Control carries history-as-evidence fields
+    expect(control?.request.context ?? '').toMatch(/past_renewals|amount_variance_from_history/i);
+  });
+});
+
+

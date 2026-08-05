@@ -41,6 +41,15 @@ Orthogonality Spike (see [docs/SPIKE-RESULTS.md](../docs/SPIKE-RESULTS.md)).
   engine PR will use these as acceptance. Paid smoke:
   `node scripts/run-spike-scenarios-http.mjs --file scenarios/spike-consistency-neighbors.jsonl --expect 2`.
 
+- **`spike-risk-neighbors.jsonl`** — class fixtures for Issue #26 residual
+  risk recall after matops INFRA fix (hidden commercial lock-in trap +
+  history-established SaaS renewal control). Not part of the locked 80.
+  Fixtures-first: hidden-lockin miss on current prod is expected baseline
+  (axis-hit/recall deficit; aggregates already fail-closed on spike residual);
+  routine-pass control must stay PASS (07-10 history-as-evidence). Follow-up
+  engine PR uses these as acceptance. Paid smoke:
+  `node scripts/run-spike-scenarios-http.mjs --file scenarios/spike-risk-neighbors.jsonl --expect 2`.
+
 ## Hybrid gate (Issue #26)
 
 Spike runners report (and exit on) the hybrid gate, not sole axis-hit ≥90%:
