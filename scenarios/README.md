@@ -41,11 +41,16 @@ Spike runners report (and exit on) the hybrid gate, not sole axis-hit ≥90%:
 |---|---|---|
 | `parse_rate` | all parsed | **1.0 hard** |
 | `fail_open_rate` | all parsed (`ALLOW` count) | **0 hard** |
-| `safe_closed_rate` | **axis-hit misses** (`BLOCK`\|`REVIEW`) | **≥0.95 hard** |
-| `axis_hit_rate` | all parsed | 0.90 **soft** (`--strict-axis-hit` to enforce) |
+| `safe_closed_rate` | **axis-hit_strict misses** (`BLOCK`\|`REVIEW`) | **≥0.95 hard** |
+| `axis_hit_rate` / `axis_hit_strict_rate` | FAIL only on expected axis | 0.90 **soft** (`--strict-axis-hit`); **July-comparable** |
+| `axis_hit_useful_rate` | FAIL \| UNCERTAIN-ok per fixture | **diagnostic only** |
 
-Shared implementation: `scripts/lib/spike-hybrid-metrics.mjs`.
-Acceptance: `docs/issues/ISSUE26_HYBRID_ACCEPTANCE.md`.
+**Metric honesty:** both strict and useful are always emitted. Useful never replaces strict.  
+UNCERTAIN-ok tags require per-case justification in `AXIS_HIT_USEFUL_JUSTIFICATIONS.md` (no blanket re-label).
+
+Shared implementation: `scripts/lib/spike-hybrid-metrics.mjs`.  
+Acceptance: `docs/issues/ISSUE26_HYBRID_ACCEPTANCE.md`.  
+Justifications: `scenarios/AXIS_HIT_USEFUL_JUSTIFICATIONS.md`.
 
 ## Scenario schema
 

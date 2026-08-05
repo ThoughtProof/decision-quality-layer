@@ -3,9 +3,15 @@
  *
  * PINNED views (see docs/issues/ISSUE26_HYBRID_ACCEPTANCE.md):
  *   fail_open_rate     — ALLOW / all parsed cases (all-80) — hard floor 0
- *   safe_closed_rate   — (BLOCK|REVIEW among axis-hit misses) / miss_count — hard floor 0.95
+ *   safe_closed_rate   — (BLOCK|REVIEW among axis-hit_strict misses) / miss_count — hard floor 0.95
  *   safe_closed_all_rate — (BLOCK|REVIEW) / all parsed — diagnostic only
- *   axis_hit_rate      — expected-axis FAIL / all parsed — soft (warn / --strict-axis-hit)
+ *
+ * Dual axis-hit reporting (Issue #26 metric honesty — always both, forever):
+ *   axis_hit_rate / axis_hit_strict_rate — expected-axis verdict === FAIL
+ *       July-comparable; default `hit` / soft floor / --strict-axis-hit
+ *   axis_hit_useful_rate — expected-axis verdict ∈ acceptable_verdicts
+ *       default acceptable_verdicts = ["FAIL"]; may include "UNCERTAIN" only when
+ *       a fixture is per-case justified (see scenarios/AXIS_HIT_USEFUL_JUSTIFICATIONS.md)
  *
  * Pure functions — no I/O. Used by run-spike-scenarios{,-http}.mjs and hermetic tests.
  */
@@ -17,10 +23,12 @@ export const HYBRID_THRESHOLDS = {
   axisHitRate: 0.9,
 };
 
+const DEFAULT_ACCEPTABLE = ['FAIL'];
+
 /**
  * Normalize a per-case record from either spike runner shape.
  * Accepts:
- *   - HTTP runner: { hit, parse_ok, aggregate_verdict, id, error? }
+ *   - HTTP runner: { hit, parse_ok, aggregate_verdict, got_verdict?, acceptable_verdicts?, id, error? }
  *   - In-process:  { axis_hit, parse_fails?, aggregate_verdict, id }
  *   - Already annotated: { fail_open, safe_closed, ... }
  */
@@ -31,6 +39,8 @@ export function annotateCase(r) {
       parse_ok: false,
       axis_hit: false,
       hit: false,
+      axis_hit_strict: false,
+      axis_hit_useful: false,
       fail_open: false,
       safe_closed: false,
     };
@@ -39,19 +49,62 @@ export function annotateCase(r) {
     r.parse_ok !== undefined
       ? Boolean(r.parse_ok)
       : !(Array.isArray(r.parse_fails) && r.parse_fails.length > 0);
-  const axisHit = r.axis_hit !== undefined ? Boolean(r.axis_hit) : Boolean(r.hit);
+
+  const acceptable = normalizeAcceptable(r.acceptable_verdicts);
+  const got = r.got_verdict ?? r.gotVerdict ?? null;
+
+  // Strict: FAIL only (July-comparable). Prefer explicit got_verdict when present.
+  let axisHitStrict;
+  if (got != null && got !== '') {
+    axisHitStrict = got === 'FAIL';
+  } else if (r.axis_hit !== undefined) {
+    axisHitStrict = Boolean(r.axis_hit);
+  } else {
+    axisHitStrict = Boolean(r.hit);
+  }
+
+  // Useful: got ∈ acceptable_verdicts (default FAIL-only → same as strict).
+  let axisHitUseful;
+  if (got != null && got !== '') {
+    axisHitUseful = acceptable.includes(got);
+  } else {
+    // Legacy rows without got_verdict cannot claim UNCERTAIN-ok.
+    axisHitUseful = axisHitStrict;
+  }
+
   const agg = r.aggregate_verdict ?? 'MISSING';
   const failOpen = parseOk && agg === 'ALLOW';
   const safeClosed = parseOk && (agg === 'BLOCK' || agg === 'REVIEW');
+
+  // `hit` / `axis_hit` remain STRICT aliases for gate + July continuity.
   return {
     ...r,
     parse_ok: parseOk,
-    axis_hit: axisHit,
-    hit: axisHit,
+    acceptable_verdicts: acceptable,
+    got_verdict: got,
+    axis_hit_strict: axisHitStrict,
+    axis_hit_useful: axisHitUseful,
+    axis_hit: axisHitStrict,
+    hit: axisHitStrict,
     fail_open: failOpen,
     safe_closed: safeClosed,
     aggregate_verdict: agg,
   };
+}
+
+function normalizeAcceptable(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return [...DEFAULT_ACCEPTABLE];
+  const out = [];
+  for (const v of raw) {
+    if (typeof v === 'string' && v && !out.includes(v)) out.push(v);
+  }
+  // Structural ban: PASS must never be “useful” — that would game axis-hit.
+  if (out.includes('PASS')) {
+    throw new Error(
+      `acceptable_verdicts must not include PASS (got ${JSON.stringify(out)}); useful hits are FAIL|UNCERTAIN-ok only`,
+    );
+  }
+  return out.length ? out : [...DEFAULT_ACCEPTABLE];
 }
 
 /**
@@ -73,23 +126,34 @@ export function computeHybridSummary(cases, opts = {}) {
   const failOpenRate = totalParsed === 0 ? 0 : failOpenCases.length / totalParsed;
   const failOpenIds = failOpenCases.map((r) => r.id);
 
-  const misses = parsed.filter((r) => !r.axis_hit);
+  // Misses for safe_closed floor = STRICT misses (July-comparable gate surface).
+  const misses = parsed.filter((r) => !r.axis_hit_strict);
   const missCount = misses.length;
   const safeClosedAmongMisses = misses.filter((r) => r.safe_closed).length;
-  // Vacuous: no misses → safe_closed_rate 1.0
   const safeClosedRate = missCount === 0 ? 1.0 : safeClosedAmongMisses / missCount;
 
   const safeClosedAllRate =
     totalParsed === 0 ? 0 : parsed.filter((r) => r.safe_closed).length / totalParsed;
 
-  const axisHits = parsed.filter((r) => r.axis_hit).length;
-  const axisHitRate = totalParsed === 0 ? 0 : axisHits / totalParsed;
+  const strictHits = parsed.filter((r) => r.axis_hit_strict).length;
+  const usefulHits = parsed.filter((r) => r.axis_hit_useful).length;
+  const axisHitStrictRate = totalParsed === 0 ? 0 : strictHits / totalParsed;
+  const axisHitUsefulRate = totalParsed === 0 ? 0 : usefulHits / totalParsed;
+  // Alias: axis_hit_rate === strict (never silently redefined).
+  const axisHitRate = axisHitStrictRate;
+
+  const usefulMisses = parsed.filter((r) => !r.axis_hit_useful);
+  const usefulMissIds = usefulMisses.map((r) => r.id);
+  const uncertainOkHits = parsed.filter(
+    (r) => r.axis_hit_useful && !r.axis_hit_strict && r.got_verdict === 'UNCERTAIN',
+  ).length;
 
   const strictAxisHit = Boolean(opts.strictAxisHit);
   const thresholds = {
     ...HYBRID_THRESHOLDS,
     safeClosedRateView: 'over_misses',
     axisHitEnforced: strictAxisHit,
+    axisHitDefinition: 'strict_FAIL_only',
   };
 
   let passed =
@@ -98,7 +162,7 @@ export function computeHybridSummary(cases, opts = {}) {
     safeClosedRate >= thresholds.safeClosedRate;
 
   if (strictAxisHit) {
-    passed = passed && axisHitRate >= thresholds.axisHitRate;
+    passed = passed && axisHitStrictRate >= thresholds.axisHitRate;
   }
 
   return {
@@ -111,7 +175,13 @@ export function computeHybridSummary(cases, opts = {}) {
     safe_closed_rate_view: 'over_misses',
     safe_closed_all_rate: safeClosedAllRate,
     miss_count: missCount,
+    // Dual axis-hit — both always present
     axis_hit_rate: axisHitRate,
+    axis_hit_strict_rate: axisHitStrictRate,
+    axis_hit_useful_rate: axisHitUsefulRate,
+    axis_hit_useful_miss_count: usefulMisses.length,
+    axis_hit_useful_miss_ids: usefulMissIds,
+    axis_hit_uncertain_ok_count: uncertainOkHits,
     thresholds,
     passed,
     annotated,
@@ -125,8 +195,18 @@ export function formatHybridConsole(summary) {
     `Fail-open-rate:        ${(summary.fail_open_rate * 100).toFixed(1)}%  (hard floor ${(t.failOpenRate * 100).toFixed(0)}%, all-parsed)`,
     `Safe-closed-rate:      ${(summary.safe_closed_rate * 100).toFixed(1)}%  (hard floor ${(t.safeClosedRate * 100).toFixed(0)}%, over misses; n=${summary.miss_count})`,
     `Safe-closed-all-rate:  ${(summary.safe_closed_all_rate * 100).toFixed(1)}%  (diagnostic)`,
-    `Axis-hit-rate:         ${(summary.axis_hit_rate * 100).toFixed(1)}%  (soft floor ${(t.axisHitRate * 100).toFixed(0)}%${t.axisHitEnforced ? ', ENFORCED' : ', diagnostic'})`,
+    `Axis-hit-strict:       ${(summary.axis_hit_strict_rate * 100).toFixed(1)}%  (FAIL only; July-comparable; soft floor ${(t.axisHitRate * 100).toFixed(0)}%${t.axisHitEnforced ? ', ENFORCED' : ''})`,
+    `Axis-hit-useful:       ${(summary.axis_hit_useful_rate * 100).toFixed(1)}%  (FAIL|UNCERTAIN-ok per fixture; diagnostic)`,
   ];
+  if (summary.axis_hit_uncertain_ok_count) {
+    lines.push(
+      `  ↳ UNCERTAIN-ok hits: ${summary.axis_hit_uncertain_ok_count} (strict misses counted useful)`,
+    );
+  }
+  // backward-compatible single line
+  lines.push(
+    `Axis-hit-rate:         ${(summary.axis_hit_rate * 100).toFixed(1)}%  (= strict; alias)`,
+  );
   if (summary.fail_open_ids?.length) {
     lines.push(`Fail-open IDs: ${summary.fail_open_ids.join(', ')}`);
   }

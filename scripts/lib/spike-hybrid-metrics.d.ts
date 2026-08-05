@@ -10,9 +10,13 @@ export function annotateCase(r: Record<string, unknown>): Record<string, unknown
   parse_ok: boolean;
   axis_hit: boolean;
   hit: boolean;
+  axis_hit_strict: boolean;
+  axis_hit_useful: boolean;
   fail_open: boolean;
   safe_closed: boolean;
   aggregate_verdict?: string;
+  acceptable_verdicts?: string[];
+  got_verdict?: string | null;
   id?: string;
 };
 
@@ -30,6 +34,11 @@ export function computeHybridSummary(
   safe_closed_all_rate: number;
   miss_count: number;
   axis_hit_rate: number;
+  axis_hit_strict_rate: number;
+  axis_hit_useful_rate: number;
+  axis_hit_useful_miss_count: number;
+  axis_hit_useful_miss_ids: string[];
+  axis_hit_uncertain_ok_count: number;
   thresholds: Record<string, unknown>;
   passed: boolean;
   annotated: Array<Record<string, unknown>>;
@@ -41,6 +50,9 @@ export function formatHybridConsole(summary: {
   safe_closed_rate: number;
   safe_closed_all_rate: number;
   axis_hit_rate: number;
+  axis_hit_strict_rate: number;
+  axis_hit_useful_rate: number;
+  axis_hit_uncertain_ok_count?: number;
   miss_count: number;
   fail_open_ids?: string[];
   passed: boolean;

@@ -32,6 +32,7 @@ import {
   computeHybridSummary,
   formatHybridConsole,
 } from './lib/spike-hybrid-metrics.mjs';
+import { AXIS_HIT_USEFUL_JUSTIFICATIONS } from '../scenarios/axis-hit-useful-justifications.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -91,6 +92,8 @@ for (const s of filtered) {
   const gotVerdict = expectedAxis?.verdict ?? 'MISSING';
   const gotConf = Number(expectedAxis?.confidence ?? 0).toFixed(2);
   const hit = gotVerdict === 'FAIL';
+  const justification = AXIS_HIT_USEFUL_JUSTIFICATIONS[s.id];
+  const acceptableVerdicts = justification?.acceptable_verdicts ?? ['FAIL'];
   const othersFired = axesArr.filter((a) => a.axis !== expected && a.verdict === 'FAIL').length;
   const parseOk = axesArr.length === 5;
   const agg = response.aggregate?.verdict ?? 'MISSING';
@@ -106,6 +109,7 @@ for (const s of filtered) {
     expected,
     got_verdict: gotVerdict,
     got_confidence: Number(gotConf),
+    acceptable_verdicts: acceptableVerdicts,
     hit,
     axis_hit: hit,
     parse_ok: parseOk,
@@ -128,7 +132,6 @@ for (const s of filtered) {
           models_used: response.meta.models_used,
           axes_evaluated: response.meta.axes_evaluated,
           sandbox: response.meta.sandbox,
-          // keep small diagnostic blobs if present
           objection_evidence_bind: response.meta.objection_evidence_bind ?? undefined,
         }
       : null,
@@ -174,7 +177,12 @@ const summary = {
     safe_closed_rate_view: hybrid.safe_closed_rate_view,
     safe_closed_all_rate: hybrid.safe_closed_all_rate,
     miss_count: hybrid.miss_count,
+    // Dual axis-hit (forever): strict = FAIL only; useful = acceptable_verdicts
     axis_hit_rate: hybrid.axis_hit_rate,
+    axis_hit_strict_rate: hybrid.axis_hit_strict_rate,
+    axis_hit_useful_rate: hybrid.axis_hit_useful_rate,
+    axis_hit_useful_miss_count: hybrid.axis_hit_useful_miss_count,
+    axis_hit_uncertain_ok_count: hybrid.axis_hit_uncertain_ok_count,
     other_axes_fire_rate: othersFireRate,
     per_axis: perAxis,
     thresholds: hybrid.thresholds,

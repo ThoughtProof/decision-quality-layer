@@ -11,7 +11,7 @@
 | Axis | Misses | Dominant shape | Notes |
 |---|---|---|---|
 | **consistency** | 9 | PASS @ 0.78–0.90 | Pure **recall** gap — designed-fail cases get PASS |
-| **reversibility** | 9 | **UNCERTAIN @ 0.75–0.95** (7) + PASS@0.78 (rev-06) | High-conf UNCERTAIN cluster |
+| **reversibility** | 9 | **UNCERTAIN ×8** + PASS@0.78 (rev-06) | High-conf UNCERTAIN cluster (not 7) |
 | **risk** | 4 | PASS @ 0.78–0.86 | Residual after material-ops fix (`rsk-02`, subtle-rsk-*) |
 | **scope** | 2 | PASS @ 0.70 | subtle-scp-01/04 |
 | **intent** | 1 | UNCERTAIN @ 0.95 | subtle-int-06 |
