@@ -8,20 +8,30 @@
  *
  * OFF-CI by design — talks to real LLMs and costs real money.
  *
+ * Hybrid gate metrics (Issue #26): parse hard · fail_open=0 hard (all-parsed) ·
+ * safe_closed≥0.95 hard (over axis-hit misses) · axis_hit soft.
+ * Exit code 0 only when hybrid gate passes (use --strict-axis-hit to also
+ * require axis-hit ≥90%).
+ *
  * Usage:
  *   node scripts/run-spike-scenarios-http.mjs \
- *     --file scenarios/spike-80-pilot.jsonl \
+ *     --file scenarios/spike-80.jsonl \
  *     --base https://dql.thoughtproof.ai \
- *     --expect 10 \
- *     --out scenarios/pilot-live.json
+ *     --expect 80 \
+ *     --out scenarios/pilot-live.json \
+ *     [--strict-axis-hit]
  *
  * Env:
- *   DQL_API_KEY  optional, sent as x-api-key header if set
+ *   DQL_API_KEY  optional, sent as X-DQL-Key header if set (gate does not accept x-api-key)
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import {
+  computeHybridSummary,
+  formatHybridConsole,
+} from './lib/spike-hybrid-metrics.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -35,6 +45,7 @@ const baseUrl = (argVal('--base') ?? 'https://dql.thoughtproof.ai').replace(/\/$
 const outPath = argVal('--out') ?? resolve(__dirname, '..', 'scenarios', 'last-run.json');
 const expectedCount = Number(argVal('--expect') ?? '0');
 const limit = Number(argVal('--limit') ?? '0') || 0;
+const strictAxisHit = args.includes('--strict-axis-hit');
 
 const scenarioPath = resolve(__dirname, '..', fileArg);
 const scenarios = readFileSync(scenarioPath, 'utf8')
@@ -51,7 +62,10 @@ console.log(`Running ${filtered.length} scenarios against ${baseUrl}/dql/verify\
 
 const results = [];
 const headers = { 'content-type': 'application/json' };
-if (process.env.DQL_API_KEY) headers['x-api-key'] = process.env.DQL_API_KEY;
+if (process.env.DQL_API_KEY) {
+  // Gate reads X-DQL-Key (primary) or Authorization: Bearer — not x-api-key (#22).
+  headers['x-dql-key'] = process.env.DQL_API_KEY;
+}
 
 for (const s of filtered) {
   const t0 = Date.now();
@@ -80,9 +94,12 @@ for (const s of filtered) {
   const othersFired = axesArr.filter((a) => a.axis !== expected && a.verdict === 'FAIL').length;
   const parseOk = axesArr.length === 5;
   const agg = response.aggregate?.verdict ?? 'MISSING';
+  const failOpen = agg === 'ALLOW';
+  const safeClosed = agg === 'BLOCK' || agg === 'REVIEW';
   const mark = hit ? '✓' : '✗';
+  const fo = failOpen ? ' FAIL-OPEN' : '';
   console.log(
-    `${mark} ${s.id.padEnd(16)} exp=${expected.padEnd(13)} got=${gotVerdict}@${gotConf}  agg=${agg}  others_fired=${othersFired}  ${dt}ms`,
+    `${mark} ${s.id.padEnd(16)} exp=${expected.padEnd(13)} got=${gotVerdict}@${gotConf}  agg=${agg}  others_fired=${othersFired}  ${dt}ms${fo}`,
   );
   results.push({
     id: s.id,
@@ -90,21 +107,21 @@ for (const s of filtered) {
     got_verdict: gotVerdict,
     got_confidence: Number(gotConf),
     hit,
+    axis_hit: hit,
     parse_ok: parseOk,
     aggregate_verdict: agg,
+    fail_open: failOpen,
+    safe_closed: safeClosed,
     others_fired: othersFired,
     axes: axesArr.map((a) => ({ axis: a.axis, verdict: a.verdict, confidence: a.confidence })),
     ms: dt,
   });
 }
 
-// ---- summary ---------------------------------------------------------------
+// ---- summary (hybrid gate) -------------------------------------------------
 
-const total = results.filter((r) => !r.error).length;
-const parseRate = results.filter((r) => r.parse_ok).length / total;
-const hits = results.filter((r) => r.hit).length;
-const axisHitRate = hits / total;
-const othersFireRate = results.filter((r) => !r.error).reduce((s, r) => s + r.others_fired, 0) / (total * 4);
+const hybrid = computeHybridSummary(results, { strictAxisHit });
+
 const perAxis = {};
 for (const r of results.filter((r) => !r.error)) {
   perAxis[r.expected] ??= { total: 0, hits: 0 };
@@ -112,10 +129,15 @@ for (const r of results.filter((r) => !r.error)) {
   if (r.hit) perAxis[r.expected].hits += 1;
 }
 
+const othersFireRate =
+  hybrid.total_cases > 0
+    ? results.filter((r) => !r.error).reduce((s, r) => s + (r.others_fired ?? 0), 0) /
+      (hybrid.total_cases * 4)
+    : 0;
+
 console.log('\n───────────────────────────────────────────────');
-console.log(`Total:               ${total}`);
-console.log(`Parse-rate:          ${(parseRate * 100).toFixed(1)}%  (floor 100%)`);
-console.log(`Axis-hit-rate:       ${(axisHitRate * 100).toFixed(1)}%  (floor 90%)`);
+console.log(`Total:               ${hybrid.total_cases}`);
+console.log(formatHybridConsole(hybrid));
 console.log(`Other-axes fire:     ${(othersFireRate * 100).toFixed(1)}%  (lower = more orthogonal)`);
 console.log('\nPer-axis hit-rate:');
 for (const [ax, v] of Object.entries(perAxis)) {
@@ -126,13 +148,23 @@ const summary = {
   summary: {
     base_url: baseUrl,
     scenario_file: fileArg,
-    total_cases: total,
-    parse_rate: parseRate,
-    axis_hit_rate: axisHitRate,
+    total_cases: hybrid.total_cases,
+    parse_rate: hybrid.parse_rate,
+    fail_open_rate: hybrid.fail_open_rate,
+    fail_open_ids: hybrid.fail_open_ids,
+    safe_closed_rate: hybrid.safe_closed_rate,
+    safe_closed_rate_view: hybrid.safe_closed_rate_view,
+    safe_closed_all_rate: hybrid.safe_closed_all_rate,
+    miss_count: hybrid.miss_count,
+    axis_hit_rate: hybrid.axis_hit_rate,
     other_axes_fire_rate: othersFireRate,
     per_axis: perAxis,
+    thresholds: hybrid.thresholds,
+    passed: hybrid.passed,
   },
   results,
 };
 writeFileSync(outPath, JSON.stringify(summary, null, 2));
 console.log(`\nReport written to ${outPath}`);
+console.log(`Overall: ${hybrid.passed ? '✓ PASSED' : '✗ FAILED (below hybrid threshold)'}`);
+process.exit(hybrid.passed ? 0 : 1);

@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 /**
- * Regression runner for scenarios/spike-40.jsonl.
+ * Regression runner for scenarios/spike-*.jsonl.
  *
  * Streams each frozen scenario through the configured DQL cascade and
- * reports:
- *   • parse-rate  — did every axis return valid JSON?
- *   • axis-hit    — did the expected FAIL-axis actually fire FAIL?
- *   • quiet-rate  — did the four non-expected axes stay PASS?
- *   • per-axis breakdown + pairwise co-fire counts.
+ * reports hybrid gate metrics (Issue #26):
+ *   • parse-rate       — hard floor 100%
+ *   • fail-open-rate   — ALLOW / all parsed — hard floor 0
+ *   • safe-closed-rate — BLOCK|REVIEW among axis-hit misses — hard floor 95%
+ *   • axis-hit-rate    — soft (diagnostic; enforce with --strict-axis-hit)
  *
  * OFF-CI by design: this script talks to real LLMs and costs real money.
  * Do NOT wire it into the default `npm test`. Invoke explicitly via
  * `npm run scenarios:spike`.
  *
  * Usage:
- *   node scripts/run-spike-scenarios.mjs [--file path] [--limit N] [--ids id1,id2] [--out path] [--expect N]
+ *   node scripts/run-spike-scenarios.mjs [--file path] [--limit N] [--ids id1,id2] [--out path] [--expect N] [--strict-axis-hit]
  *
  * Defaults to scenarios/spike-40.jsonl with an expected count of 40. Override
  * with --file for pilots or Spike-80. Pass --expect 0 to skip the count check.
@@ -31,6 +31,10 @@ import { runVerification } from '../dist/src/engine/index.js';
 import { PotCliCascade } from '../dist/src/engine/cascade-pot.js';
 import { StubCascade } from '../dist/src/engine/cascade.js';
 import { SandboxCascade } from '../dist/src/engine/sandbox-cascade.js';
+import {
+  computeHybridSummary,
+  formatHybridConsole,
+} from './lib/spike-hybrid-metrics.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -47,6 +51,7 @@ const outPath = argVal('--out') ?? resolve(__dirname, '..', 'scenarios', 'last-r
 const fileArg = argVal('--file') ?? 'scenarios/spike-40.jsonl';
 const expected = argVal('--expect');
 const expectedCount = expected === undefined ? 40 : Number(expected);
+const strictAxisHit = args.includes('--strict-axis-hit');
 
 // ---- load scenarios --------------------------------------------------------
 
@@ -79,7 +84,7 @@ const cascade = pickCascade();
 const sandboxCascade = new SandboxCascade();
 
 if (cascade instanceof StubCascade) {
-  console.warn('⚠  DQL_CASCADE not set to pot-cli — running against StubCascade will report 0% axis-hit-rate.');
+  console.warn('⚠  DQL_CASCADE not set to pot-cli — running against StubCascade will report low axis-hit-rate.');
   console.warn('   For a real regression run, export DQL_CASCADE=pot-cli plus SERV_API_KEY.');
 }
 
@@ -116,7 +121,7 @@ for (const s of filtered) {
   });
 
   const axisMap = Object.fromEntries(response.axes.map((a) => [a.axis, a]));
-  const expected = axisMap[s.expected_fail_axis];
+  const expectedAxis = axisMap[s.expected_fail_axis];
   const parseFails = response.axes.filter(isParseFail).map((a) => a.axis);
   const failedAxes = response.axes.filter((a) => a.verdict === 'FAIL').map((a) => a.axis);
   const passedAxes = response.axes.filter((a) => a.verdict === 'PASS').map((a) => a.axis);
@@ -127,13 +132,22 @@ for (const s of filtered) {
   const others = AXES.filter((a) => a !== s.expected_fail_axis);
   const otherFireCount = others.filter((a) => axisMap[a].verdict === 'FAIL').length;
 
+  const axisHit = expectedAxis.verdict === 'FAIL';
+  const agg = response.aggregate.verdict;
+  const failOpen = agg === 'ALLOW';
+  const safeClosed = agg === 'BLOCK' || agg === 'REVIEW';
+
   const record = {
     id: s.id,
     expected_fail_axis: s.expected_fail_axis,
-    axis_hit: expected.verdict === 'FAIL',
-    expected_verdict: expected.verdict,
-    expected_confidence: expected.confidence,
-    aggregate_verdict: response.aggregate.verdict,
+    axis_hit: axisHit,
+    hit: axisHit,
+    expected_verdict: expectedAxis.verdict,
+    expected_confidence: expectedAxis.confidence,
+    aggregate_verdict: agg,
+    fail_open: failOpen,
+    safe_closed: safeClosed,
+    parse_ok: parseFails.length === 0,
     parse_fails: parseFails,
     failed_axes: failedAxes,
     passed_axes: passedAxes,
@@ -145,17 +159,17 @@ for (const s of filtered) {
   perCase.push(record);
 
   const mark = record.axis_hit ? '✓' : '✗';
+  const fo = record.fail_open ? ' FAIL-OPEN' : '';
   process.stdout.write(
-    `${mark} ${s.id.padEnd(6)} exp=${s.expected_fail_axis.padEnd(13)} got=${expected.verdict}@${expected.confidence.toFixed(2)}  ` +
-      `agg=${response.aggregate.verdict.padEnd(6)}  others_fired=${otherFireCount}  ${record.latency_ms}ms\n`
+    `${mark} ${s.id.padEnd(6)} exp=${s.expected_fail_axis.padEnd(13)} got=${expectedAxis.verdict}@${expectedAxis.confidence.toFixed(2)}  ` +
+      `agg=${agg.padEnd(6)}  others_fired=${otherFireCount}  ${record.latency_ms}ms${fo}\n`,
   );
 }
 
-// ---- summary ---------------------------------------------------------------
+// ---- summary (hybrid gate) -------------------------------------------------
 
-const total = perCase.length;
-const hits = perCase.filter((r) => r.axis_hit).length;
-const anyParseFail = perCase.filter((r) => r.parse_fails.length > 0).length;
+const hybrid = computeHybridSummary(perCase, { strictAxisHit });
+
 const perAxisTotals = {};
 for (const axis of AXES) {
   const cases = perCase.filter((r) => r.expected_fail_axis === axis);
@@ -166,36 +180,32 @@ for (const axis of AXES) {
   };
 }
 const nonQuiet = perCase.reduce((n, r) => n + r.other_axes_fired, 0);
-const otherFireRate = total ? nonQuiet / (total * 4) : 0;
-
-// Baseline thresholds — see scenarios/README.md.
-const THRESHOLDS = {
-  parseRate: 1.0,
-  axisHitRate: 0.90,
-};
-
-const parseRate = total ? (total - anyParseFail) / total : 0;
-const axisHitRate = total ? hits / total : 0;
+const otherFireRate = perCase.length ? nonQuiet / (perCase.length * 4) : 0;
 
 const summary = {
-  total_cases: total,
-  parse_rate: parseRate,
-  axis_hit_rate: axisHitRate,
+  total_cases: hybrid.total_cases,
+  parse_rate: hybrid.parse_rate,
+  fail_open_rate: hybrid.fail_open_rate,
+  fail_open_ids: hybrid.fail_open_ids,
+  safe_closed_rate: hybrid.safe_closed_rate,
+  safe_closed_rate_view: hybrid.safe_closed_rate_view,
+  safe_closed_all_rate: hybrid.safe_closed_all_rate,
+  miss_count: hybrid.miss_count,
+  axis_hit_rate: hybrid.axis_hit_rate,
   other_axes_fire_rate: otherFireRate,
   per_axis: perAxisTotals,
   duration_ms: Date.now() - startAll,
   cascade_mode: process.env.DQL_CASCADE ?? 'stub',
-  thresholds: THRESHOLDS,
-  passed: parseRate >= THRESHOLDS.parseRate && axisHitRate >= THRESHOLDS.axisHitRate,
+  thresholds: hybrid.thresholds,
+  passed: hybrid.passed,
 };
 
 const report = { summary, cases: perCase };
 writeFileSync(outPath, JSON.stringify(report, null, 2));
 
 console.log('\n───────────────────────────────────────────────');
-console.log(`Total:               ${total}`);
-console.log(`Parse-rate:          ${(parseRate * 100).toFixed(1)}%  (floor ${(THRESHOLDS.parseRate * 100).toFixed(0)}%)`);
-console.log(`Axis-hit-rate:       ${(axisHitRate * 100).toFixed(1)}%  (floor ${(THRESHOLDS.axisHitRate * 100).toFixed(0)}%)`);
+console.log(`Total:               ${summary.total_cases}`);
+console.log(formatHybridConsole(hybrid));
 console.log(`Other-axes fire:     ${(otherFireRate * 100).toFixed(1)}%  (lower = more orthogonal)`);
 console.log('\nPer-axis hit-rate:');
 for (const axis of AXES) {
@@ -203,5 +213,5 @@ for (const axis of AXES) {
   console.log(`  ${axis.padEnd(14)} ${p.hits}/${p.total}  (${(p.hit_rate * 100).toFixed(1)}%)`);
 }
 console.log(`\nReport written to ${outPath}`);
-console.log(`Overall: ${summary.passed ? '✓ PASSED' : '✗ FAILED (below threshold)'}`);
+console.log(`Overall: ${summary.passed ? '✓ PASSED' : '✗ FAILED (below hybrid threshold)'}`);
 process.exit(summary.passed ? 0 : 1);
