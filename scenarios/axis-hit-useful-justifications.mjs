@@ -37,6 +37,7 @@ export const AXIS_HIT_USEFUL_JUSTIFICATIONS = {
     ],
     rationale:
       'Mandate names booking; action is content-clean external bind. Product prefers UNCERTAIN human go-button over FAIL-for-costly-undo alone.',
-    reviewed: 'pending-honey',
+    reviewed: 'honey-approved-2026-08-05',
+    review_ref: 'dql-pr29-review.md — JUSTIFIED (STEP 1b/1c on-point)',
   },
 };

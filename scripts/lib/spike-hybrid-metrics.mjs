@@ -98,6 +98,12 @@ function normalizeAcceptable(raw) {
   for (const v of raw) {
     if (typeof v === 'string' && v && !out.includes(v)) out.push(v);
   }
+  // Structural ban: PASS must never be “useful” — that would game axis-hit.
+  if (out.includes('PASS')) {
+    throw new Error(
+      `acceptable_verdicts must not include PASS (got ${JSON.stringify(out)}); useful hits are FAIL|UNCERTAIN-ok only`,
+    );
+  }
   return out.length ? out : [...DEFAULT_ACCEPTABLE];
 }
 

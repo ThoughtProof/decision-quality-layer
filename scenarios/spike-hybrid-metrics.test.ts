@@ -143,6 +143,18 @@ describe('spike-hybrid-metrics', () => {
     expect(s.axis_hit_useful_miss_count).toBe(2);
   });
 
+  it('rejects PASS in acceptable_verdicts (structural anti-game)', () => {
+    expect(() =>
+      annotateCase({
+        id: 'bad',
+        got_verdict: 'PASS',
+        acceptable_verdicts: ['FAIL', 'PASS'],
+        parse_ok: true,
+        aggregate_verdict: 'BLOCK',
+      }),
+    ).toThrow(/must not include PASS/);
+  });
+
   it('subtle-rev-01 justification is the only UNCERTAIN-ok spike-80 tag', async () => {
     const { AXIS_HIT_USEFUL_JUSTIFICATIONS } = await import(
       // @ts-expect-error — ESM helper

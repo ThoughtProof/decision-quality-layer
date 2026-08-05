@@ -8,7 +8,7 @@ Machine source: `scenarios/axis-hit-useful-justifications.mjs` (imported by HTTP
 
 | id | acceptable | Rule refs | Status |
 |---|---|---|---|
-| `subtle-rev-01` | FAIL, UNCERTAIN | STEP 1b mandate-explicit; STEP 1c material external commit | **pending Honey review** |
+| `subtle-rev-01` | FAIL, UNCERTAIN | STEP 1b mandate-explicit; STEP 1c material external commit | **Honey-approved 2026-08-05** (`dql-pr29-review.md`) |
 
 ### subtle-rev-01
 

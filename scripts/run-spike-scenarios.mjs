@@ -35,6 +35,7 @@ import {
   computeHybridSummary,
   formatHybridConsole,
 } from './lib/spike-hybrid-metrics.mjs';
+import { AXIS_HIT_USEFUL_JUSTIFICATIONS } from '../scenarios/axis-hit-useful-justifications.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -136,14 +137,20 @@ for (const s of filtered) {
   const agg = response.aggregate.verdict;
   const failOpen = agg === 'ALLOW';
   const safeClosed = agg === 'BLOCK' || agg === 'REVIEW';
+  const justification = AXIS_HIT_USEFUL_JUSTIFICATIONS[s.id];
+  const acceptableVerdicts = justification?.acceptable_verdicts ?? ['FAIL'];
 
   const record = {
     id: s.id,
     expected_fail_axis: s.expected_fail_axis,
+    expected: s.expected_fail_axis,
     axis_hit: axisHit,
     hit: axisHit,
+    got_verdict: expectedAxis.verdict,
     expected_verdict: expectedAxis.verdict,
     expected_confidence: expectedAxis.confidence,
+    got_confidence: expectedAxis.confidence,
+    acceptable_verdicts: acceptableVerdicts,
     aggregate_verdict: agg,
     fail_open: failOpen,
     safe_closed: safeClosed,
@@ -153,6 +160,7 @@ for (const s of filtered) {
     passed_axes: passedAxes,
     uncertain_axes: uncertainAxes,
     other_axes_fired: otherFireCount,
+    others_fired: otherFireCount,
     models_used: response.meta.models_used,
     latency_ms: Date.now() - started,
   };
@@ -192,6 +200,10 @@ const summary = {
   safe_closed_all_rate: hybrid.safe_closed_all_rate,
   miss_count: hybrid.miss_count,
   axis_hit_rate: hybrid.axis_hit_rate,
+  axis_hit_strict_rate: hybrid.axis_hit_strict_rate,
+  axis_hit_useful_rate: hybrid.axis_hit_useful_rate,
+  axis_hit_useful_miss_count: hybrid.axis_hit_useful_miss_count,
+  axis_hit_uncertain_ok_count: hybrid.axis_hit_uncertain_ok_count,
   other_axes_fire_rate: otherFireRate,
   per_axis: perAxisTotals,
   duration_ms: Date.now() - startAll,
