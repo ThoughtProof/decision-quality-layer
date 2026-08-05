@@ -20,6 +20,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 interface Scenario {
   id: string;
   expected_fail_axis: 'intent' | 'scope' | 'risk' | 'consistency' | 'reversibility';
+  /** Prior designed axis before honest relabel (Issue #26 option 3). */
+  expected_v1_fail_axis?: 'intent' | 'scope' | 'risk' | 'consistency' | 'reversibility';
   note: string;
   request: {
     mandate: string;
@@ -39,15 +41,23 @@ function load(file: string): Scenario[] {
     .map((l) => JSON.parse(l) as Scenario);
 }
 
-function assertBasics(scenarios: Scenario[], label: string, expectedCount: number, perAxis: number) {
+type PerAxis = number | Record<(typeof AXES)[number], number>;
+
+function assertBasics(
+  scenarios: Scenario[],
+  label: string,
+  expectedCount: number,
+  perAxis: PerAxis,
+) {
   it(`${label}: has exactly ${expectedCount} scenarios`, () => {
     expect(scenarios).toHaveLength(expectedCount);
   });
 
-  it(`${label}: has ${perAxis} scenarios per axis`, () => {
+  it(`${label}: has expected per-axis counts`, () => {
     for (const axis of AXES) {
       const count = scenarios.filter((s) => s.expected_fail_axis === axis).length;
-      expect(count, `axis ${axis}`).toBe(perAxis);
+      const want = typeof perAxis === 'number' ? perAxis : perAxis[axis];
+      expect(count, `axis ${axis}`).toBe(want);
     }
   });
 
@@ -81,7 +91,14 @@ function assertBasics(scenarios: Scenario[], label: string, expectedCount: numbe
 
 describe('spike-40-coarse JSONL', () => {
   const scenarios = load('spike-40-coarse.jsonl');
-  assertBasics(scenarios, 'coarse', 40, 8);
+  // rev-06 relabeled reversibility → risk (#26 option 3); expected_v1 preserved
+  assertBasics(scenarios, 'coarse', 40, {
+    intent: 8,
+    scope: 8,
+    risk: 9,
+    consistency: 8,
+    reversibility: 7,
+  });
 });
 
 describe('spike-40-subtle JSONL', () => {
@@ -98,13 +115,27 @@ describe('spike-40-subtle JSONL', () => {
 
 describe('spike-80 JSONL', () => {
   const scenarios = load('spike-80.jsonl');
-  assertBasics(scenarios, 'combined', 80, 16);
+  assertBasics(scenarios, 'combined', 80, {
+    intent: 16,
+    scope: 16,
+    risk: 17,
+    consistency: 16,
+    reversibility: 15,
+  });
 
   it('combined: is the concatenation of coarse + subtle (ids preserved)', () => {
     const coarse = load('spike-40-coarse.jsonl').map((s) => s.id);
     const subtle = load('spike-40-subtle.jsonl').map((s) => s.id);
     const combined = scenarios.map((s) => s.id);
     expect(combined).toEqual([...coarse, ...subtle]);
+  });
+
+  it('rev-06 is risk-primary with expected_v1=reversibility (#26 option 3)', () => {
+    const rev06 = scenarios.find((s) => s.id === 'rev-06');
+    expect(rev06).toBeTruthy();
+    expect(rev06!.expected_fail_axis).toBe('risk');
+    expect(rev06!.expected_v1_fail_axis).toBe('reversibility');
+    expect(rev06!.note.toLowerCase()).toMatch(/relabel|expected_v1|risk/);
   });
 });
 
