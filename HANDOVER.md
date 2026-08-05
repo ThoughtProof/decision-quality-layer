@@ -3,7 +3,7 @@
 > **Language note:** This is a German one-page status doc (per the OpenClaw `DRAFTS/2026-08-04-dql-now-next-not.md` it replaces). Deep doc is in `docs/`. This file is the **current** single source of truth; prefer it over the old 2026-07-08 v0.2 HANDOVER.
 
 **Stand:** 2026-08-05 CEST (PR #28 hybrid gate live; #26 partial — risk matops + fail_open metrics)
-**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=df652752…`
+**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=9e7fc18c…`
 **Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim.
 
 ---
