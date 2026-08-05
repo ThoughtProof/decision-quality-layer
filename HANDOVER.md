@@ -37,7 +37,8 @@
 
 **Regel:** Health-JSON + Deploy-SHA schlagen README.
 
-**Ops:** Mehr REVIEW nach #25 = Fix bei der Arbeit (Secondary-Failure ehrlich), kein neuer Bug.
+**Ops:** Mehr REVIEW nach #25 = Fix bei der Arbeit (Secondary-Failure ehrlich), kein neuer Bug.  
+**Gate lexicon:** `fail_open` ≡ aggregate **ALLOW** only; REVIEW/BLOCK = safe-closed (see #26). Block→REVIEW ≠ fail-open.
 
 ---
 
