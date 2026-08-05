@@ -4,6 +4,25 @@ This is the complete list of environment variables the DQL API reads. The
 default configuration (no variables set) runs the **StubCascade** and needs
 no secrets — safe for local development and CI.
 
+## Version semantics (P0 #3)
+
+**One-sentence rule:** `version` is the **package/artifact** version
+(`package.json` / npm label); `config_schema_version` is the **runtime
+behavior/schema** version (`CONFIG_SCHEMA_VERSION` in
+`src/engine/production-config.ts`). Never cite `version` for feature or
+behavior claims; never cite `config_schema_version` as the package version.
+
+| Field (e.g. `/dql/health`) | Meaning | Current example |
+|----------------------------|---------|-----------------|
+| `version` | npm/package **artifact** | `0.2.0` (locked; not a feature level) |
+| `config_schema_version` | runtime **behavior/schema** | `0.4.3.2-deadline-1` |
+| `X-DQL-Version` header | same as `version` (artifact) | `0.2.0` |
+
+Single source of truth for the artifact number: `package.json` →
+`src/package-version.ts` (`PACKAGE_VERSION`). Health/verify/structural-metrics
+import that constant. CI hermetic test asserts
+`PACKAGE_VERSION === package.json.version` and that the two axes stay distinct.
+
 ## Cascade selection
 
 | Variable       | Values                                | Default | Effect |

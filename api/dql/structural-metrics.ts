@@ -16,7 +16,10 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getStructuralMetricsSnapshot } from '../../src/engine/structural-metrics.js';
 
-const VERSION = '0.2.0';
+import { PACKAGE_VERSION } from '../../src/package-version.js';
+
+/** Artifact version (package.json). See docs/ENV.md § Version semantics. */
+const VERSION = PACKAGE_VERSION;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*');

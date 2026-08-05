@@ -49,7 +49,10 @@ import {
   type DiagnosticsSnapshot,
 } from '../../src/engine/runtime-diagnostics.js';
 
-const VERSION = '0.2.0';
+import { PACKAGE_VERSION } from '../../src/package-version.js';
+
+/** Artifact version (package.json). See docs/ENV.md § Version semantics. */
+const VERSION = PACKAGE_VERSION;
 const MAX_BODY_SIZE = 1_000_000; // 1 MB
 
 // v0.4.3.1 hardening: production runtime bundle is constructed at cold-start.

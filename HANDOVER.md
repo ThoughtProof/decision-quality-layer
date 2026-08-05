@@ -16,7 +16,7 @@
 | Health | `status=ok` · cascade `pot-cli` · SERV key bound |
 | Runtime schema | `0.4.3.2-deadline-1` · `v0431_active=true` |
 | Deploy commit | **`df652752`** — PR #31 consistency Class-B recall + prior hybrid stack · Health-SHA == main-SHA
-| npm/package label | noch `0.2.0` (Label ≠ Runtime — nicht als Product-Version zitieren) |
+| npm/package label | `0.2.0` **artifact only** (locked P0 #3) — cite `config_schema_version` for behavior |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
 | Flags | `capital_path_mode=true` · `disable_circuit_breaker=true` · `alias_gate_ready=false` · diagnostics on |
 | Cascade | `serv-nano` → `serv-swift` (OpenServ) |
@@ -49,7 +49,7 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 ### P0 — Repo/Prod Hygiene
 1. ✅ **Prod-Linie nach `main` bringen + Prod-Redeploy** — **DONE 2026-08-04** (PR #22, then superseded by later main).
 2. ✅ **HANDOVER 1-pager ersetzen** — **dieses Dokument** (P0 #2; PR #23).
-3. **Versionssemantik:** entweder package auf `0.4.3.2` heben oder public copy nur `config_schema_version` nennen.
+3. ✅ **Versionssemantik (P0 #3)** — **DONE 2026-08-05:** keep package `0.2.0` (artifact); `config_schema_version` = runtime. One-sentence rule in `docs/ENV.md`; `PACKAGE_VERSION` single source from `package.json` (health/verify); CI hermetic test asserts health==package and axes stay distinct.
 4. ✅ **Cascade-Provenienz-Regression** — **DONE 2026-08-05** ([Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24) / [PR #25](https://github.com/ThoughtProof/decision-quality-layer/pull/25) → main/`e2e62179`). Verdict preservation decoupled from truthful `provider_outcome`; auth constant-time + key fingerprint logs. Preview spike ≈ prod; interim engine-merge gate documented on PR.
 5. **P0 #5: Prod spike-80 recovery ≥90%** — [Issue #26](https://github.com/ThoughtProof/decision-quality-layer/issues/26). **Partial 2026-08-05:** [PR #28](https://github.com/ThoughtProof/decision-quality-layer/pull/28) hybrid gate live (fail_open 0). **Recovery sketch:** `docs/issues/ISSUE26_AXIS_HIT_RECOVERY.md` — 25 misses: consistency PASS×9, reversibility UNCERTAIN-cluster×7 (often STEP 1c by design — do not force FAIL), residual risk×4. HTTP spike now persists provenance/meta. **Metric honesty DONE (PR #29):** dual axis_hit_strict/useful forever; sole UNCERTAIN-ok=`subtle-rev-01` (Honey-approved). Next: optional consistency recall PR — **not** blanket UNCERTAIN→FAIL.
 
