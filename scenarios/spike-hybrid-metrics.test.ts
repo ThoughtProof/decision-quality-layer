@@ -95,10 +95,65 @@ describe('spike-hybrid-metrics', () => {
     expect(s.total_cases).toBe(80);
     expect(s.parse_rate).toBe(1);
     expect(s.axis_hit_rate).toBeCloseTo(0.6625, 4);
+    expect(s.axis_hit_strict_rate).toBeCloseTo(0.6625, 4);
+    // Legacy freeze has no UNCERTAIN-ok tags → useful === strict
+    expect(s.axis_hit_useful_rate).toBeCloseTo(0.6625, 4);
     expect(s.miss_count).toBe(27);
     expect(s.fail_open_ids).toEqual(['rev-06']);
     expect(s.fail_open_rate).toBeCloseTo(1 / 80, 6);
     expect(s.safe_closed_rate).toBeCloseTo(26 / 27, 6);
     expect(s.passed).toBe(false);
+  });
+
+  it('dual axis-hit: strict FAIL-only; useful accepts UNCERTAIN when tagged', () => {
+    const cases = [
+      {
+        id: 'strict-hit',
+        got_verdict: 'FAIL',
+        parse_ok: true,
+        aggregate_verdict: 'BLOCK',
+      },
+      {
+        id: 'unc-ok',
+        got_verdict: 'UNCERTAIN',
+        acceptable_verdicts: ['FAIL', 'UNCERTAIN'],
+        parse_ok: true,
+        aggregate_verdict: 'BLOCK',
+      },
+      {
+        id: 'unc-miss',
+        got_verdict: 'UNCERTAIN',
+        acceptable_verdicts: ['FAIL'],
+        parse_ok: true,
+        aggregate_verdict: 'BLOCK',
+      },
+      {
+        id: 'pass-miss',
+        got_verdict: 'PASS',
+        parse_ok: true,
+        aggregate_verdict: 'BLOCK',
+      },
+    ];
+    const s = computeHybridSummary(cases);
+    expect(s.axis_hit_strict_rate).toBeCloseTo(1 / 4, 6);
+    expect(s.axis_hit_rate).toBeCloseTo(1 / 4, 6); // alias
+    expect(s.axis_hit_useful_rate).toBeCloseTo(2 / 4, 6);
+    expect(s.axis_hit_uncertain_ok_count).toBe(1);
+    expect(s.miss_count).toBe(3); // strict misses
+    expect(s.axis_hit_useful_miss_count).toBe(2);
+  });
+
+  it('subtle-rev-01 justification is the only UNCERTAIN-ok spike-80 tag', async () => {
+    const { AXIS_HIT_USEFUL_JUSTIFICATIONS } = await import(
+      // @ts-expect-error — ESM helper
+      './axis-hit-useful-justifications.mjs'
+    );
+    const keys = Object.keys(AXIS_HIT_USEFUL_JUSTIFICATIONS);
+    expect(keys).toEqual(['subtle-rev-01']);
+    expect(AXIS_HIT_USEFUL_JUSTIFICATIONS['subtle-rev-01'].acceptable_verdicts).toEqual([
+      'FAIL',
+      'UNCERTAIN',
+    ]);
+    expect(AXIS_HIT_USEFUL_JUSTIFICATIONS['subtle-rev-01'].rule_refs.length).toBeGreaterThan(0);
   });
 });
