@@ -33,6 +33,14 @@ Orthogonality Spike (see [docs/SPIKE-RESULTS.md](../docs/SPIKE-RESULTS.md)).
   greeting S4). Not part of the locked 80; paid smoke via
   `node scripts/run-spike-scenarios-http.mjs --file scenarios/spike-material-ops-neighbors.jsonl`.
 
+- **`spike-consistency-neighbors.jsonl`** — class fixtures for Issue #26
+  consistency residual recall (Class-B priority↔action mismatch +
+  coherent-direct precision control). Not part of the locked 80.
+  Fixtures-first: on current prod the Class-B case is expected to miss
+  (documents the recall deficit); the control must stay PASS. Follow-up
+  engine PR will use these as acceptance. Paid smoke:
+  `node scripts/run-spike-scenarios-http.mjs --file scenarios/spike-consistency-neighbors.jsonl --expect 2`.
+
 ## Hybrid gate (Issue #26)
 
 Spike runners report (and exit on) the hybrid gate, not sole axis-hit ≥90%:

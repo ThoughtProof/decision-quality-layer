@@ -140,3 +140,45 @@ describe('spike-material-ops-neighbors JSONL (Issue #26 class fixtures)', () => 
     }
   });
 });
+
+describe('spike-consistency-neighbors JSONL (Issue #26 class fixtures)', () => {
+  const scenarios = load('spike-consistency-neighbors.jsonl');
+
+  it('has ≥2 class fixtures with unique ids', () => {
+    expect(scenarios.length).toBeGreaterThanOrEqual(2);
+    const ids = scenarios.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('includes Class-B priority-mismatch + coherent-direct control', () => {
+    const ids = new Set(scenarios.map((s) => s.id));
+    expect(ids.has('cns-neighbor-priority-mismatch')).toBe(true);
+    expect(ids.has('cns-neighbor-coherent-direct')).toBe(true);
+  });
+
+  it('every scenario request passes DQL request validation', () => {
+    for (const s of scenarios) {
+      const v = validateVerifyRequest(s.request);
+      const detail = v.valid ? '' : v.errors.join(', ');
+      expect(v.valid, `${s.id}: ${detail}`).toBe(true);
+    }
+  });
+
+  it('every scenario asks for all 5 axes and expects consistency', () => {
+    for (const s of scenarios) {
+      expect(s.expected_fail_axis).toBe('consistency');
+      expect(s.request.axes.sort()).toEqual([...AXES].sort());
+    }
+  });
+
+  it('Class-B neighbor notes a priority↔action break; control notes precision/PASS intent', () => {
+    const mismatch = scenarios.find((s) => s.id === 'cns-neighbor-priority-mismatch');
+    const control = scenarios.find((s) => s.id === 'cns-neighbor-coherent-direct');
+    expect(mismatch?.note.toLowerCase()).toMatch(/priority|speed|contradict|mismatch|logical break/);
+    expect(control?.note.toLowerCase()).toMatch(/pass|precision|control|direct/);
+    // Fresh surface — not a copy of locked spike-80 CDN/laptop ids
+    expect(mismatch?.id).not.toMatch(/subtle-con|cns-0/);
+    expect(JSON.stringify(mismatch?.request)).not.toMatch(/FastCDN|Latitude 5450/i);
+  });
+});
+
