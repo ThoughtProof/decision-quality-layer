@@ -86,6 +86,46 @@ Prod also carries post-baseline features (objection evidence bind on surface pat
 |---|---|
 | Spike floor 90% met on prod today? | **No** (66.3%) |
 | July→now prod regression real? | **Yes** (−31.2 pp, 25 id flips) |
-| Caused by PR #25? | **Unknown / not implicated by this URL** |
-| Merge PR #25 now under stated spike gate? | **NO-GO** |
-| Bee analysis OK to continue? | **Yes** — with above scope correction |
+| Caused by PR #25? | **No evidence** — preview spike ≈ prod |
+| Merge PR #25 now under stated spike gate? | **NO-GO** (floor still fails; gate unmet) |
+| Bee analysis OK to continue? | **Yes** — focus **prod regression**, not #25 blame |
+
+---
+
+## Follow-up run: PR #25 Preview (2026-08-05)
+
+**Yes — a new test was required.** Prod spike ≠ PR acceptance.
+
+| | |
+|---|---|
+| **Deploy** | `fix/24-provenance-decoupling` → Vercel Preview |
+| **URL** | `https://decision-quality-layer-4valsxj6o-rauls-projects-820227a7.vercel.app` |
+| **Env** | Preview aligned with prod critical flags (`DQL_CAPITAL_PATH_MODE`, deadline, cascade, …) + rotated `DQL_API_KEYS` |
+| **Report** | `scenarios/spike-80-pr25-preview-2026-08-05.json` |
+
+| | Baseline 07-08 | Prod 08-04 | **PR25 Preview 08-05** |
+|---|---|---|---|
+| Axis-hit | **97.5%** | **66.3%** | **62.5%** |
+| Intent | 100% | 100% | 93.8% |
+| Scope | 93.8% | 87.5% | 87.5% |
+| Risk | 100% | 56.3% | 56.3% |
+| Consistency | 100% | 43.8% | 43.8% |
+| Reversibility | 93.8% | 43.8% | 31.3% |
+| Parse | 100% | 100% | 100% |
+
+**Prod vs PR25 agreement: 77/80 cases.**  
+PR-only worse on 3 ids (`rev-01`, `rev-02`, `subtle-int-06`); **zero** cases where PR hits and prod misses.
+
+### Interpretation
+
+1. **PR #25 does not cause the cliff** from 97.5% — the damage is already on **prod**.
+2. **PR #25 also does not restore the floor** — preview still ~62–66%, far below 90%.
+3. Under the **stated** spike-floor gate, merge remains **NO-GO** (criterion unmet on the PR surface too).
+4. Next engineering focus = **prod cascade/quality regression** (model path, latency 4s→17s, risk/consistency/reversibility), not provenance-decoupling archaeology — unless unit tests on #25 still justify merging under a **rewritten** gate (unit-only + “no worse than prod” within noise).
+
+### Optional gate rewrite (needs Raul go)
+
+- **Old:** spike ≥90% vs July baseline before any engine merge  
+- **Possible interim:** spike on PR preview **not materially worse than current prod** (e.g. within 5 pp) **and** 450/450 unit tests — while prod floor recovery is a separate P0  
+
+Without explicit rewrite, stay NO-GO.
