@@ -42,11 +42,13 @@ DQL runs a single tier: the nano → swift cascade validated by the Orthogonalit
 
 ## Status
 
-**Phase 0 (this repo, today):** API scaffold, request validation, engine orchestration, aggregation, per-axis prompt builders, sandbox cascade. Real cascade is stubbed — every non-sandbox axis returns `UNCERTAIN` until Phase 1 wires the pot-cli cascade.
+**Production (live):** `https://dql.thoughtproof.ai` — real cascade via **`pot-cli`** (`active_cascade: pot-cli` on `GET /dql/health`). Auth: `X-DQL-Key` (see `docs/ENV.md`). Sandbox (`sandbox: true`) remains free and keyless.
 
-**Phase 1 (next):** Wire cascade to `pot-cli`'s nano→swift path (validated by the spike). Deploy to `dql.thoughtproof.ai` via Vercel.
+**Do not** treat older “cascade stubbed / Phase 0 scaffold” copy as current — that described the pre-wire scaffold and is **obsolete**.
 
-**Phase 2:** Payment gates — Stripe metered ($0.05/call for API-key holders) and x402 (per-call for crypto-native agents). Both flows return the same DQL response.
+**Payments:** API-key (`dev_access` / metered paths) and x402 as configured in deploy env. Pricing table above is the product intent; live 402/key behavior is authoritative over stale docs.
+
+**Ops honesty (Gate-0):** When `capital_path_mode` is on, circuit-breaker disable flags and fail-open defaults are treated as defects to clear — check `/dql/health` (`disable_circuit_breaker`, `capital_path_mode`) before high-reliance claims.
 
 ## API
 
