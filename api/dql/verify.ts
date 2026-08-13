@@ -33,9 +33,15 @@ import { runVerification } from '../../src/engine/index.js';
 import { StubCascade } from '../../src/engine/cascade.js';
 import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
-import { authorizeCall, parseApiKeys } from '../../src/auth/keys.js';
+import { authorizeCall, extractApiKey, parseApiKeys } from '../../src/auth/keys.js';
 import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
-import { priceForCall } from '../../src/pricing.js';
+import { emitStripeMeterEvent } from '../../src/auth/stripe-meter.js';
+import {
+  applyX402ChallengeHeaders,
+  isX402Enabled,
+  processX402Payment,
+} from '../../src/auth/x402.js';
+import { PRICE_USD_PER_CALL, priceForCall } from '../../src/pricing.js';
 import {
   createProductionRuntime,
   type ProductionRuntime,
@@ -130,7 +136,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-DQL-Key');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, X-DQL-Key, PAYMENT-SIGNATURE, Payment-Signature',
+    );
     res.setHeader('X-DQL-Version', VERSION);
     res.setHeader('X-Request-Id', requestId);
 
@@ -151,18 +160,79 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         status = 413;
         payload = { error: 'Request too large', code: 'PAYLOAD_TOO_LARGE', max_bytes: MAX_BODY_SIZE };
       } else {
-        // Phase 2 key gate: sandbox stays free (integration testing);
-        // everything else needs a valid X-DQL-Key (PAYMENT.md matrix).
+        // PAYMENT.md matrix:
+        // sandbox free → API key (dev free / billable Stripe) → x402 → 402.
         // Auth runs BEFORE validation — strangers don't get parsing work.
-        const auth = await authorizeCall({
-          headers: req.headers as Record<string, unknown>,
-          sandbox: (req.body as { sandbox?: unknown } | undefined)?.sandbox === true,
-          keys: API_KEYS,
-          usage: USAGE_GATE,
-        });
-        if (auth.kind === 'deny') {
-          status = auth.status;
-          payload = auth.payload;
+        const isSandbox =
+          (req.body as { sandbox?: unknown } | undefined)?.sandbox === true;
+        const headers = req.headers as Record<string, unknown>;
+        const presentedKey = extractApiKey(headers);
+
+        type AuthPath =
+          | { kind: 'free_sandbox' }
+          | { kind: 'allow'; key: string; record: import('../../src/auth/keys.js').ApiKeyRecord }
+          | { kind: 'x402'; txHash?: string; network?: string }
+          | { kind: 'deny'; status: number; payload: object };
+
+        let authPath: AuthPath;
+
+        if (isSandbox) {
+          authPath = { kind: 'free_sandbox' };
+        } else if (presentedKey) {
+          const auth = await authorizeCall({
+            headers,
+            sandbox: false,
+            keys: API_KEYS,
+            usage: USAGE_GATE,
+          });
+          if (auth.kind === 'deny') {
+            authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
+          } else if (auth.kind === 'allow') {
+            authPath = { kind: 'allow', key: auth.key, record: auth.record };
+          } else {
+            authPath = { kind: 'free_sandbox' };
+          }
+        } else if (isX402Enabled(process.env)) {
+          const x402 = await processX402Payment(req, process.env);
+          if (x402.kind === 'paid') {
+            authPath = { kind: 'x402', txHash: x402.txHash, network: x402.network };
+            if (x402.txHash) {
+              const receipt = {
+                txHash: x402.txHash,
+                network: x402.network ?? 'eip155:8453',
+                paidWith: 'x402-facilitator',
+              };
+              res.setHeader(
+                'payment-response',
+                Buffer.from(JSON.stringify(receipt)).toString('base64'),
+              );
+            }
+          } else if (x402.kind === 'reject') {
+            authPath = { kind: 'deny', status: x402.status, payload: x402.body };
+          } else {
+            // challenge or disabled-with-no-key
+            const challengeBody = applyX402ChallengeHeaders(res, process.env);
+            authPath = { kind: 'deny', status: 402, payload: challengeBody };
+          }
+        } else {
+          const auth = await authorizeCall({
+            headers,
+            sandbox: false,
+            keys: API_KEYS,
+            usage: USAGE_GATE,
+          });
+          if (auth.kind === 'deny') {
+            authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
+          } else if (auth.kind === 'allow') {
+            authPath = { kind: 'allow', key: auth.key, record: auth.record };
+          } else {
+            authPath = { kind: 'free_sandbox' };
+          }
+        }
+
+        if (authPath.kind === 'deny') {
+          status = authPath.status;
+          payload = authPath.payload;
         } else {
           const validation = validateVerifyRequest(req.body);
           if (!validation.valid) {
@@ -196,23 +266,54 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             });
             status = 200;
             payload = response;
-            // Billing surface: informational headers + the structured usage
-            // line that becomes the meter record once Stripe/x402 rails land.
-            if (auth.kind === 'allow') {
+
+            if (authPath.kind === 'allow') {
               const price = priceForCall({
                 sandbox: false,
-                dev_access: auth.record.dev_access,
+                dev_access: authPath.record.dev_access,
               });
-              res.setHeader('X-DQL-Billing', auth.record.dev_access ? 'dev-access' : 'metered');
+              const rail = authPath.record.dev_access ? 'dev-access' : 'metered-log-only';
+              res.setHeader(
+                'X-DQL-Billing',
+                authPath.record.dev_access ? 'dev-access' : 'metered',
+              );
               res.setHeader('X-DQL-Price-Usd', price.toFixed(2));
               emitUsageLine({
                 requestId,
-                key: auth.key,
-                owner: auth.record.owner,
-                devAccess: auth.record.dev_access,
+                key: authPath.key,
+                owner: authPath.record.owner,
+                devAccess: authPath.record.dev_access,
                 priceUsd: price,
                 verdict: (response as { verdict?: string }).verdict,
+                billingRail: rail,
               });
+              // Stripe meter: billable keys only; best-effort, never blocks response.
+              if (!authPath.record.dev_access && price > 0) {
+                void emitStripeMeterEvent({
+                  requestId,
+                  owner: authPath.record.owner,
+                  priceUsd: price,
+                }).then((r) => {
+                  if (r.kind === 'ok') {
+                    // already logged inside emitter
+                  }
+                });
+              }
+            } else if (authPath.kind === 'x402') {
+              res.setHeader('X-DQL-Billing', 'x402');
+              res.setHeader('X-DQL-Price-Usd', priceForCall({ sandbox: false, dev_access: false }).toFixed(2));
+              console.log(
+                JSON.stringify({
+                  type: 'dql_usage',
+                  request_id: requestId,
+                  billing_rail: 'x402',
+                  price_usd: PRICE_USD_PER_CALL,
+                  tx_hash: authPath.txHash,
+                  network: authPath.network,
+                  verdict: (response as { verdict?: string }).verdict,
+                  ts: new Date().toISOString(),
+                }),
+              );
             } else {
               res.setHeader('X-DQL-Billing', 'sandbox');
               res.setHeader('X-DQL-Price-Usd', '0.00');

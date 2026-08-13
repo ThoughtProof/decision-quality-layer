@@ -76,3 +76,15 @@ POST /dql/verify received
 
 - **Dev-access grant flow** — email-based today; do we want a lightweight form or is a mailto: link enough for v1?
 - **Refund / dispute policy** — if a customer disputes a Stripe charge, do we auto-refund below some threshold? Manual review above?
+
+## Implementation status (2026-08-14)
+
+Code path shipped on branch `feat/p2-self-serve-gate-rails` (flag-gated, **not** auto-enabled in prod):
+
+| Rail | Status | Enable |
+|---|---|---|
+| Stripe meter `dql_verify_call` | Code + unit tests | `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + **create meter in Stripe Dashboard** (Raul) |
+| x402 Base USDC | Code + unit tests (port of Sentinel Base/CDP path) | `DQL_X402_ENABLED=true` + CDP keys (reuse Sentinel) |
+| Upstash daily-cap multi-instance | Verified in unit test (atomic INCR shared counter); Redis keys now hash the API key (no raw secret in Redis) | `UPSTASH_REDIS_REST_URL` + `_TOKEN` |
+
+**Do not claim self-serve live** until Stripe meter exists in Dashboard and flags are intentionally turned on.

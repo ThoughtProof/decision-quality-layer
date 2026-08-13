@@ -61,9 +61,9 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 8. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
 
 ### P2 — Gate vollständig (wenn Self-Serve gewollt)
-9. Stripe meter `dql_verify_call` @ **$0.05** (PAYMENT.md) — Raul-Hold erst bei Bedarf heben
-10. x402-Rail port von Sentinel (gleiche Wallet) — optional parallel
-11. Upstash/global rate-limit multi-instance verifizieren
+9. ✅ Stripe meter code path `dql_verify_call` @ **$0.05** — **flag-gated OFF** (`DQL_STRIPE_METER_ENABLED`). Needs Raul: create meter in Stripe + customer map + enable flag.
+10. ✅ x402 Base rail port (Sentinel CDP path, same wallet) — **flag-gated OFF** (`DQL_X402_ENABLED`). Enable + CDP keys when wanted.
+11. ✅ Upstash daily-cap multi-instance — unit-verified atomic INCR; Redis key = sha256(key) (no raw secret). Prod still needs live dual-instance smoke when Upstash bound.
 
 ### P3 — Reliability debt (nur wenn capital/high-SLA)
 12. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)

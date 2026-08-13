@@ -1,7 +1,14 @@
 import { createHash } from 'node:crypto';
 
 import { describe, it, expect, vi } from 'vitest';
-import { NoopUsageGate, UpstashUsageGate, createUsageGate, emitUsageLine } from './usage.js';
+import {
+  NoopUsageGate,
+  UpstashUsageGate,
+  createUsageGate,
+  emitUsageLine,
+  usageCounterKey,
+  usageRedisKeyId,
+} from './usage.js';
 
 describe('NoopUsageGate', () => {
   it('always allows', async () => {
@@ -31,7 +38,27 @@ describe('UpstashUsageGate', () => {
     expect(await gate.checkAndRecord('dqlk_a', 2)).toBe(true); // 2
     expect(await gate.checkAndRecord('dqlk_a', 2)).toBe(false); // 3 > cap
     expect(redis.expire).toHaveBeenCalledTimes(1); // only on first incr
-    expect(redis.incr.mock.calls[0]![0]).toBe('dql:usage:dqlk_a:2026-07-20');
+    // Raw API key must NOT appear in Redis key — hashed id only.
+    expect(redis.incr.mock.calls[0]![0]).toBe(usageCounterKey('dqlk_a', '2026-07-20'));
+    expect(redis.incr.mock.calls[0]![0]).not.toContain('dqlk_a');
+    expect(redis.incr.mock.calls[0]![0]).toContain(usageRedisKeyId('dqlk_a'));
+  });
+
+  it('multi-instance: concurrent INCRs share one atomic counter (cap exact)', async () => {
+    const redis = fakeRedis();
+    const gateA = new UpstashUsageGate(redis, () => new Date('2026-07-20T12:00:00Z'));
+    const gateB = new UpstashUsageGate(redis, () => new Date('2026-07-20T12:00:01Z'));
+    const cap = 5;
+    // Simulate two Vercel instances racing 10 calls total.
+    const results = await Promise.all([
+      ...Array.from({ length: 5 }, () => gateA.checkAndRecord('dqlk_race', cap)),
+      ...Array.from({ length: 5 }, () => gateB.checkAndRecord('dqlk_race', cap)),
+    ]);
+    const allowed = results.filter(Boolean).length;
+    const blocked = results.filter((r) => !r).length;
+    expect(allowed).toBe(5);
+    expect(blocked).toBe(5);
+    expect(redis.store.get(usageCounterKey('dqlk_race', '2026-07-20'))).toBe(10);
   });
 
   it('separates counters per UTC day', async () => {
