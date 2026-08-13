@@ -13,6 +13,12 @@
   },
   "headers": [
     {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Robots-Tag", "value": "noindex, nofollow" }
+      ]
+    },
+    {
       "source": "/dql/(.*)",
       "headers": [
         { "key": "X-Content-Type-Options", "value": "nosniff" },
