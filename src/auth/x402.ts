@@ -17,6 +17,8 @@
  * No GOAT/XRPL in v1 DQL port — Base USDC only. Expand later if needed.
  */
 
+import { createHash } from 'node:crypto';
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 import { PRICE_USD_PER_CALL } from '../pricing.js';
@@ -148,6 +150,10 @@ export function sanitizeServerLogReason(err: unknown): string {
  * Non-sensitive payment identifier for reconcile logs.
  * Prefer payload nonce/authorization hash fields; never log signatures.
  */
+/**
+ * Non-sensitive payment reconcile id: SHA-256 fingerprint over non-secret
+ * authorization fields only. Never returns raw nonce, wallet, or signature.
+ */
 export function paymentReconcileId(payload: Record<string, unknown>): string {
   const nested =
     payload.payload && typeof payload.payload === 'object'
@@ -157,35 +163,35 @@ export function paymentReconcileId(payload: Record<string, unknown>): string {
     nested.authorization && typeof nested.authorization === 'object'
       ? (nested.authorization as Record<string, unknown>)
       : {};
-  const candidates = [
-    payload.nonce,
-    nested.nonce,
-    auth.nonce,
-    auth.from,
-    nested.from,
-  ];
-  for (const c of candidates) {
-    if (typeof c === 'string' && c.trim()) {
-      // Truncate addresses/ids; never store full signature material.
-      return c.trim().slice(0, 42);
-    }
-  }
-  // Stable short fingerprint over non-signature fields only.
-  const safe = JSON.stringify({
-    network: payload.network ?? null,
-    scheme: payload.scheme ?? null,
-    accepted:
-      payload.accepted && typeof payload.accepted === 'object'
-        ? {
-            network: (payload.accepted as Record<string, unknown>).network ?? null,
-            amount: (payload.accepted as Record<string, unknown>).amount ?? null,
-          }
-        : null,
-  });
-  // Lightweight djb2 — avoid importing crypto just for a log id.
-  let h = 5381;
-  for (let i = 0; i < safe.length; i++) h = ((h << 5) + h) ^ safe.charCodeAt(i);
-  return `pay_${(h >>> 0).toString(16)}`;
+  const accepted =
+    payload.accepted && typeof payload.accepted === 'object'
+      ? (payload.accepted as Record<string, unknown>)
+      : {};
+
+  // Include only non-sensitive authorization material. Explicitly exclude
+  // signature, private material, and full wallet dumps as standalone ids.
+  const material = {
+    scheme: payload.scheme ?? accepted.scheme ?? null,
+    network: payload.network ?? accepted.network ?? null,
+    amount: accepted.amount ?? accepted.maxAmountRequired ?? null,
+    asset: accepted.asset ?? null,
+    payTo: accepted.payTo ?? null,
+    // Hashed-in fields from authorization (values hashed as part of whole blob;
+    // never emitted raw). Prefer structured auth fields when present.
+    auth_from: typeof auth.from === 'string' ? auth.from : null,
+    auth_to: typeof auth.to === 'string' ? auth.to : null,
+    auth_value: typeof auth.value === 'string' ? auth.value : null,
+    auth_validAfter: typeof auth.validAfter === 'string' ? auth.validAfter : null,
+    auth_validBefore: typeof auth.validBefore === 'string' ? auth.validBefore : null,
+    auth_nonce: typeof auth.nonce === 'string' ? auth.nonce : null,
+    nested_nonce: typeof nested.nonce === 'string' ? nested.nonce : null,
+  };
+
+  const digest = createHash('sha256')
+    .update(JSON.stringify(material), 'utf8')
+    .digest('hex')
+    .slice(0, 24);
+  return `pay_${digest}`;
 }
 
 async function fetchWithTimeout(
@@ -202,13 +208,19 @@ async function fetchWithTimeout(
   }
 }
 
+type FacilitatorVerifyOutcome =
+  | { outcome: 'valid' }
+  | { outcome: 'invalid'; invalidReason?: string }
+  | { outcome: 'http_error'; status: number }
+  | { outcome: 'unavailable'; reason: string };
+
 async function facilitatorVerify(
   payload: unknown,
   paymentRequirements: unknown,
   env: NodeJS.ProcessEnv,
   baseUrl: string,
   mode: 'cdp' | 'explicit',
-): Promise<{ isValid: boolean; invalidReason?: string }> {
+): Promise<FacilitatorVerifyOutcome> {
   const cdp = mode === 'cdp' && hasCdpCredentials(env);
   const req = paymentRequirements as Record<string, unknown>;
   const body = cdp
@@ -234,15 +246,18 @@ async function facilitatorVerify(
         ts: new Date().toISOString(),
       }),
     );
-    return { isValid: false, invalidReason: `Facilitator verify failed (HTTP ${resp.status})` };
+    // 5xx / transport-class HTTP failures are infrastructure, not invalid payment.
+    return { outcome: 'http_error', status: resp.status };
   }
-  return (await resp.json()) as { isValid: boolean; invalidReason?: string };
+  const raw = (await resp.json()) as { isValid?: boolean; invalidReason?: string };
+  if (raw.isValid === true) return { outcome: 'valid' };
+  return { outcome: 'invalid', invalidReason: raw.invalidReason };
 }
 
 type FacilitatorSettleOutcome =
   | { outcome: 'success'; success: true; txHash?: string; network?: string }
   | { outcome: 'failed'; success: false; error?: string }
-  | { outcome: 'http_error'; success: false; error?: string };
+  | { outcome: 'unknown'; success: false; error?: string; status?: number };
 
 async function facilitatorSettle(
   payload: unknown,
@@ -276,11 +291,14 @@ async function facilitatorSettle(
         ts: new Date().toISOString(),
       }),
     );
-    // HTTP failure before an accepted settle response — unavailable, not unknown.
+    // After the settle request is sent, a 5xx/ambiguous HTTP error does NOT
+    // prove the facilitator rejected before accept — chain may have settled.
+    // Only definitive JSON success:false is "failed". HTTP errors → unknown.
     return {
-      outcome: 'http_error',
+      outcome: 'unknown',
       success: false,
-      error: `Facilitator settle failed (HTTP ${resp.status})`,
+      error: `Facilitator settle HTTP ${resp.status}`,
+      status: resp.status,
     };
   }
   const raw = (await resp.json()) as Record<string, unknown>;
@@ -487,7 +505,7 @@ export async function verifyX402Payment(
   const reqs = buildPaymentRequirements(parsed.payload, env);
   if (!reqs.ok) return reqs.result;
 
-  let verification: { isValid: boolean; invalidReason?: string };
+  let verification: FacilitatorVerifyOutcome;
   try {
     verification = await facilitatorVerify(
       parsed.payload,
@@ -515,7 +533,19 @@ export async function verifyX402Payment(
     };
   }
 
-  if (!verification.isValid) {
+  if (verification.outcome === 'http_error' || verification.outcome === 'unavailable') {
+    // Verify 5xx / infrastructure failure — not an invalid payment signature.
+    return {
+      kind: 'reject',
+      status: 502,
+      body: {
+        error: 'Payment verification unavailable',
+        code: 'PAYMENT_UNAVAILABLE',
+      },
+    };
+  }
+
+  if (verification.outcome === 'invalid') {
     return {
       kind: 'reject',
       status: 402,
@@ -607,12 +637,14 @@ export async function settleX402Payment(
     };
   }
 
-  if (settlement.outcome === 'http_error') {
-    // HTTP error before accepted settle response — unavailable, not a charge claim.
+  if (settlement.outcome === 'unknown') {
+    // Settle HTTP 5xx / ambiguous after request sent — status unknown.
+    // Do not claim "not charged" or "not accepted".
     console.warn(
       JSON.stringify({
-        type: 'dql_x402_settle_http_error_outcome',
+        type: 'dql_x402_settle_unknown_outcome',
         payment_id: paymentId,
+        status: settlement.status,
         ts: new Date().toISOString(),
       }),
     );
@@ -620,9 +652,10 @@ export async function settleX402Payment(
       kind: 'reject',
       status: 502,
       body: {
-        error: 'Payment settlement unavailable',
-        code: 'PAYMENT_UNAVAILABLE',
-        details: 'Settlement request was not accepted; reconcile if unsure.',
+        error: 'Payment settlement status unknown',
+        code: 'PAYMENT_STATUS_UNKNOWN',
+        details:
+          'Do not retry the payment blindly. Reconcile using the payment identifier.',
         payment_id: paymentId,
       },
     };
@@ -656,11 +689,9 @@ export async function settleX402Payment(
 export async function processX402Payment(
   req: VercelRequest,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<
-  | X402VerifyResult
-  | { kind: 'paid'; txHash?: string; network?: string }
-> {
+): Promise<X402VerifyResult> {
   // Backward-compat name: VERIFY ONLY. Settlement is intentionally not here.
+  // No 'paid' outcome — that only exists after settleX402Payment.
   return verifyX402Payment(req, env);
 }
 

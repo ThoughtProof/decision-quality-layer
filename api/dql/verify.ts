@@ -142,6 +142,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       'Access-Control-Allow-Headers',
       'Content-Type, Authorization, X-DQL-Key, PAYMENT-SIGNATURE, Payment-Signature',
     );
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      [
+        'X-Request-Id',
+        'X-DQL-Version',
+        'X-DQL-Billing',
+        'X-DQL-Price-Usd',
+        'X-DQL-Meter',
+        'payment-required',
+        'payment-response',
+        'X-DQL-Diagnostics',
+        'X-DQL-Diagnostics-Truncated',
+        'X-DQL-Diagnostics-Counts',
+      ].join(', '),
+    );
     res.setHeader('X-DQL-Version', VERSION);
     res.setHeader('X-Request-Id', requestId);
 
@@ -315,7 +330,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             status = 200;
             payload = response;
           } else if (authPath.kind === 'x402_verified') {
-            // Settle only after successful DQL. Failure → not charged.
+            // Settle only after successful DQL. Outcome may be settled,
+            // PAYMENT_FAILED, PAYMENT_UNAVAILABLE, or PAYMENT_STATUS_UNKNOWN.
             const settled = await settleX402Payment(authPath.ctx, process.env);
             if (settled.kind === 'reject') {
               status = settled.status;

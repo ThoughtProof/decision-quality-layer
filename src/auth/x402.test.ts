@@ -77,17 +77,23 @@ describe('sanitizePaymentClientError / sanitizeServerLogReason', () => {
 });
 
 describe('paymentReconcileId', () => {
-  it('prefers non-sensitive nonce/from fields', () => {
-    expect(
-      paymentReconcileId({
-        payload: { authorization: { from: '0xabc123', nonce: 'n-1' }, signature: 'sig' },
-      }),
-    ).toBe('n-1');
+  it('returns SHA-256 fingerprint, never raw nonce/wallet', () => {
+    const id = paymentReconcileId({
+      network: 'base',
+      payload: { authorization: { from: '0xabc123', nonce: 'n-1' }, signature: 'sig' },
+    });
+    expect(id.startsWith('pay_')).toBe(true);
+    expect(id).toMatch(/^pay_[0-9a-f]{24}$/);
+    expect(id).not.toContain('n-1');
+    expect(id).not.toContain('0xabc123');
+    expect(id).not.toContain('sig');
   });
 
-  it('falls back to stable fingerprint without signatures', () => {
-    const id = paymentReconcileId({ network: 'base', scheme: 'exact' });
-    expect(id.startsWith('pay_')).toBe(true);
+  it('is stable for same non-sensitive material', () => {
+    const a = paymentReconcileId({ network: 'base', scheme: 'exact' });
+    const b = paymentReconcileId({ network: 'base', scheme: 'exact' });
+    expect(a).toBe(b);
+    expect(a.startsWith('pay_')).toBe(true);
   });
 });
 
@@ -276,7 +282,8 @@ describe('settleX402Payment', () => {
     if (r.kind === 'reject') {
       expect(r.body.code).toBe('PAYMENT_FAILED');
       expect(String(r.body.details)).toMatch(/not charged/i);
-      expect(r.body.payment_id).toBe('n-99');
+      expect(String(r.body.payment_id)).toMatch(/^pay_[0-9a-f]{24}$/);
+      expect(String(r.body.payment_id)).not.toContain('n-99');
     }
   });
 
@@ -296,11 +303,12 @@ describe('settleX402Payment', () => {
       expect(r.body.code).toBe('PAYMENT_STATUS_UNKNOWN');
       expect(JSON.stringify(r.body)).not.toMatch(/not charged/i);
       expect(String(r.body.details)).toMatch(/Reconcile/i);
-      expect(r.body.payment_id).toBe('n-99');
+      expect(String(r.body.payment_id)).toMatch(/^pay_[0-9a-f]{24}$/);
+      expect(String(r.body.payment_id)).not.toContain('n-99');
     }
   });
 
-  it('settle HTTP error before accept → PAYMENT_UNAVAILABLE', async () => {
+  it('settle HTTP 5xx after request → PAYMENT_STATUS_UNKNOWN', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => ({
@@ -313,8 +321,32 @@ describe('settleX402Payment', () => {
     const r = await settleX402Payment(ctx, {});
     expect(r.kind).toBe('reject');
     if (r.kind === 'reject') {
+      expect(r.body.code).toBe('PAYMENT_STATUS_UNKNOWN');
+      expect(JSON.stringify(r.body)).not.toMatch(/secret|not charged|not accepted/i);
+      expect(String(r.body.payment_id)).toMatch(/^pay_[0-9a-f]{24}$/);
+    }
+  });
+
+  it('verify HTTP 5xx → 502 PAYMENT_UNAVAILABLE (not 402 invalid)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 503,
+        json: async () => ({}),
+        text: async () => 'upstream down',
+      })),
+    );
+    const sig = Buffer.from(JSON.stringify({ network: 'base', payload: {} })).toString('base64');
+    const r = await verifyX402Payment(
+      { headers: { 'payment-signature': sig } } as any,
+      { DQL_X402_ENABLED: 'true', X402_FACILITATOR_URL: 'https://fac.example' },
+    );
+    expect(r.kind).toBe('reject');
+    if (r.kind === 'reject') {
+      expect(r.status).toBe(502);
       expect(r.body.code).toBe('PAYMENT_UNAVAILABLE');
-      expect(JSON.stringify(r.body)).not.toMatch(/secret|not charged/i);
+      expect(r.status).not.toBe(402);
     }
   });
 });

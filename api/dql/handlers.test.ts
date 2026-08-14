@@ -656,6 +656,60 @@ describe('PR #36 payment semantics hardening', () => {
     expect(String(call0[0])).toContain('billing/meter_events');
   });
 
+  it('x402 verify HTTP 5xx → 502 PAYMENT_UNAVAILABLE (not 402)', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes('/verify')) {
+        return { ok: false, status: 503, json: async () => ({}), text: async () => 'down' };
+      }
+      throw new Error('settle must not be called');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    process.env.DQL_X402_ENABLED = 'true';
+    process.env.X402_FACILITATOR_URL = 'https://fac.example';
+    const mod = await import('./verify.js');
+    const sig = Buffer.from(JSON.stringify({ network: 'base', payload: {} })).toString('base64');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'payment-signature': sig },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(502);
+    expect(state.jsonBody.code).toBe('PAYMENT_UNAVAILABLE');
+    expect(state.statusCode).not.toBe(402);
+    const urls = fetchMock.mock.calls.map((c: any) => String(c[0]));
+    expect(urls.some((u: string) => u.includes('/settle'))).toBe(false);
+  });
+
+  it('x402 settle HTTP 5xx after DQL → PAYMENT_STATUS_UNKNOWN', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes('/verify')) {
+        return { ok: true, status: 200, json: async () => ({ isValid: true }), text: async () => '' };
+      }
+      if (String(url).includes('/settle')) {
+        return { ok: false, status: 502, json: async () => ({}), text: async () => 'bad gateway' };
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    process.env.DQL_X402_ENABLED = 'true';
+    process.env.X402_FACILITATOR_URL = 'https://fac.example';
+    const mod = await import('./verify.js');
+    const sig = Buffer.from(
+      JSON.stringify({ network: 'base', payload: { authorization: { nonce: 'n-http5xx' } } }),
+    ).toString('base64');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'payment-signature': sig },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(502);
+    expect(state.jsonBody.code).toBe('PAYMENT_STATUS_UNKNOWN');
+    expect(JSON.stringify(state.jsonBody)).not.toMatch(/not charged|not accepted/i);
+    expect(String(state.jsonBody.payment_id)).toMatch(/^pay_[0-9a-f]{24}$/);
+  });
+
   it('x402 settle timeout after DQL → PAYMENT_STATUS_UNKNOWN, no not-charged claim', async () => {
     const fetchMock = vi.fn(async (url: string) => {
       if (String(url).includes('/verify')) {
@@ -691,7 +745,8 @@ describe('PR #36 payment semantics hardening', () => {
     expect(state.statusCode).toBe(502);
     expect(state.jsonBody.code).toBe('PAYMENT_STATUS_UNKNOWN');
     expect(JSON.stringify(state.jsonBody)).not.toMatch(/not charged/i);
-    expect(state.jsonBody.payment_id).toBe('n-handler');
+    expect(String(state.jsonBody.payment_id)).toMatch(/^pay_[0-9a-f]{24}$/);
+    expect(String(state.jsonBody.payment_id)).not.toContain('n-handler');
     // verify + settle attempted; DQL ran between them
     const urls = fetchMock.mock.calls.map((c: any) => String(c[0]));
     expect(urls.some((u: string) => u.includes('/verify'))).toBe(true);
