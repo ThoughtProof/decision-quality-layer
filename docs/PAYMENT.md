@@ -77,12 +77,12 @@ POST /dql/verify received
 - **Dev-access grant flow** — email-based today; do we want a lightweight form or is a mailto: link enough for v1?
 - **Refund / dispute policy** — if a customer disputes a Stripe charge, do we auto-refund below some threshold? Manual review above?
 
-## Implementation status (2026-08-14)
+## Implementation status (2026-08-15)
 
-**`SELF_SERVE_LIVE=partial`** — x402 Base rail **ON** in Production (crypto pay-per-call). Stripe still **OFF**. Upstash unbound. Do not claim full self-serve / fiat billing live.
+**`SELF_SERVE_LIVE=partial`** — payment **rails** live in Production (x402 + Stripe meter canary + Upstash daily-cap). **Not** full self-serve: no public signup/checkout/key-mint UX on `app.thoughtproof.ai` (demo + agent gate only). Do not claim freemium or automated fiat onboarding.
 
 Code path **merged via [PR #36](https://github.com/ThoughtProof/decision-quality-layer/pull/36)** → `main` merge commit **`9f3c1b4`** (PR head `4c27363`).  
-Production: `dql.thoughtproof.ai` · cascade `pot-cli` · runtime includes docs commit `2fd421d`.
+Production: `dql.thoughtproof.ai` · cascade `pot-cli`.
 
 ### Payment semantics (locked; review PASS)
 
@@ -105,9 +105,9 @@ Hard rules:
 
 | Rail | Code status | Production | Enable |
 |---|---|---|---|
-| Stripe meter `dql_verify_call` | Merged · unit tests (awaited + timeout) | **OFF** | `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + create meter/price in Dashboard |
+| Stripe meter `dql_verify_call` | Merged · unit tests (awaited + timeout) | **ON** (canary owner `dql-canary` → `cus_V4abfGkmWdyxyC`) | Dashboard meter/price live; prod flag + secret + map |
 | x402 Base USDC | Merged · Preview + **Production canary PASS** | **ON** (`DQL_X402_ENABLED` + CDP keys) | live |
-| Upstash daily-cap multi-instance | Merged · unit-verified atomic INCR; Redis key = sha256(apiKey) | **unbound** | `UPSTASH_REDIS_REST_URL` + `_TOKEN` + dual-instance smoke |
+| Upstash daily-cap multi-instance | Merged · unit-verified atomic INCR; Redis key = sha256(apiKey) | **ON** (shared Sentinel Upstash; keys `dql:usage:…`) | bound 2026-08-15; over-cap → 429 `QUOTA_EXCEEDED` |
 
 ### Activation proof
 
@@ -122,4 +122,15 @@ Hard rules:
 - Tx [`0x70f93e79533d3c8caf7a7b5ee6ae2a218992bf97e45f095bcf797b534c8b70bf`](https://basescan.org/tx/0x70f93e79533d3c8caf7a7b5ee6ae2a218992bf97e45f095bcf797b534c8b70bf) · block `49971716` · Transfer 50000 micro-USDC → `0xAB9f…82E83`
 - Artifact: `memory/artifacts/dql-x402-prod-canary-2026-08-14.json`
 
-**Honest claims:** crypto pay-per-call via x402 works in Production. Fiat/Stripe self-serve is **not** live. No freemium. Invite/dev keys still free.
+**Stripe meter Production canary (2026-08-14):**
+- Env: `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP`
+- Billable key owner `dql-canary` (`dev_access=false`); guardian-pwa remains free
+- Smoke: HTTP 200 · `X-DQL-Billing: metered` · **`X-DQL-Meter: ok`** · `$0.05` · request `dql_mstgnams_cs8s91`
+- Artifact: `memory/artifacts/dql-stripe-prod-canary-2026-08-14.json`
+
+**Upstash daily-cap Production bind (2026-08-15):**
+- Env: `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (same DB as Sentinel; DQL namespaced)
+- Smoke: counter@cap → **429** `QUOTA_EXCEEDED` (`dql_msthu647_ip91cp`); after reset → **200** metered (`dql_msthu6sb_amgn7z`)
+- Artifact: `memory/artifacts/dql-upstash-prod-bind-2026-08-15.json`
+
+**Honest claims:** crypto pay-per-call (x402) and fiat meter emit (Stripe canary) work in Production. Daily-cap brake is live. Public self-serve UX (signup/checkout/key issue on app.thoughtproof.ai) is **not** live. No freemium. Invite/dev keys still free.
