@@ -34,8 +34,9 @@ import { StubCascade } from '../../src/engine/cascade.js';
 import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
 import { authorizeCall, extractApiKey, parseApiKeys } from '../../src/auth/keys.js';
+import { createKeyStore } from '../../src/auth/key-store.js';
 import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
-import { emitStripeMeterEvent } from '../../src/auth/stripe-meter.js';
+import { emitStripeMeterEvent, loadStripeMeterConfig } from '../../src/auth/stripe-meter.js';
 import {
   applyX402ChallengeHeaders,
   isX402Enabled,
@@ -97,13 +98,13 @@ function pickRuntime(): RuntimeInit {
 const RUNTIME = pickRuntime();
 const sandboxCascade = new SandboxCascade();
 
-// Phase 2 key gate (docs/PAYMENT.md decision matrix): env-held key list,
-// parsed once at cold start. A malformed DQL_API_KEYS yields an EMPTY map —
-// every non-sandbox call fails closed (402), the safe direction for billing.
-// USAGE_GATE is Upstash-backed when configured, otherwise a no-op (the
-// daily-cap brake degrades; key validation is env-based and still holds).
+// Phase 2 key gate (docs/PAYMENT.md decision matrix): env-held key list
+// (bootstrap: canary / guardian-pwa / manual dev_access) ∪ Upstash store
+// (self-serve minted billable keys). Malformed DQL_API_KEYS → empty env
+// map. Store miss + env miss → 402. USAGE_GATE is the daily-cap brake.
 const API_KEYS = parseApiKeys(process.env.DQL_API_KEYS);
 const USAGE_GATE = createUsageGate(process.env);
+const KEY_STORE = createKeyStore(process.env);
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const requestId = `dql_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -219,6 +220,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             sandbox: false,
             keys: API_KEYS,
             usage: USAGE_GATE,
+            store: KEY_STORE ?? undefined,
           });
           if (auth.kind === 'deny') {
             authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
@@ -247,6 +249,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             sandbox: false,
             keys: API_KEYS,
             usage: USAGE_GATE,
+            store: KEY_STORE ?? undefined,
           });
           if (auth.kind === 'deny') {
             authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
@@ -314,10 +317,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             // already delivered — do not convert 200 → 5xx. Idempotency-Key
             // = requestId allows safe retry of failed meter posts.
             if (!authPath.record.dev_access && price > 0) {
+              const meterCfg = loadStripeMeterConfig();
+              const customerId =
+                authPath.record.stripe_customer_id ??
+                meterCfg.customerByOwner.get(authPath.record.owner) ??
+                (KEY_STORE
+                  ? await KEY_STORE.getCustomerByOwner(authPath.record.owner)
+                  : undefined);
               const meter = await emitStripeMeterEvent({
                 requestId,
                 owner: authPath.record.owner,
+                customerId,
                 priceUsd: price,
+                config: meterCfg,
               });
               if (meter.kind === 'error') {
                 res.setHeader('X-DQL-Meter', 'error');

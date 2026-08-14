@@ -11,26 +11,23 @@
  *
  * Graceful degradation: if UPSTASH_REDIS_REST_URL / _TOKEN are unset, the
  * gate is a no-op (allow everything, warn once per cold start). Key
- * VALIDATION is env-based and unaffected — only the daily-cap brake and the
- * structured usage record depend on Redis. Rationale: a Redis outage should
- * degrade the abuse brake, not take down paying traffic; the env key list
- * still rejects strangers.
+ * VALIDATION is env ∪ store and unaffected — only the daily-cap brake and
+ * the structured usage record depend on this counter. Rationale: a Redis
+ * outage should degrade the abuse brake, not take down paying traffic; the
+ * env key list still rejects strangers. Store-minted keys cannot be
+ * validated if Redis is down (fail closed on lookup, not here).
  */
-
-import { createHash } from 'node:crypto';
 
 import { Redis } from '@upstash/redis';
 import type { UsageGate } from './keys.js';
+import { fingerprintKey, usageRedisKeyId } from './key-hash.js';
+
+export { fingerprintKey, usageRedisKeyId } from './key-hash.js';
 
 export class NoopUsageGate implements UsageGate {
   async checkAndRecord(_key: string, _cap: number): Promise<boolean> {
     return true;
   }
-}
-
-/** Hash API key for Redis storage — never put the raw secret in the key name. */
-export function usageRedisKeyId(apiKey: string): string {
-  return createHash('sha256').update(apiKey, 'utf8').digest('hex').slice(0, 24);
 }
 
 export function usageCounterKey(apiKey: string, dayUtc: string): string {
@@ -58,7 +55,7 @@ export class UpstashUsageGate implements UsageGate {
       return count <= cap;
     } catch {
       // Redis failure must not take down paying traffic. The brake degrades,
-      // the gate holds (key validation is env-based).
+      // the gate holds (key validation is env ∪ store).
       return true;
     }
   }
@@ -110,19 +107,4 @@ export function emitUsageLine(opts: {
       ts: new Date().toISOString(),
     }),
   );
-}
-
-/**
- * Derive a non-reversible, log-safe identifier for an API key: the first 12
- * hex characters of its sha256 hash, plus the literal last 4 characters of
- * the key (e.g. `a1b2c3d4e5f6…af42`). The hash prefix lets ops correlate the
- * SAME key across log lines without storing/searching the raw secret; the
- * last-4 gives a human-recognizable suffix matching common billing-UI
- * conventions (like card-number masking), without materially increasing
- * brute-force risk for a high-entropy `dqlk_<hex>` key.
- */
-function fingerprintKey(key: string): string {
-  const hashPrefix = createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 12);
-  const last4 = key.slice(-4);
-  return `${hashPrefix}…${last4}`;
 }

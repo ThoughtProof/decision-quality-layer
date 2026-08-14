@@ -14,9 +14,9 @@
  * response to 5xx (product already delivered; retry via idempotency key).
  */
 
-import { createHash } from 'node:crypto';
-
 import { PRICE_USD_PER_CALL } from '../pricing.js';
+import { fingerprintCustomer } from './key-hash.js';
+import { truthy } from './env-flag.js';
 
 export const STRIPE_METER_EVENT_NAME = 'dql_verify_call';
 export const STRIPE_METER_EVENTS_URL = 'https://api.stripe.com/v1/billing/meter_events';
@@ -35,10 +35,6 @@ export interface StripeMeterConfig {
   eventName: string;
   /** Map owner → Stripe customer id (cus_…). */
   customerByOwner: Map<string, string>;
-}
-
-function truthy(v: string | undefined): boolean {
-  return ['true', '1', 'on', 'yes'].includes((v ?? '').trim().toLowerCase());
 }
 
 /** Parse DQL_STRIPE_CUSTOMER_MAP JSON: {"owner":"cus_xxx", ...}. */
@@ -75,6 +71,11 @@ export function loadStripeMeterConfig(env: NodeJS.ProcessEnv = process.env): Str
 export interface EmitStripeMeterOpts {
   requestId: string;
   owner: string;
+  /**
+   * Explicit Stripe customer id (store-minted keys). Takes precedence over
+   * `DQL_STRIPE_CUSTOMER_MAP` so self-serve keys meter without an env edit.
+   */
+  customerId?: string;
   priceUsd?: number;
   /** Optional override for tests. */
   fetchImpl?: typeof fetch;
@@ -108,7 +109,9 @@ export async function emitStripeMeterEvent(opts: EmitStripeMeterOpts): Promise<S
   const cfg = opts.config ?? loadStripeMeterConfig();
   if (!cfg.enabled) return { kind: 'skipped', reason: 'meter_disabled' };
 
-  const customer = cfg.customerByOwner.get(opts.owner);
+  const customer =
+    (opts.customerId && opts.customerId.startsWith('cus_') ? opts.customerId : undefined) ??
+    cfg.customerByOwner.get(opts.owner);
   if (!customer) return { kind: 'skipped', reason: 'no_customer_mapping' };
 
   const price = opts.priceUsd ?? PRICE_USD_PER_CALL;
@@ -188,8 +191,4 @@ export async function emitStripeMeterEvent(opts: EmitStripeMeterOpts): Promise<S
     );
     return { kind: 'error', reason };
   }
-}
-
-function fingerprintCustomer(cus: string): string {
-  return createHash('sha256').update(cus, 'utf8').digest('hex').slice(0, 12);
 }
