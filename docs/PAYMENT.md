@@ -79,12 +79,12 @@ POST /dql/verify received
 
 ## Implementation status (2026-08-14)
 
-**`SELF_SERVE_LIVE=false`**
+**`SELF_SERVE_LIVE=partial`** — x402 Base rail **ON** in Production (crypto pay-per-call). Stripe still **OFF**. Upstash unbound. Do not claim full self-serve / fiat billing live.
 
 Code path **merged via [PR #36](https://github.com/ThoughtProof/decision-quality-layer/pull/36)** → `main` merge commit **`9f3c1b4`** (PR head `4c27363`).  
-Production deploy: `dql.thoughtproof.ai` health `commit_sha=9f3c1b4…` · cascade `pot-cli` · **all payment rails disabled** (no Stripe/x402/Upstash/CDP env in Production).
+Production: `dql.thoughtproof.ai` · cascade `pot-cli` · runtime includes docs commit `2fd421d`.
 
-### Payment semantics (locked; review PASS before merge)
+### Payment semantics (locked; review PASS)
 
 ```
 Request validate
@@ -103,18 +103,23 @@ Hard rules:
 6. **Unknown settlement ≠ not charged.** Timeout/connection-drop after settle request → `PAYMENT_STATUS_UNKNOWN` + reconcile id. Authoritative `success:false` → `PAYMENT_FAILED`.
 7. **Stripe price is Dashboard-side.** Meter event sends `value=1`; configure $0.05 on the Stripe Meter/Price object.
 
-| Rail | Code status | Production | Enable (separate go) |
+| Rail | Code status | Production | Enable |
 |---|---|---|---|
 | Stripe meter `dql_verify_call` | Merged · unit tests (awaited + timeout) | **OFF** | `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + create meter/price in Dashboard |
-| x402 Base USDC | Merged · unit tests + Preview challenge + **live $0.05 E2E** | **OFF** | `DQL_X402_ENABLED=true` + CDP keys (or explicit facilitator URL) |
+| x402 Base USDC | Merged · Preview + **Production canary PASS** | **ON** (`DQL_X402_ENABLED` + CDP keys) | live |
 | Upstash daily-cap multi-instance | Merged · unit-verified atomic INCR; Redis key = sha256(apiKey) | **unbound** | `UPSTASH_REDIS_REST_URL` + `_TOKEN` + dual-instance smoke |
 
-### Preview activation proof (not Production)
+### Activation proof
 
-- Challenge-smoke PASS on Preview @ `4c27363` (flag on temporarily, then removed).
-- Live E2E: exactly one Base USDC payment **0.05** · HTTP 200 · billing `x402` · DQL ALLOW.
-- Tx: [`0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6`](https://basescan.org/tx/0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6) · Transfer 50000 micro-USDC → `0xAB9f…82E83`.
-- Report artifact (workspace): `memory/artifacts/dql-x402-e2e-step3-2026-08-14.json`.
-- Preview payment env cleaned after E2E (flag + CDP keys removed).
+**Preview E2E (pre-merge):**
+- Tx [`0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6`](https://basescan.org/tx/0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6) · $0.05 USDC · HTTP 200 · billing x402
+- Artifact: `memory/artifacts/dql-x402-e2e-step3-2026-08-14.json`
 
-**Do not claim self-serve live.** Code is production-ready; commercial rails require explicit activation gos. Preferred order if monetizing later: Stripe first (controlled), then x402 with its own production canary.
+**Production canary (2026-08-14, post-merge explicit go):**
+- Env: `DQL_X402_ENABLED=true` + `X402_CDP_KEY_ID/SECRET` (Production)
+- Challenge smoke PASS on `dql.thoughtproof.ai` (402 + payment-required + amount 50000 + Base USDC + payTo `0xAB9f…`)
+- Live settle: exactly one $0.05 · HTTP 200 · billing `x402`
+- Tx [`0x70f93e79533d3c8caf7a7b5ee6ae2a218992bf97e45f095bcf797b534c8b70bf`](https://basescan.org/tx/0x70f93e79533d3c8caf7a7b5ee6ae2a218992bf97e45f095bcf797b534c8b70bf) · block `49971716` · Transfer 50000 micro-USDC → `0xAB9f…82E83`
+- Artifact: `memory/artifacts/dql-x402-prod-canary-2026-08-14.json`
+
+**Honest claims:** crypto pay-per-call via x402 works in Production. Fiat/Stripe self-serve is **not** live. No freemium. Invite/dev keys still free.

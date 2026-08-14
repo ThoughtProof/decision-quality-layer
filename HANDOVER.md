@@ -4,7 +4,7 @@
 
 **Stand:** 2026-08-14 CEST (PR #36 P2 rails code merged flag-off; #26 closed earlier)
 **Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=9f3c1b4…` · cascade `pot-cli`
-**Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim. **`SELF_SERVE_LIVE=false`**.
+**Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim. **`SELF_SERVE_LIVE=partial`** (x402 only).
 
 ---
 
@@ -18,8 +18,8 @@
 | Deploy commit | **`9f3c1b4`** — PR #36 P2 self-serve rails **code** merged · Health-SHA == main-SHA |
 | npm/package label | `0.2.0` **artifact only** (locked P0 #3) — cite `config_schema_version` for behavior |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
-| Payment rails | **Stripe OFF · x402 OFF · Upstash unbound · CDP not in Production** |
-| Self-serve | **`SELF_SERVE_LIVE=false`** — do not claim live |
+| Payment rails | **x402 ON (Base USDC)** · Stripe OFF · Upstash unbound |
+| Self-serve | **`SELF_SERVE_LIVE=partial`** — crypto x402 only; no fiat/Stripe claim |
 | Flags | `capital_path_mode` / CB / alias_gate / diagnostics — see live health JSON |
 | Cascade | `serv-nano` → `serv-swift` (OpenServ) |
 | Product lane | **Consumer Trust** (mandate vs geplante Aktion) — **nicht** Sentinel/PLV Banking |
@@ -33,8 +33,9 @@
 |---|---|
 | **`origin/main`** | **`9f3c1b4`** — merge PR #36 P2 self-serve rails flag-off · CI **grün** |
 | **Prod deploy** | **`9f3c1b4`** — live via Health verifiziert (`dql.thoughtproof.ai`) · Vercel target=production |
-| **P2 payment code** | ✅ deployed · rails **disabled** (honest status) |
-| **Preview x402 E2E proof** | Tx [`0x2fc1c4a4…22ed6`](https://basescan.org/tx/0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6) · $0.05 USDC · not a prod activation |
+| **P2 payment code** | ✅ deployed |
+| **x402 Production** | ✅ **ON** · canary Tx [`0x70f93e79…8b70bf`](https://basescan.org/tx/0x70f93e79533d3c8caf7a7b5ee6ae2a218992bf97e45f095bcf797b534c8b70bf) · $0.05 |
+| **Preview x402 E2E** | Tx [`0x2fc1c4a4…22ed6`](https://basescan.org/tx/0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6) · pre-merge proof |
 | DNS | `try.thoughtproof.ai` **NXDOMAIN** · `guardian.thoughtproof.ai` **NXDOMAIN** |
 | `HANDOVER.md` | dieses Dokument |
 
@@ -64,8 +65,8 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 8. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
 
 ### P2 — Gate code complete (Self-Serve still OFF)
-9. ✅ Stripe meter code path `dql_verify_call` @ **$0.05** — **merged PR #36 · Production OFF**. Activation still needs: Stripe Dashboard meter/price + customer map + `DQL_STRIPE_METER_ENABLED` (explicit go).
-10. ✅ x402 Base rail (Sentinel CDP path, same wallet) — **merged PR #36 · Production OFF**. Preview challenge + live $0.05 E2E PASS; prod enable needs CDP keys + `DQL_X402_ENABLED` (explicit go, prefer after Stripe).
+9. 🔲 Stripe meter activation — code merged; **Production OFF**. Needs: Dashboard meter/price `dql_verify_call` @ $0.05 + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + `DQL_STRIPE_METER_ENABLED`.
+10. ✅ x402 Base rail — **Production ON** (2026-08-14). CDP keys + flag live; challenge + $0.05 canary PASS.
 11. ✅ Upstash daily-cap multi-instance — **merged PR #36 · unbound in Production**. Redis key = sha256(apiKey). Live dual-instance smoke when bound.
 
 ### P3 — Reliability debt (nur wenn capital/high-SLA)
@@ -108,9 +109,9 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 
 ## Claim-Guard (Copy)
 
-**OK:** live DQL · 5 axes · nano→swift cascade · key-gated · sandbox free · consumer mandate check · objection-bound surface · main=prod `9f3c1b4` · P2 payment **code** deployed rails **off**
+**OK:** live DQL · 5 axes · nano→swift cascade · key-gated · sandbox free · x402 Base pay-per-call **on** · consumer mandate check · objection-bound surface · main=prod `9f3c1b4`/`2fd421d`
 
-**Nicht OK ohne Denominator/SHA:** „100% accurate“, „prevents bad actions“, „capital-path CB proven in prod“, „try.thoughtproof.ai live“, package `0.2.0` als Feature-Stand, **„self-serve live“**, „x402/Stripe billing on“
+**Nicht OK ohne Denominator/SHA:** „100% accurate“, „prevents bad actions“, „capital-path CB proven in prod“, „try.thoughtproof.ai live“, package `0.2.0` als Feature-Stand, **„full self-serve live“**, „Stripe billing on“
 
 ---
 
