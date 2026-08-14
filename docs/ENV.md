@@ -74,6 +74,34 @@ Enforced on every non-sandbox `POST /dql/verify` (see `docs/PAYMENT.md`).
 | `UPSTASH_REDIS_REST_URL` | optional | Daily-cap brake + usage counter. Absent → cap enforcement disabled (key validation still active). |
 | `UPSTASH_REDIS_REST_TOKEN` | optional | Pair with URL above. |
 
+### Stripe meter (P2 Rail A — default OFF)
+
+| Variable | Required | Effect |
+|----------|----------|--------|
+| `DQL_STRIPE_METER_ENABLED` | no | `true`/`1`/`on` to emit Stripe Billing Meter Events. Default off. |
+| `STRIPE_SECRET_KEY` | with flag | Stripe secret (`sk_live_…` / `sk_test_…`). Without it the flag is ignored. |
+| `STRIPE_METER_EVENT_NAME` | no | Default `dql_verify_call`. Must match the meter created in Stripe Dashboard. |
+| `DQL_STRIPE_CUSTOMER_MAP` | for billing | JSON `{"owner":"cus_…"}` mapping key `owner` → Stripe customer id. Missing owner → skip emit (no charge attempt). |
+
+Billable keys only (`dev_access: false`). Idempotency key = DQL `request_id`. Meter emit is **awaited** with a hard timeout before the response is finalized. Failures are logged, never fail the verify response.
+
+**Pricing note:** the API meter event sends `value=1` (one call unit). The **$0.05 USD** price must be configured on the Stripe Meter / Price object in the Dashboard — not in the event payload.
+
+### x402 (P2 Rail B — default OFF)
+
+| Variable | Required | Effect |
+|----------|----------|--------|
+| `DQL_X402_ENABLED` | no | `true` to accept Base USDC x402 when no API key. Default off. |
+| `PAYMENT_WALLET` | no | Default shared wallet `0xAB9f…82E83` (same as Sentinel). |
+| `X402_CDP_KEY_ID` / `X402_CDP_KEY_SECRET` | for CDP facilitator | Coinbase CDP credentials (required unless explicit facilitator URL). |
+| `X402_FACILITATOR_URL` | no | Explicit facilitator base URL. **Required** if CDP keys absent. No silent public fallback. |
+
+When enabled **and ready** (CDP keys or explicit facilitator URL) and no key/signature: `402` + `payment-required` header + JSON challenge (Base dual `eip155:8453` + `base`).
+
+When enabled but **not ready** (flag on, no CDP, no facilitator URL): `503 PAYMENT_UNAVAILABLE` — **no challenge**, no `payment-required` header.
+
+Payment sequence: validate → verify authorization → DQL → settle → respond. Settlement timeouts return `PAYMENT_STATUS_UNKNOWN` (do not claim "not charged").
+
 Header: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or `Authorization: Bearer dqlk_...`.
 
 Sandbox (`{"sandbox":true}`) stays free and keyless.

@@ -2,9 +2,12 @@
  * Usage accounting for the DQL API-key gate.
  *
  * Storage: Upstash Redis over REST (serverless-friendly, no sockets).
- * Counter key: `dql:usage:<apiKey>:<yyyy-mm-dd>` — INCR per call, 48h TTL
- * set on first touch. Read-before-write is unnecessary: INCR returns the
- * new value, so the cap check is atomic.
+ * Counter key: `dql:usage:<sha256(key)[:24]>:<yyyy-mm-dd>` — INCR per call,
+ * 48h TTL on first touch. Raw API keys are NEVER stored in Redis (multi-
+ * instance safe + secret hygiene).
+ *
+ * Multi-instance: INCR is atomic on Redis; concurrent Vercel instances share
+ * the same counter. Cap check uses the post-INCR value (count <= cap).
  *
  * Graceful degradation: if UPSTASH_REDIS_REST_URL / _TOKEN are unset, the
  * gate is a no-op (allow everything, warn once per cold start). Key
@@ -25,6 +28,15 @@ export class NoopUsageGate implements UsageGate {
   }
 }
 
+/** Hash API key for Redis storage — never put the raw secret in the key name. */
+export function usageRedisKeyId(apiKey: string): string {
+  return createHash('sha256').update(apiKey, 'utf8').digest('hex').slice(0, 24);
+}
+
+export function usageCounterKey(apiKey: string, dayUtc: string): string {
+  return `dql:usage:${usageRedisKeyId(apiKey)}:${dayUtc}`;
+}
+
 export class UpstashUsageGate implements UsageGate {
   constructor(
     private readonly redis: {
@@ -36,7 +48,7 @@ export class UpstashUsageGate implements UsageGate {
 
   async checkAndRecord(key: string, cap: number): Promise<boolean> {
     const day = this.now().toISOString().slice(0, 10); // UTC day
-    const redisKey = `dql:usage:${key}:${day}`;
+    const redisKey = usageCounterKey(key, day);
     try {
       const count = await this.redis.incr(redisKey);
       if (count === 1) {
@@ -65,8 +77,8 @@ export function createUsageGate(env: NodeJS.ProcessEnv): UsageGate {
 }
 
 /**
- * Structured usage line for Vercel logs — the billing record until the
- * Stripe/x402 meter rails land (docs/PAYMENT.md Phase 2). One JSON line per
+ * Structured usage line for Vercel logs — the billing record until / alongside
+ * Stripe/x402 meter rails (docs/PAYMENT.md Phase 2). One JSON line per
  * allowed non-sandbox call; grepable as `dql_usage`.
  *
  * Issue #24 hardening: never log the raw API key. Vercel log access can be
@@ -83,6 +95,7 @@ export function emitUsageLine(opts: {
   devAccess: boolean;
   priceUsd: number;
   verdict?: string;
+  billingRail?: 'dev-access' | 'stripe' | 'x402' | 'metered-log-only' | 'sandbox';
 }): void {
   console.log(
     JSON.stringify({
@@ -93,6 +106,7 @@ export function emitUsageLine(opts: {
       dev_access: opts.devAccess,
       price_usd: opts.priceUsd,
       verdict: opts.verdict,
+      billing_rail: opts.billingRail,
       ts: new Date().toISOString(),
     }),
   );
