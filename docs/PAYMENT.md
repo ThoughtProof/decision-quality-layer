@@ -79,12 +79,29 @@ POST /dql/verify received
 
 ## Implementation status (2026-08-14)
 
-Code path shipped on branch `feat/p2-self-serve-gate-rails` (flag-gated, **not** auto-enabled in prod):
+Code path on branch `feat/p2-self-serve-gate-rails` (flag-gated, **not** auto-enabled in prod).
+
+### Payment semantics (HOLD fix — required before merge)
+
+```
+Request validate
+→ Payment VERIFY (x402) / auth key check
+→ DQL execute
+→ Payment SETTLE (x402) OR await Stripe meter
+→ Deliver result
+```
+
+Hard rules:
+1. **Never settle x402 before successful DQL.** Invalid body / 4xx / 5xx must not charge.
+2. **Stripe meter is awaited** (not fire-and-forget). Vercel drops dangling work after response.
+3. **No silent public facilitator fallback.** x402 requires CDP credentials **or** explicit `X402_FACILITATOR_URL`.
+4. **Hard timeouts** on facilitator + Stripe network calls; client errors sanitized.
 
 | Rail | Status | Enable |
 |---|---|---|
-| Stripe meter `dql_verify_call` | Code + unit tests | `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + **create meter in Stripe Dashboard** (Raul) |
-| x402 Base USDC | Code + unit tests (port of Sentinel Base/CDP path) | `DQL_X402_ENABLED=true` + CDP keys (reuse Sentinel) |
+| Stripe meter `dql_verify_call` | Code + unit tests (awaited + timeout) | `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + **create meter in Stripe Dashboard** (Raul) |
+| x402 Base USDC | Code + unit tests (verify→DQL→settle) | `DQL_X402_ENABLED=true` + CDP keys (or explicit facilitator URL) |
 | Upstash daily-cap multi-instance | Verified in unit test (atomic INCR shared counter); Redis keys now hash the API key (no raw secret in Redis) | `UPSTASH_REDIS_REST_URL` + `_TOKEN` |
 
 **Do not claim self-serve live** until Stripe meter exists in Dashboard and flags are intentionally turned on.
+**Do not merge until payment-semantics review passes.**

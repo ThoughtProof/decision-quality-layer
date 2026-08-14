@@ -118,4 +118,35 @@ describe('emitStripeMeterEvent', () => {
     });
     expect(r.kind).toBe('error');
   });
+
+  it('times out hanging fetch instead of hanging forever', async () => {
+    const fetchImpl = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal) {
+            signal.addEventListener('abort', () => {
+              const err = new Error('The operation was aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          }
+        }),
+    ) as unknown as typeof fetch;
+
+    const r = await emitStripeMeterEvent({
+      requestId: 'dql_timeout',
+      owner: 'acme',
+      fetchImpl,
+      timeoutMs: 30,
+      config: {
+        enabled: true,
+        secretKey: 'sk',
+        eventName: STRIPE_METER_EVENT_NAME,
+        customerByOwner: new Map([['acme', 'cus_1']]),
+      },
+    });
+    expect(r.kind).toBe('error');
+    if (r.kind === 'error') expect(r.reason).toBe('timeout');
+  });
 });

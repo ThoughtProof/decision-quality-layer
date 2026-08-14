@@ -39,7 +39,9 @@ import { emitStripeMeterEvent } from '../../src/auth/stripe-meter.js';
 import {
   applyX402ChallengeHeaders,
   isX402Enabled,
-  processX402Payment,
+  settleX402Payment,
+  verifyX402Payment,
+  type X402PaymentContext,
 } from '../../src/auth/x402.js';
 import { PRICE_USD_PER_CALL, priceForCall } from '../../src/pricing.js';
 import {
@@ -160,9 +162,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         status = 413;
         payload = { error: 'Request too large', code: 'PAYLOAD_TOO_LARGE', max_bytes: MAX_BODY_SIZE };
       } else {
-        // PAYMENT.md matrix:
-        // sandbox free → API key (dev free / billable Stripe) → x402 → 402.
-        // Auth runs BEFORE validation — strangers don't get parsing work.
+        // Correct payment semantics (PR #36 HOLD fix):
+        //   validate → payment VERIFY → DQL → payment SETTLE / Stripe await → respond
+        // Never settle/charge before a successful DQL result.
+        // Cheap auth identity (key presence / sandbox) still runs early for 402 matrix.
         const isSandbox =
           (req.body as { sandbox?: unknown } | undefined)?.sandbox === true;
         const headers = req.headers as Record<string, unknown>;
@@ -171,12 +174,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         type AuthPath =
           | { kind: 'free_sandbox' }
           | { kind: 'allow'; key: string; record: import('../../src/auth/keys.js').ApiKeyRecord }
-          | { kind: 'x402'; txHash?: string; network?: string }
+          | { kind: 'x402_verified'; ctx: X402PaymentContext }
           | { kind: 'deny'; status: number; payload: object };
+
+        // 1) Body validation FIRST for non-challenge paths that will charge.
+        //    Sandbox and pure 402-challenge still need identity matrix, but
+        //    invalid bodies must never reach settle/meter.
+        const validation = validateVerifyRequest(req.body);
+        const validatedRequest = validation.valid ? validation.request : null;
 
         let authPath: AuthPath;
 
-        if (isSandbox) {
+        if (!validation.valid || !validatedRequest) {
+          // Invalid body → 400. Never verify/settle x402 or emit Stripe on bad requests.
+          authPath = {
+            kind: 'deny',
+            status: 400,
+            payload: {
+              error: 'Validation failed',
+              code: 'INVALID_REQUEST',
+              details: validation.valid ? ['Invalid request'] : validation.errors,
+            },
+          };
+        } else if (isSandbox) {
           authPath = { kind: 'free_sandbox' };
         } else if (presentedKey) {
           const auth = await authorizeCall({
@@ -193,24 +213,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             authPath = { kind: 'free_sandbox' };
           }
         } else if (isX402Enabled(process.env)) {
-          const x402 = await processX402Payment(req, process.env);
-          if (x402.kind === 'paid') {
-            authPath = { kind: 'x402', txHash: x402.txHash, network: x402.network };
-            if (x402.txHash) {
-              const receipt = {
-                txHash: x402.txHash,
-                network: x402.network ?? 'eip155:8453',
-                paidWith: 'x402-facilitator',
-              };
-              res.setHeader(
-                'payment-response',
-                Buffer.from(JSON.stringify(receipt)).toString('base64'),
-              );
-            }
+          // 2) Payment VERIFY only — settle happens after successful DQL.
+          const x402 = await verifyX402Payment(req, process.env);
+          if (x402.kind === 'verified') {
+            authPath = { kind: 'x402_verified', ctx: x402.ctx };
           } else if (x402.kind === 'reject') {
             authPath = { kind: 'deny', status: x402.status, payload: x402.body };
+          } else if (x402.kind === 'challenge' || x402.kind === 'disabled') {
+            const challengeBody = applyX402ChallengeHeaders(res, process.env);
+            authPath = { kind: 'deny', status: 402, payload: challengeBody };
           } else {
-            // challenge or disabled-with-no-key
             const challengeBody = applyX402ChallengeHeaders(res, process.env);
             authPath = { kind: 'deny', status: 402, payload: challengeBody };
           }
@@ -233,91 +245,119 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         if (authPath.kind === 'deny') {
           status = authPath.status;
           payload = authPath.payload;
+        } else if (RUNTIME.kind === 'error') {
+          // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
+          // resolver failed for a Live-configured deploy, EVERY POST
+          // returns 503, including sandbox=true. Never settle on config fail.
+          status = 503;
+          payload = {
+            error: 'Runtime not initialised',
+            code: 'CONFIG_INVALID',
+            reasons: RUNTIME.reason.reasons,
+          };
         } else {
-          const validation = validateVerifyRequest(req.body);
-          if (!validation.valid) {
-            status = 400;
-            payload = { error: 'Validation failed', code: 'INVALID_REQUEST', details: validation.errors };
-          } else if (RUNTIME.kind === 'error') {
-            // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
-            // resolver failed for a Live-configured deploy, EVERY POST
-            // returns 503, including sandbox=true.
-            status = 503;
-            payload = {
-              error: 'Runtime not initialised',
-              code: 'CONFIG_INVALID',
-              reasons: RUNTIME.reason.reasons,
-            };
-          } else {
-            const response = await runVerification({
-              request: validation.request,
-              cascade: RUNTIME.cascade,
-              sandboxCascade,
-              requestId,
-              version: VERSION,
-              collector: collector ?? undefined,
-              ...(RUNTIME.kind === 'production' &&
-              RUNTIME.production.config.deadline_enforcement_enabled
-                ? {
-                    requestDeadlineMs: RUNTIME.production.config.request_deadline_ms,
-                    providerCallBudgetMs: RUNTIME.production.config.provider_call_budget_ms,
-                  }
-                : {}),
+          // 3) DQL execute — validatedRequest is non-null on non-deny paths.
+          const response = await runVerification({
+            request: validatedRequest!,
+            cascade: RUNTIME.cascade,
+            sandboxCascade,
+            requestId,
+            version: VERSION,
+            collector: collector ?? undefined,
+            ...(RUNTIME.kind === 'production' &&
+            RUNTIME.production.config.deadline_enforcement_enabled
+              ? {
+                  requestDeadlineMs: RUNTIME.production.config.request_deadline_ms,
+                  providerCallBudgetMs: RUNTIME.production.config.provider_call_budget_ms,
+                }
+              : {}),
+          });
+
+          // 4) Payment settle / Stripe meter ONLY after successful DQL.
+          if (authPath.kind === 'allow') {
+            const price = priceForCall({
+              sandbox: false,
+              dev_access: authPath.record.dev_access,
             });
+            const rail = authPath.record.dev_access ? 'dev-access' : 'metered-log-only';
+            res.setHeader(
+              'X-DQL-Billing',
+              authPath.record.dev_access ? 'dev-access' : 'metered',
+            );
+            res.setHeader('X-DQL-Price-Usd', price.toFixed(2));
+            emitUsageLine({
+              requestId,
+              key: authPath.key,
+              owner: authPath.record.owner,
+              devAccess: authPath.record.dev_access,
+              priceUsd: price,
+              verdict: (response as { verdict?: string }).verdict,
+              billingRail: rail,
+            });
+            // Stripe meter: AWAITED (not fire-and-forget). Vercel drops
+            // dangling promises after response. Errors are logged; product
+            // already delivered — do not convert 200 → 5xx. Idempotency-Key
+            // = requestId allows safe retry of failed meter posts.
+            if (!authPath.record.dev_access && price > 0) {
+              const meter = await emitStripeMeterEvent({
+                requestId,
+                owner: authPath.record.owner,
+                priceUsd: price,
+              });
+              if (meter.kind === 'error') {
+                res.setHeader('X-DQL-Meter', 'error');
+              } else if (meter.kind === 'ok') {
+                res.setHeader('X-DQL-Meter', 'ok');
+              } else {
+                res.setHeader('X-DQL-Meter', meter.reason);
+              }
+            }
             status = 200;
             payload = response;
-
-            if (authPath.kind === 'allow') {
-              const price = priceForCall({
-                sandbox: false,
-                dev_access: authPath.record.dev_access,
-              });
-              const rail = authPath.record.dev_access ? 'dev-access' : 'metered-log-only';
-              res.setHeader(
-                'X-DQL-Billing',
-                authPath.record.dev_access ? 'dev-access' : 'metered',
-              );
-              res.setHeader('X-DQL-Price-Usd', price.toFixed(2));
-              emitUsageLine({
-                requestId,
-                key: authPath.key,
-                owner: authPath.record.owner,
-                devAccess: authPath.record.dev_access,
-                priceUsd: price,
-                verdict: (response as { verdict?: string }).verdict,
-                billingRail: rail,
-              });
-              // Stripe meter: billable keys only; best-effort, never blocks response.
-              if (!authPath.record.dev_access && price > 0) {
-                void emitStripeMeterEvent({
-                  requestId,
-                  owner: authPath.record.owner,
-                  priceUsd: price,
-                }).then((r) => {
-                  if (r.kind === 'ok') {
-                    // already logged inside emitter
-                  }
-                });
+          } else if (authPath.kind === 'x402_verified') {
+            // Settle only after successful DQL. Failure → not charged.
+            const settled = await settleX402Payment(authPath.ctx, process.env);
+            if (settled.kind === 'reject') {
+              status = settled.status;
+              payload = settled.body;
+            } else {
+              if (settled.txHash) {
+                const receipt = {
+                  txHash: settled.txHash,
+                  network: settled.network ?? 'eip155:8453',
+                  paidWith: 'x402-facilitator',
+                };
+                res.setHeader(
+                  'payment-response',
+                  Buffer.from(JSON.stringify(receipt)).toString('base64'),
+                );
               }
-            } else if (authPath.kind === 'x402') {
               res.setHeader('X-DQL-Billing', 'x402');
-              res.setHeader('X-DQL-Price-Usd', priceForCall({ sandbox: false, dev_access: false }).toFixed(2));
+              res.setHeader(
+                'X-DQL-Price-Usd',
+                priceForCall({ sandbox: false, dev_access: false }).toFixed(2),
+              );
               console.log(
                 JSON.stringify({
                   type: 'dql_usage',
                   request_id: requestId,
                   billing_rail: 'x402',
                   price_usd: PRICE_USD_PER_CALL,
-                  tx_hash: authPath.txHash,
-                  network: authPath.network,
+                  tx_hash: settled.txHash,
+                  network: settled.network,
                   verdict: (response as { verdict?: string }).verdict,
                   ts: new Date().toISOString(),
                 }),
               );
-            } else {
-              res.setHeader('X-DQL-Billing', 'sandbox');
-              res.setHeader('X-DQL-Price-Usd', '0.00');
+              status = 200;
+              payload = response;
             }
+          } else {
+            // sandbox
+            res.setHeader('X-DQL-Billing', 'sandbox');
+            res.setHeader('X-DQL-Price-Usd', '0.00');
+            status = 200;
+            payload = response;
           }
         }
       }

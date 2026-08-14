@@ -7,6 +7,11 @@
  * the event (never fails the verify call).
  *
  * Idempotency: Stripe-Idempotency-Key = DQL request_id.
+ *
+ * PR #36 HOLD fix: meter emit is AWAITED (not fire-and-forget) with a hard
+ * timeout. On Vercel, fire-and-forget can be dropped after the response is
+ * sent. Failure is logged; billing errors do not flip a successful DQL
+ * response to 5xx (product already delivered; retry via idempotency key).
  */
 
 import { createHash } from 'node:crypto';
@@ -15,6 +20,9 @@ import { PRICE_USD_PER_CALL } from '../pricing.js';
 
 export const STRIPE_METER_EVENT_NAME = 'dql_verify_call';
 export const STRIPE_METER_EVENTS_URL = 'https://api.stripe.com/v1/billing/meter_events';
+
+/** Hard timeout for Stripe meter network calls. */
+export const STRIPE_METER_TIMEOUT_MS = 5_000;
 
 export type StripeMeterResult =
   | { kind: 'skipped'; reason: string }
@@ -54,7 +62,8 @@ export function parseCustomerMap(raw: string | undefined): Map<string, string> {
 export function loadStripeMeterConfig(env: NodeJS.ProcessEnv = process.env): StripeMeterConfig {
   const secretKey = (env.STRIPE_SECRET_KEY ?? '').trim();
   const enabled = truthy(env.DQL_STRIPE_METER_ENABLED) && secretKey.length > 0;
-  const eventName = (env.STRIPE_METER_EVENT_NAME ?? STRIPE_METER_EVENT_NAME).trim() || STRIPE_METER_EVENT_NAME;
+  const eventName =
+    (env.STRIPE_METER_EVENT_NAME ?? STRIPE_METER_EVENT_NAME).trim() || STRIPE_METER_EVENT_NAME;
   return {
     enabled,
     secretKey,
@@ -71,11 +80,29 @@ export interface EmitStripeMeterOpts {
   fetchImpl?: typeof fetch;
   config?: StripeMeterConfig;
   nowSec?: () => number;
+  /** Timeout ms (default STRIPE_METER_TIMEOUT_MS). */
+  timeoutMs?: number;
+}
+
+async function fetchWithTimeout(
+  fetchImpl: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
- * Best-effort meter emit. Never throws into the request path.
+ * Awaited meter emit with hard timeout. Never throws into the request path.
  * Billable keys only (caller must gate on !dev_access && price > 0).
+ * MUST be awaited before the response is finalized on Vercel.
  */
 export async function emitStripeMeterEvent(opts: EmitStripeMeterOpts): Promise<StripeMeterResult> {
   const cfg = opts.config ?? loadStripeMeterConfig();
@@ -97,17 +124,23 @@ export async function emitStripeMeterEvent(opts: EmitStripeMeterOpts): Promise<S
   body.set('payload[value]', '1'); // 1 call unit; price is on the meter/price object in Stripe
 
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const timeoutMs = opts.timeoutMs ?? STRIPE_METER_TIMEOUT_MS;
   try {
-    const resp = await fetchImpl(STRIPE_METER_EVENTS_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${cfg.secretKey}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Idempotency-Key': opts.requestId,
-        'Stripe-Version': '2024-11-20.acacia',
+    const resp = await fetchWithTimeout(
+      fetchImpl,
+      STRIPE_METER_EVENTS_URL,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${cfg.secretKey}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Idempotency-Key': opts.requestId,
+          'Stripe-Version': '2024-11-20.acacia',
+        },
+        body: body.toString(),
       },
-      body: body.toString(),
-    });
+      timeoutMs,
+    );
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
       console.warn(
@@ -137,16 +170,22 @@ export async function emitStripeMeterEvent(opts: EmitStripeMeterOpts): Promise<S
     );
     return { kind: 'ok', event_name: cfg.eventName, identifier: json.identifier ?? opts.requestId };
   } catch (err) {
+    const reason =
+      err instanceof Error && /aborted|timeout|AbortError/i.test(err.message)
+        ? 'timeout'
+        : err instanceof Error
+          ? err.message
+          : 'fetch_failed';
     console.warn(
       JSON.stringify({
         type: 'dql_stripe_meter_error',
         request_id: opts.requestId,
         owner: opts.owner,
-        reason: err instanceof Error ? err.message : String(err),
+        reason,
         ts: new Date().toISOString(),
       }),
     );
-    return { kind: 'error', reason: err instanceof Error ? err.message : 'fetch_failed' };
+    return { kind: 'error', reason };
   }
 }
 

@@ -4,10 +4,15 @@
  * PAYMENT.md Rail B. Default OFF via DQL_X402_ENABLED.
  * Wallet: same as Sentinel (0xAB9f…82E83) unless PAYMENT_WALLET override.
  *
- * Flow:
- *   - API key present → caller handles key path (this module not used)
- *   - PAYMENT-SIGNATURE → verify+settle via CDP/x402 facilitator
- *   - else → 402 challenge payload (caller sends)
+ * Correct payment semantics (PR #36 HOLD fix):
+ *   1. Request validate
+ *   2. Payment VERIFY only (no settle)
+ *   3. DQL execute
+ *   4. Payment SETTLE only on DQL success
+ *   5. Deliver result
+ *
+ * No silent public-facilitator fallback without CDP credentials.
+ * Hard timeouts on facilitator network calls; client errors are sanitized.
  *
  * No GOAT/XRPL in v1 DQL port — Base USDC only. Expand later if needed.
  */
@@ -21,6 +26,9 @@ const DEFAULT_WALLET = '0xAB9f84864662f980614bD1453dB9950Ef2b82E83';
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const CDP_FACILITATOR_URL = 'https://api.cdp.coinbase.com/platform/v2/x402';
 const RESOURCE_URL = 'https://dql.thoughtproof.ai/dql/verify';
+
+/** Hard timeout for facilitator verify/settle network calls. */
+export const X402_FACILITATOR_TIMEOUT_MS = 8_000;
 
 function truthy(v: string | undefined): boolean {
   return ['true', '1', 'on', 'yes'].includes((v ?? '').trim().toLowerCase());
@@ -38,18 +46,40 @@ function amountMicro(priceUsd: number = PRICE_USD_PER_CALL): string {
   return String(Math.round(priceUsd * 1_000_000));
 }
 
-function facilitatorUrl(env: NodeJS.ProcessEnv): string {
-  if (env.X402_FACILITATOR_URL?.trim()) return env.X402_FACILITATOR_URL.trim();
-  return hasCdpCredentials(env) ? CDP_FACILITATOR_URL : 'https://x402.org/facilitator';
+/**
+ * Resolve facilitator URL. Fail-closed when x402 is enabled without:
+ *   - CDP credentials (preferred Coinbase path), OR
+ *   - an explicit X402_FACILITATOR_URL override.
+ * Never silently falls back to https://x402.org/facilitator.
+ */
+export function resolveFacilitatorUrl(
+  env: NodeJS.ProcessEnv,
+): { ok: true; url: string; mode: 'cdp' | 'explicit' } | { ok: false; reason: string } {
+  const explicit = env.X402_FACILITATOR_URL?.trim();
+  if (explicit) {
+    return { ok: true, url: explicit.replace(/\/$/, ''), mode: 'explicit' };
+  }
+  if (hasCdpCredentials(env)) {
+    return { ok: true, url: CDP_FACILITATOR_URL, mode: 'cdp' };
+  }
+  return {
+    ok: false,
+    reason:
+      'x402 enabled but no CDP credentials (X402_CDP_KEY_ID/SECRET) and no X402_FACILITATOR_URL',
+  };
 }
 
 function facilitatorRequest(
   path: '/verify' | '/settle',
   env: NodeJS.ProcessEnv,
+  baseUrl: string,
+  mode: 'cdp' | 'explicit',
 ): { url: string; headers: Record<string, string> } {
-  const url = `${facilitatorUrl(env)}${path}`;
+  const url = `${baseUrl}${path}`;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (hasCdpCredentials(env)) {
+  // Sign only when talking to CDP (credentials present). Explicit non-CDP
+  // facilitators must not receive CDP JWTs.
+  if (mode === 'cdp' && hasCdpCredentials(env)) {
     const { host, pathname } = new URL(url);
     headers.Authorization = `Bearer ${generateCdpJwt(
       env.X402_CDP_KEY_ID!,
@@ -90,12 +120,41 @@ function toV2Requirements(req: Record<string, unknown>): Record<string, unknown>
   };
 }
 
+/** Sanitize facilitator/network errors for client responses (no secrets/URLs). */
+export function sanitizePaymentClientError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (/aborted|timeout|TimeoutError|AbortError/i.test(raw)) {
+    return 'Payment facilitator timed out';
+  }
+  if (/fetch failed|ECONN|ENOTFOUND|network/i.test(raw)) {
+    return 'Payment facilitator unreachable';
+  }
+  // Never leak stack/host/secret material.
+  return 'Payment facilitator error';
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number = X402_FACILITATOR_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function facilitatorVerify(
   payload: unknown,
   paymentRequirements: unknown,
   env: NodeJS.ProcessEnv,
+  baseUrl: string,
+  mode: 'cdp' | 'explicit',
 ): Promise<{ isValid: boolean; invalidReason?: string }> {
-  const cdp = hasCdpCredentials(env);
+  const cdp = mode === 'cdp' && hasCdpCredentials(env);
   const req = paymentRequirements as Record<string, unknown>;
   const body = cdp
     ? {
@@ -104,11 +163,24 @@ async function facilitatorVerify(
         paymentRequirements: toV2Requirements(req),
       }
     : { x402Version: 1, paymentPayload: payload, paymentRequirements };
-  const { url, headers } = facilitatorRequest('/verify', env);
-  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const { url, headers } = facilitatorRequest('/verify', env, baseUrl, mode);
+  const resp = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => 'unknown');
-    return { isValid: false, invalidReason: `Facilitator verify failed (${resp.status}): ${text}` };
+    // Do not echo facilitator body to client path — log server-side only.
+    const text = await resp.text().catch(() => '');
+    console.warn(
+      JSON.stringify({
+        type: 'dql_x402_verify_http_error',
+        status: resp.status,
+        body: text.slice(0, 240),
+        ts: new Date().toISOString(),
+      }),
+    );
+    return { isValid: false, invalidReason: `Facilitator verify failed (HTTP ${resp.status})` };
   }
   return (await resp.json()) as { isValid: boolean; invalidReason?: string };
 }
@@ -117,8 +189,10 @@ async function facilitatorSettle(
   payload: unknown,
   paymentRequirements: unknown,
   env: NodeJS.ProcessEnv,
+  baseUrl: string,
+  mode: 'cdp' | 'explicit',
 ): Promise<{ success: boolean; txHash?: string; network?: string; error?: string }> {
-  const cdp = hasCdpCredentials(env);
+  const cdp = mode === 'cdp' && hasCdpCredentials(env);
   const req = paymentRequirements as Record<string, unknown>;
   const body = cdp
     ? {
@@ -127,11 +201,23 @@ async function facilitatorSettle(
         paymentRequirements: toV2Requirements(req),
       }
     : { x402Version: 1, paymentPayload: payload, paymentRequirements };
-  const { url, headers } = facilitatorRequest('/settle', env);
-  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const { url, headers } = facilitatorRequest('/settle', env, baseUrl, mode);
+  const resp = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => 'unknown');
-    return { success: false, error: `Facilitator settle failed (${resp.status}): ${text}` };
+    const text = await resp.text().catch(() => '');
+    console.warn(
+      JSON.stringify({
+        type: 'dql_x402_settle_http_error',
+        status: resp.status,
+        body: text.slice(0, 240),
+        ts: new Date().toISOString(),
+      }),
+    );
+    return { success: false, error: `Facilitator settle failed (HTTP ${resp.status})` };
   }
   const raw = (await resp.json()) as Record<string, unknown>;
   return {
@@ -195,36 +281,55 @@ export function buildX402Challenge(env: NodeJS.ProcessEnv = process.env): {
   };
 }
 
-export type X402GateResult =
+export type X402PaymentContext = {
+  payload: Record<string, unknown>;
+  paymentRequirements: Record<string, unknown>;
+  clientNetwork: string;
+  facilitatorUrl: string;
+  facilitatorMode: 'cdp' | 'explicit';
+};
+
+export type X402VerifyResult =
   | { kind: 'disabled' }
-  | { kind: 'paid'; txHash?: string; network?: string }
   | { kind: 'challenge' }
+  | { kind: 'verified'; ctx: X402PaymentContext }
   | { kind: 'reject'; status: number; body: Record<string, unknown> };
 
-/**
- * Process PAYMENT-SIGNATURE when present. Does NOT send the response —
- * caller applies challenge headers / JSON.
- */
-export async function processX402Payment(
-  req: VercelRequest,
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<X402GateResult> {
-  if (!isX402Enabled(env)) return { kind: 'disabled' };
+export type X402SettleResult =
+  | { kind: 'settled'; txHash?: string; network?: string }
+  | { kind: 'reject'; status: number; body: Record<string, unknown> };
 
-  const paymentSig = req.headers['payment-signature'] as string | undefined;
-  if (!paymentSig) return { kind: 'challenge' };
-
-  let payload: Record<string, unknown>;
+function parsePaymentSignature(
+  paymentSig: string,
+):
+  | { ok: true; payload: Record<string, unknown> }
+  | { ok: false; result: X402VerifyResult } {
   try {
-    payload = JSON.parse(Buffer.from(paymentSig, 'base64').toString('utf8')) as Record<string, unknown>;
+    const payload = JSON.parse(
+      Buffer.from(paymentSig, 'base64').toString('utf8'),
+    ) as Record<string, unknown>;
+    return { ok: true, payload };
   } catch {
     return {
-      kind: 'reject',
-      status: 402,
-      body: { error: 'Invalid PAYMENT-SIGNATURE header: not valid base64 JSON', code: 'PAYMENT_REQUIRED' },
+      ok: false,
+      result: {
+        kind: 'reject',
+        status: 402,
+        body: {
+          error: 'Invalid PAYMENT-SIGNATURE header: not valid base64 JSON',
+          code: 'PAYMENT_REQUIRED',
+        },
+      },
     };
   }
+}
 
+function buildPaymentRequirements(
+  payload: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+):
+  | { ok: true; paymentRequirements: Record<string, unknown>; clientNetwork: string }
+  | { ok: false; result: X402VerifyResult } {
   const payloadNetwork = String(payload.network ?? '');
   const acceptedNet =
     payload.accepted && typeof payload.accepted === 'object'
@@ -237,40 +342,103 @@ export async function processX402Payment(
     effectiveNetwork !== 'eip155:8453'
   ) {
     return {
-      kind: 'reject',
-      status: 402,
-      body: {
-        error: 'Unsupported x402 network for DQL (Base mainnet only in v1)',
-        code: 'PAYMENT_REQUIRED',
-        network: effectiveNetwork,
+      ok: false,
+      result: {
+        kind: 'reject',
+        status: 402,
+        body: {
+          error: 'Unsupported x402 network for DQL (Base mainnet only in v1)',
+          code: 'PAYMENT_REQUIRED',
+          network: effectiveNetwork,
+        },
       },
     };
   }
 
   const clientNetwork = effectiveNetwork === 'base' ? 'base' : 'eip155:8453';
   const micro = amountMicro();
-  const paymentRequirements = {
-    scheme: 'exact',
-    network: clientNetwork,
-    amount: micro,
-    maxAmountRequired: micro,
-    asset: USDC_BASE,
-    payTo: paymentWallet(env),
-    resource: RESOURCE_URL,
-    maxTimeoutSeconds: 300,
-    extra: { name: 'USD Coin', version: '2' },
+  return {
+    ok: true,
+    clientNetwork,
+    paymentRequirements: {
+      scheme: 'exact',
+      network: clientNetwork,
+      amount: micro,
+      maxAmountRequired: micro,
+      asset: USDC_BASE,
+      payTo: paymentWallet(env),
+      resource: RESOURCE_URL,
+      maxTimeoutSeconds: 300,
+      extra: { name: 'USD Coin', version: '2' },
+    },
   };
+}
+
+/**
+ * VERIFY-only path. Does NOT settle.
+ * Caller must run body validation + DQL, then call settleX402Payment on success.
+ */
+export async function verifyX402Payment(
+  req: VercelRequest,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<X402VerifyResult> {
+  if (!isX402Enabled(env)) return { kind: 'disabled' };
+
+  const paymentSig = req.headers['payment-signature'] as string | undefined;
+  if (!paymentSig) return { kind: 'challenge' };
+
+  const fac = resolveFacilitatorUrl(env);
+  if (!fac.ok) {
+    console.error(
+      JSON.stringify({
+        type: 'dql_x402_misconfigured',
+        reason: fac.reason,
+        ts: new Date().toISOString(),
+      }),
+    );
+    return {
+      kind: 'reject',
+      status: 503,
+      body: {
+        error: 'Payment rail misconfigured',
+        code: 'PAYMENT_UNAVAILABLE',
+      },
+    };
+  }
+
+  const parsed = parsePaymentSignature(paymentSig);
+  if (!parsed.ok) return parsed.result;
+
+  const reqs = buildPaymentRequirements(parsed.payload, env);
+  if (!reqs.ok) return reqs.result;
 
   let verification: { isValid: boolean; invalidReason?: string };
   try {
-    verification = await facilitatorVerify(payload, paymentRequirements, env);
+    verification = await facilitatorVerify(
+      parsed.payload,
+      reqs.paymentRequirements,
+      env,
+      fac.url,
+      fac.mode,
+    );
   } catch (err) {
+    console.warn(
+      JSON.stringify({
+        type: 'dql_x402_verify_error',
+        reason: err instanceof Error ? err.message : String(err),
+        ts: new Date().toISOString(),
+      }),
+    );
     return {
       kind: 'reject',
       status: 502,
-      body: { error: `Payment verification unavailable: ${String(err)}`, code: 'PAYMENT_UNAVAILABLE' },
+      body: {
+        error: sanitizePaymentClientError(err),
+        code: 'PAYMENT_UNAVAILABLE',
+      },
     };
   }
+
   if (!verification.isValid) {
     return {
       kind: 'reject',
@@ -278,21 +446,62 @@ export async function processX402Payment(
       body: {
         error: 'Payment verification failed',
         code: 'PAYMENT_REQUIRED',
-        reason: verification.invalidReason,
+        reason: verification.invalidReason
+          ? 'Payment signature rejected by facilitator'
+          : undefined,
       },
     };
   }
 
+  return {
+    kind: 'verified',
+    ctx: {
+      payload: parsed.payload,
+      paymentRequirements: reqs.paymentRequirements,
+      clientNetwork: reqs.clientNetwork,
+      facilitatorUrl: fac.url,
+      facilitatorMode: fac.mode,
+    },
+  };
+}
+
+/**
+ * SETTLE-only path. Call only after DQL completed successfully.
+ * Customers must never be charged for 400/500 responses.
+ */
+export async function settleX402Payment(
+  ctx: X402PaymentContext,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<X402SettleResult> {
   let settlement: { success: boolean; txHash?: string; network?: string; error?: string };
   try {
-    settlement = await facilitatorSettle(payload, paymentRequirements, env);
+    settlement = await facilitatorSettle(
+      ctx.payload,
+      ctx.paymentRequirements,
+      env,
+      ctx.facilitatorUrl,
+      ctx.facilitatorMode,
+    );
   } catch (err) {
+    console.warn(
+      JSON.stringify({
+        type: 'dql_x402_settle_error',
+        reason: err instanceof Error ? err.message : String(err),
+        ts: new Date().toISOString(),
+      }),
+    );
     return {
       kind: 'reject',
       status: 502,
-      body: { error: `Settlement unavailable: ${String(err)}`, code: 'PAYMENT_UNAVAILABLE' },
+      body: {
+        error: sanitizePaymentClientError(err),
+        code: 'PAYMENT_UNAVAILABLE',
+        // DQL already ran; settle failed — do not claim paid.
+        details: 'Verification completed but settlement failed; not charged',
+      },
     };
   }
+
   if (!settlement.success) {
     return {
       kind: 'reject',
@@ -300,16 +509,39 @@ export async function processX402Payment(
       body: {
         error: 'Settlement failed',
         code: 'PAYMENT_REQUIRED',
-        details: settlement.error,
+        details: 'Verification completed but settlement failed; not charged',
       },
     };
   }
 
-  return { kind: 'paid', txHash: settlement.txHash, network: settlement.network ?? clientNetwork };
+  return {
+    kind: 'settled',
+    txHash: settlement.txHash,
+    network: settlement.network ?? ctx.clientNetwork,
+  };
+}
+
+/**
+ * @deprecated Prefer verifyX402Payment + settleX402Payment.
+ * Kept as a thin wrapper for tests that only exercise parse/challenge paths.
+ * Does NOT settle — returns verified context or reject/challenge.
+ */
+export async function processX402Payment(
+  req: VercelRequest,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<
+  | X402VerifyResult
+  | { kind: 'paid'; txHash?: string; network?: string }
+> {
+  // Backward-compat name: VERIFY ONLY. Settlement is intentionally not here.
+  return verifyX402Payment(req, env);
 }
 
 /** Apply challenge headers onto a 402 response. */
-export function applyX402ChallengeHeaders(res: VercelResponse, env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+export function applyX402ChallengeHeaders(
+  res: VercelResponse,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, unknown> {
   const { body, paymentRequiredHeader } = buildX402Challenge(env);
   res.setHeader('payment-required', paymentRequiredHeader);
   return body;
