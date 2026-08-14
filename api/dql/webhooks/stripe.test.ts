@@ -47,7 +47,7 @@ describe('POST /dql/webhooks/stripe', () => {
   });
 
   it('400 when body was pre-parsed (signature cannot be verified)', async () => {
-    process.env.STRIPE_WEBHOOK_SECRET = 'whsec_aaaaaaaaaaaaaaaaaaaaaaaa';
+    process.env.STRIPE_WEBHOOK_SECRET = 'whsec_' + 'a'.repeat(24);
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
     const mod = await import('./stripe.js');

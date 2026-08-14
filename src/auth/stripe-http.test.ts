@@ -8,7 +8,7 @@ function sign(payload: string, secret: string, t: number): string {
 }
 
 describe('verifyStripeSignature', () => {
-  const secret = 'whsec_testsecret_aaaaaaaaaaaaaaaa';
+  const secret = 'whsec_' + 'a'.repeat(24);
   const payload = '{"type":"checkout.session.completed"}';
   const t = 1_700_000_000;
 

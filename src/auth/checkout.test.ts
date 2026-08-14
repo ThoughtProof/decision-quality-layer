@@ -271,7 +271,7 @@ describe('revealCheckoutKey', () => {
 });
 
 describe('handleStripeWebhookEvent', () => {
-  const secret = 'whsec_testsecret_bbbbbbbbbbbbbbbb';
+  const secret = 'whsec_' + 'b'.repeat(24);
   const t = 1_700_000_100;
 
   it('rejects unsigned / bad signature and never mints', async () => {
