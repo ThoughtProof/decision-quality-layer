@@ -55,6 +55,30 @@ describe('emitStripeMeterEvent', () => {
     expect(r).toEqual({ kind: 'skipped', reason: 'meter_disabled' });
   });
 
+  it('uses explicit customerId when env map is empty (store-minted keys)', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ identifier: 'dql_ss' }),
+      text: async () => '',
+      status: 200,
+    }));
+    const r = await emitStripeMeterEvent({
+      requestId: 'dql_ss',
+      owner: 'ss:cus_from_store',
+      customerId: 'cus_from_store',
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      config: {
+        enabled: true,
+        secretKey: 'sk_test',
+        eventName: STRIPE_METER_EVENT_NAME,
+        customerByOwner: new Map(),
+      },
+    });
+    expect(r.kind).toBe('ok');
+    const call0 = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(String(call0[1].body)).toContain('cus_from_store');
+  });
+
   it('skips without customer mapping', async () => {
     const r = await emitStripeMeterEvent({
       requestId: 'dql_1',

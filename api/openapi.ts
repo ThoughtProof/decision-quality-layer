@@ -36,7 +36,7 @@ const spec = {
     // bare `guidance` is not a valid OpenAPI 3.1 info property and fails
     // strict 3.1 validation (unevaluatedProperties). Content unchanged.
     'x-guidance':
-      'POST /dql/verify with (mandate, proposed_action, reasoning, context?) to receive per-axis verdicts plus an aggregate. Set `sandbox: true` in the body for a free deterministic mock response — useful for integration testing against the schema. GET /dql/axes for axis metadata (question and failure mode per axis). Payment (Stripe metered + x402 on Base) lands in a later release; for now DQL is dev-access on request.',
+      'POST /dql/verify with (mandate, proposed_action, reasoning, context?) to receive per-axis verdicts plus an aggregate. Set `sandbox: true` in the body for a free deterministic mock response — useful for integration testing against the schema. GET /dql/axes for axis metadata (question and failure mode per axis). Live rails: X-DQL-Key (env ∪ Upstash store), Stripe meter dql_verify_call, x402 on Base. Public Checkout key-mint is code-complete behind DQL_CHECKOUT_ENABLED (default off) — not a live self-serve claim.',
     contact: {
       url: 'https://thoughtproof.ai',
       email: 'support@thoughtproof.ai',
@@ -199,6 +199,82 @@ const spec = {
         },
       },
     },
+    '/dql/checkout': {
+      post: {
+        operationId: 'dqlCheckout',
+        summary: 'Start Stripe Checkout for a billable API key',
+        description:
+          'Default OFF (`DQL_CHECKOUT_ENABLED`). Creates a Stripe Customer and Checkout Session. On completion the webhook (or GET reveal) mints one `dqlk_…` key (`dev_access: false`) bound to `cus_…`. Not a live self-serve claim until the flag is on and smoked.',
+        security: [],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['email'],
+                properties: {
+                  email: { type: 'string', format: 'email' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Checkout Session URL',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    url: { type: 'string', format: 'uri' },
+                    session_id: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          '503': {
+            description: 'Checkout disabled or unconfigured',
+          },
+        },
+      },
+      get: {
+        operationId: 'dqlCheckoutReveal',
+        summary: 'Reveal the minted API key once',
+        description:
+          'Query `session_id` (Stripe Checkout Session id). Returns the plaintext key once. Does not put the key in the query string.',
+        security: [],
+        parameters: [
+          {
+            name: 'session_id',
+            in: 'query',
+            required: true,
+            schema: { type: 'string' },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Key shown once',
+          },
+          '409': {
+            description: 'Key already delivered',
+          },
+        },
+      },
+    },
+    '/dql/webhooks/stripe': {
+      post: {
+        operationId: 'dqlStripeWebhook',
+        summary: 'Stripe webhook (signature required)',
+        security: [],
+        responses: {
+          '200': { description: 'Received' },
+          '400': { description: 'Invalid signature or payload' },
+        },
+      },
+    },
   },
   components: {
     headers: {
@@ -250,7 +326,7 @@ const spec = {
         in: 'header',
         name: 'X-DQL-Key',
         description:
-          'Dev-access API key. Payment gates (Stripe metered + x402 on Base) will replace / augment this in a later release. Contact support@thoughtproof.ai for dev access.',
+          'DQL API key (`dqlk_…`). Dev-access keys are granted manually (free). Self-serve keys are billable ($0.05/call) when Checkout is enabled. Alias: Authorization: Bearer. Contact support@thoughtproof.ai for dev access.',
       },
     },
     schemas: {

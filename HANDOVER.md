@@ -18,8 +18,8 @@
 | Deploy commit | **`9f3c1b4`** — PR #36 P2 self-serve rails **code** merged · Health-SHA == main-SHA |
 | npm/package label | `0.2.0` **artifact only** (locked P0 #3) — cite `config_schema_version` for behavior |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
-| Payment rails | **x402 ON (Base USDC)** · Stripe OFF · Upstash unbound |
-| Self-serve | **`SELF_SERVE_LIVE=partial`** — crypto x402 only; no fiat/Stripe claim |
+| Payment rails | **x402 ON** · **Stripe meter ON** (canary) · **Upstash daily-cap ON** · Checkout **code** flag-off |
+| Self-serve | **`SELF_SERVE_LIVE=partial`** — rails live; public Checkout mint **OFF** (`DQL_CHECKOUT_ENABLED`) |
 | Flags | `capital_path_mode` / CB / alias_gate / diagnostics — see live health JSON |
 | Cascade | `serv-nano` → `serv-swift` (OpenServ) |
 | Product lane | **Consumer Trust** (mandate vs geplante Aktion) — **nicht** Sentinel/PLV Banking |
@@ -65,9 +65,10 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 8. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
 
 ### P2 — Gate code complete (Self-Serve still OFF)
-9. 🔲 Stripe meter activation — code merged; **Production OFF**. Needs: Dashboard meter/price `dql_verify_call` @ $0.05 + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + `DQL_STRIPE_METER_ENABLED`.
+9. ✅ Stripe meter — **Production ON** (canary `dql-canary` → `cus_V4abfGkmWdyxyC`).
 10. ✅ x402 Base rail — **Production ON** (2026-08-14). CDP keys + flag live; challenge + $0.05 canary PASS.
-11. ✅ Upstash daily-cap multi-instance — **merged PR #36 · unbound in Production**. Redis key = sha256(apiKey). Live dual-instance smoke when bound.
+11. ✅ Upstash daily-cap multi-instance — **ON** (2026-08-15). Redis key = sha256(apiKey).
+11b. 🔲 Public Checkout mint — **code** (`POST /dql/checkout` + signed webhook + one-time reveal). **Flag OFF.** Do not claim `SELF_SERVE_LIVE=true` until `DQL_CHECKOUT_ENABLED` + smoke.
 
 ### P3 — Reliability debt (nur wenn capital/high-SLA)
 12. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)

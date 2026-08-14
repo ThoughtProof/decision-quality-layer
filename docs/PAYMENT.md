@@ -77,9 +77,9 @@ POST /dql/verify received
 - **Dev-access grant flow** — email-based today; do we want a lightweight form or is a mailto: link enough for v1?
 - **Refund / dispute policy** — if a customer disputes a Stripe charge, do we auto-refund below some threshold? Manual review above?
 
-## Implementation status (2026-08-15)
+## Implementation status (2026-08-14)
 
-**`SELF_SERVE_LIVE=partial`** — payment **rails** live in Production (x402 + Stripe meter canary + Upstash daily-cap). **Not** full self-serve: no public signup/checkout/key-mint UX on `app.thoughtproof.ai` (demo + agent gate only). Do not claim freemium or automated fiat onboarding.
+**`SELF_SERVE_LIVE=partial`** — payment **rails** live in Production (x402 + Stripe meter canary + Upstash daily-cap). Checkout **code** exists (`POST /dql/checkout`, signed webhook, one-time key reveal) behind `DQL_CHECKOUT_ENABLED` (**default OFF**). Merge ≠ public billing. Do **not** claim `SELF_SERVE_LIVE=true` until Raul flips the flag and smokes Production. No public signup UX on `app.thoughtproof.ai` yet. No freemium.
 
 Code path **merged via [PR #36](https://github.com/ThoughtProof/decision-quality-layer/pull/36)** → `main` merge commit **`9f3c1b4`** (PR head `4c27363`).  
 Production: `dql.thoughtproof.ai` · cascade `pot-cli`.
@@ -108,6 +108,44 @@ Hard rules:
 | Stripe meter `dql_verify_call` | Merged · unit tests (awaited + timeout) | **ON** (canary owner `dql-canary` → `cus_V4abfGkmWdyxyC`) | Dashboard meter/price live; prod flag + secret + map |
 | x402 Base USDC | Merged · Preview + **Production canary PASS** | **ON** (`DQL_X402_ENABLED` + CDP keys) | live |
 | Upstash daily-cap multi-instance | Merged · unit-verified atomic INCR; Redis key = sha256(apiKey) | **ON** (shared Sentinel Upstash; keys `dql:usage:…`) | bound 2026-08-15; over-cap → 429 `QUOTA_EXCEEDED` |
+| Stripe Checkout → persist `dqlk_…` | **Code** · unit tests (mint → auth → revoke; env canary; no key in logs) | **OFF** (`DQL_CHECKOUT_ENABLED` unset) | flag + webhook secret + Upstash; see below |
+
+Auth + customer-map + daily-cap consult **env ∪ Upstash store**. `DQL_API_KEYS` and `DQL_STRIPE_CUSTOMER_MAP` remain bootstrap (canary / guardian-pwa / manual `dev_access`). Self-serve keys are `dev_access: false`, stored as sha256 only, bound to `cus_…`. Plaintext is shown **once** on `GET /dql/checkout?session_id=cs_…` (session id in the query, never the raw key).
+
+### Checkout / webhook (local + prod flag)
+
+**Local (Stripe test mode):**
+
+```bash
+# Terminal A — forward webhooks (prints whsec_…)
+stripe listen --forward-to localhost:3002/dql/webhooks/stripe
+
+# Terminal B
+export DQL_CHECKOUT_ENABLED=true
+export STRIPE_SECRET_KEY=sk_test_…
+export STRIPE_WEBHOOK_SECRET=whsec_…          # from stripe listen
+export DQL_PUBLIC_BASE_URL=http://localhost:3002
+export UPSTASH_REDIS_REST_URL=…               # required to persist keys
+export UPSTASH_REDIS_REST_TOKEN=…
+# Optional: Dashboard metered price so Checkout uses subscription mode
+# (pay-as-you-go invoices). Without it, Checkout is setup-mode (card on file).
+# export DQL_STRIPE_PRICE_ID=price_…
+DQL_CASCADE=stub npx vercel dev --listen 3002
+
+curl -s -X POST http://localhost:3002/dql/checkout \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com"}'
+# → { "url": "https://checkout.stripe.com/…", "session_id": "cs_…" }
+# Complete Checkout, then:
+curl -s 'http://localhost:3002/dql/checkout?session_id=cs_…'
+# → { "api_key": "dqlk_…", "shown_once": true }   # once only
+```
+
+Stripe Dashboard webhook (prod): endpoint `https://dql.thoughtproof.ai/dql/webhooks/stripe`, event `checkout.session.completed`, signing secret → `STRIPE_WEBHOOK_SECRET`. Shared ThoughtProof Stripe account: only sessions with `metadata.dql_checkout=1` are minted; other events are ignored.
+
+**Prod flip (Raul):** set `DQL_CHECKOUT_ENABLED=true` **after** `STRIPE_WEBHOOK_SECRET` + Upstash are bound. Redeploy. Smoke: one test Checkout → reveal once → `POST /dql/verify` with `X-DQL-Key` → `X-DQL-Meter: ok`. Until that smoke, keep **`SELF_SERVE_LIVE=partial`**.
+
+Webhook signature is required. No Stripe secrets in the repo.
 
 ### Activation proof
 
@@ -133,4 +171,4 @@ Hard rules:
 - Smoke: counter@cap → **429** `QUOTA_EXCEEDED` (`dql_msthu647_ip91cp`); after reset → **200** metered (`dql_msthu6sb_amgn7z`)
 - Artifact: `memory/artifacts/dql-upstash-prod-bind-2026-08-15.json`
 
-**Honest claims:** crypto pay-per-call (x402) and fiat meter emit (Stripe canary) work in Production. Daily-cap brake is live. Public self-serve UX (signup/checkout/key issue on app.thoughtproof.ai) is **not** live. No freemium. Invite/dev keys still free.
+**Honest claims:** crypto pay-per-call (x402) and fiat meter emit (Stripe canary) work in Production. Daily-cap brake is live. Checkout **code** can mint a persisted billable key, but the public flag is **OFF** — not a live self-serve claim. No freemium. Invite/dev keys still free. Env canary `dql-canary` → `cus_V4abfGkmWdyxyC` is unchanged.

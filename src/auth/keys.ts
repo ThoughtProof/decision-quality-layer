@@ -13,12 +13,16 @@
  * Key delivery: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or
  * `Authorization: Bearer dqlk_...` (alias for OpenAI-style clients).
  *
- * Keys live in env `DQL_API_KEYS` as a JSON object — Vercel-native, no DB
- * round-trip at cold start:
- *   {
- *     "dqlk_<hex>": { "owner": "raul",  "dev_access": true,  "daily_cap": 500 },
- *     "dqlk_<hex>": { "owner": "acme",  "dev_access": false, "daily_cap": 2000 }
- *   }
+ * Key registry is the union of:
+ *   1. Env `DQL_API_KEYS` JSON — bootstrap (canary / guardian-pwa / manual
+ *      `dev_access`). Parsed at cold start, no DB round-trip:
+ *        {
+ *          "dqlk_<hex>": { "owner": "raul",  "dev_access": true,  "daily_cap": 500 },
+ *          "dqlk_<hex>": { "owner": "acme",  "dev_access": false, "daily_cap": 2000 }
+ *        }
+ *   2. Upstash key store (`src/auth/key-store.ts`) — self-serve minted
+ *      billable keys (`dev_access: false`), looked up by sha256. Env wins
+ *      on collision so the canary cannot be shadowed.
  *
  * `daily_cap` is an operational abuse brake (429), orthogonal to billing.
  * Unknown fields are ignored so the format can grow without a gate change.
@@ -32,6 +36,15 @@ export interface ApiKeyRecord {
   owner: string;
   dev_access: boolean;
   daily_cap: number;
+  /** Present on store-minted keys; env keys resolve cus_ via customer map. */
+  stripe_customer_id?: string;
+  revoked?: boolean;
+  source?: 'env' | 'store';
+}
+
+/** Optional persisted-key lookup (Upstash). Env registry is checked first. */
+export interface KeyLookup {
+  lookup(plaintextKey: string): Promise<ApiKeyRecord | undefined>;
 }
 
 export const DEFAULT_DAILY_CAP = 1000;
@@ -110,6 +123,8 @@ export async function authorizeCall(opts: {
   sandbox: boolean;
   keys: Map<string, ApiKeyRecord>;
   usage: UsageGate;
+  /** Self-serve / minted keys. Consulted only after env miss. */
+  store?: KeyLookup;
 }): Promise<AuthDecision> {
   if (opts.sandbox) return { kind: 'free_sandbox' };
 
@@ -127,8 +142,9 @@ export async function authorizeCall(opts: {
     };
   }
 
-  const record = lookupKeyConstantTime(opts.keys, key);
-  if (!record) {
+  const envRecord = lookupKeyConstantTime(opts.keys, key);
+  const record = envRecord ?? (opts.store ? await opts.store.lookup(key) : undefined);
+  if (!record || record.revoked === true) {
     return {
       kind: 'deny',
       status: 402,

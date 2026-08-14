@@ -70,9 +70,9 @@ Enforced on every non-sandbox `POST /dql/verify` (see `docs/PAYMENT.md`).
 
 | Variable | Required | Effect |
 |----------|----------|--------|
-| `DQL_API_KEYS` | **yes in prod** for live calls | JSON object of API keys. Empty / unset → every non-sandbox call returns **402 PAYMENT_REQUIRED** (fail-closed). Format: `{"dqlk_<hex>":{"owner":"name","dev_access":true,"daily_cap":500}}`. `dev_access:true` → free (manual grant). `dev_access:false` → billable (Stripe/x402 meter rails TBD; usage line already emitted). |
-| `UPSTASH_REDIS_REST_URL` | optional | Daily-cap brake + usage counter. Absent → cap enforcement disabled (key validation still active). |
-| `UPSTASH_REDIS_REST_TOKEN` | optional | Pair with URL above. |
+| `DQL_API_KEYS` | **yes in prod** for bootstrap keys | JSON object of API keys (canary / guardian-pwa / manual `dev_access`). Auth is **env ∪ Upstash store** — self-serve minted keys do **not** need to be pasted here. Empty env + empty store → every non-sandbox call returns **402 PAYMENT_REQUIRED**. Format: `{"dqlk_<hex>":{"owner":"name","dev_access":true,"daily_cap":500}}`. `dev_access:true` → free (manual grant). `dev_access:false` → billable. |
+| `UPSTASH_REDIS_REST_URL` | prod (caps + store) | Daily-cap brake (`dql:usage:…`) **and** persisted self-serve key records (`dql:key:<sha256>`). Absent → cap disabled; store-minted keys cannot be validated (env keys still work). |
+| `UPSTASH_REDIS_REST_TOKEN` | pair with URL | Pair with URL above. |
 
 ### Stripe meter (P2 Rail A — default OFF)
 
@@ -81,11 +81,28 @@ Enforced on every non-sandbox `POST /dql/verify` (see `docs/PAYMENT.md`).
 | `DQL_STRIPE_METER_ENABLED` | no | `true`/`1`/`on` to emit Stripe Billing Meter Events. Default off. |
 | `STRIPE_SECRET_KEY` | with flag | Stripe secret (`sk_live_…` / `sk_test_…`). Without it the flag is ignored. |
 | `STRIPE_METER_EVENT_NAME` | no | Default `dql_verify_call`. Must match the meter created in Stripe Dashboard. |
-| `DQL_STRIPE_CUSTOMER_MAP` | for billing | JSON `{"owner":"cus_…"}` mapping key `owner` → Stripe customer id. Missing owner → skip emit (no charge attempt). |
+| `DQL_STRIPE_CUSTOMER_MAP` | bootstrap | JSON `{"owner":"cus_…"}` mapping key `owner` → Stripe customer id (canary). Minted keys resolve `owner → cus_…` from the Upstash store too. Missing both → skip emit (no charge attempt). |
 
 Billable keys only (`dev_access: false`). Idempotency key = DQL `request_id`. Meter emit is **awaited** with a hard timeout before the response is finalized. Failures are logged, never fail the verify response.
 
 **Pricing note:** the API meter event sends `value=1` (one call unit). The **$0.05 USD** price must be configured on the Stripe Meter / Price object in the Dashboard — not in the event payload.
+
+### Public Checkout (self-serve mint — default OFF)
+
+Merge does **not** turn on public billing. `POST /dql/checkout` returns `503 CHECKOUT_DISABLED` until the flag is on.
+
+| Variable | Required | Effect |
+|----------|----------|--------|
+| `DQL_CHECKOUT_ENABLED` | no | `true`/`1`/`on` to create Checkout Sessions. **Default off.** |
+| `STRIPE_SECRET_KEY` | with flag | Same secret as the meter rail. |
+| `STRIPE_WEBHOOK_SECRET` | webhook | `whsec_…` from Stripe Dashboard or `stripe listen`. Unsigned webhooks are rejected. |
+| `DQL_STRIPE_PRICE_ID` | recommended | Dashboard metered price id. When set, Checkout is `mode=subscription` (pay-as-you-go invoices). When unset, Checkout is `mode=setup` (card on file; attach the metered price in Dashboard if invoices should generate). |
+| `DQL_PUBLIC_BASE_URL` | no | Success URL origin. Default `https://$VERCEL_URL` or `https://dql.thoughtproof.ai`. |
+| `DQL_CHECKOUT_CANCEL_URL` | no | Cancel URL. Default `{publicBase}/`. |
+
+Self-serve keys are always `dev_access: false`. Plaintext is never logged and is stored only in a 15-minute one-time reveal token. Success URL uses `session_id`, not the raw key.
+
+See `docs/PAYMENT.md` § Checkout / webhook for local `stripe listen` + prod flip. Do not claim `SELF_SERVE_LIVE=true` until the flag is on and smoked.
 
 ### x402 (P2 Rail B — default OFF)
 
