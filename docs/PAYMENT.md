@@ -79,9 +79,12 @@ POST /dql/verify received
 
 ## Implementation status (2026-08-14)
 
-Code path on branch `feat/p2-self-serve-gate-rails` (flag-gated, **not** auto-enabled in prod).
+**`SELF_SERVE_LIVE=false`**
 
-### Payment semantics (HOLD fix — required before merge)
+Code path **merged via [PR #36](https://github.com/ThoughtProof/decision-quality-layer/pull/36)** → `main` merge commit **`9f3c1b4`** (PR head `4c27363`).  
+Production deploy: `dql.thoughtproof.ai` health `commit_sha=9f3c1b4…` · cascade `pot-cli` · **all payment rails disabled** (no Stripe/x402/Upstash/CDP env in Production).
+
+### Payment semantics (locked; review PASS before merge)
 
 ```
 Request validate
@@ -100,11 +103,18 @@ Hard rules:
 6. **Unknown settlement ≠ not charged.** Timeout/connection-drop after settle request → `PAYMENT_STATUS_UNKNOWN` + reconcile id. Authoritative `success:false` → `PAYMENT_FAILED`.
 7. **Stripe price is Dashboard-side.** Meter event sends `value=1`; configure $0.05 on the Stripe Meter/Price object.
 
-| Rail | Status | Enable |
-|---|---|---|
-| Stripe meter `dql_verify_call` | Code + unit tests (awaited + timeout) | `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + **create meter in Stripe Dashboard** (Raul) |
-| x402 Base USDC | Code + unit tests (verify→DQL→settle) | `DQL_X402_ENABLED=true` + CDP keys (or explicit facilitator URL) |
-| Upstash daily-cap multi-instance | Verified in unit test (atomic INCR shared counter); Redis keys now hash the API key (no raw secret in Redis) | `UPSTASH_REDIS_REST_URL` + `_TOKEN` |
+| Rail | Code status | Production | Enable (separate go) |
+|---|---|---|---|
+| Stripe meter `dql_verify_call` | Merged · unit tests (awaited + timeout) | **OFF** | `DQL_STRIPE_METER_ENABLED=true` + `STRIPE_SECRET_KEY` + `DQL_STRIPE_CUSTOMER_MAP` + create meter/price in Dashboard |
+| x402 Base USDC | Merged · unit tests + Preview challenge + **live $0.05 E2E** | **OFF** | `DQL_X402_ENABLED=true` + CDP keys (or explicit facilitator URL) |
+| Upstash daily-cap multi-instance | Merged · unit-verified atomic INCR; Redis key = sha256(apiKey) | **unbound** | `UPSTASH_REDIS_REST_URL` + `_TOKEN` + dual-instance smoke |
 
-**Do not claim self-serve live** until Stripe meter exists in Dashboard and flags are intentionally turned on.
-**Do not merge until payment-semantics review passes.**
+### Preview activation proof (not Production)
+
+- Challenge-smoke PASS on Preview @ `4c27363` (flag on temporarily, then removed).
+- Live E2E: exactly one Base USDC payment **0.05** · HTTP 200 · billing `x402` · DQL ALLOW.
+- Tx: [`0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6`](https://basescan.org/tx/0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6) · Transfer 50000 micro-USDC → `0xAB9f…82E83`.
+- Report artifact (workspace): `memory/artifacts/dql-x402-e2e-step3-2026-08-14.json`.
+- Preview payment env cleaned after E2E (flag + CDP keys removed).
+
+**Do not claim self-serve live.** Code is production-ready; commercial rails require explicit activation gos. Preferred order if monetizing later: Stripe first (controlled), then x402 with its own production canary.

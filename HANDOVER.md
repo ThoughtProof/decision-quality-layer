@@ -2,9 +2,9 @@
 
 > **Language note:** This is a German one-page status doc (per the OpenClaw `DRAFTS/2026-08-04-dql-now-next-not.md` it replaces). Deep doc is in `docs/`. This file is the **current** single source of truth; prefer it over the old 2026-07-08 v0.2 HANDOVER.
 
-**Stand:** 2026-08-05 CEST (PR #28 hybrid gate live; #26 partial — risk matops + fail_open metrics)
-**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=9e7fc18c…`
-**Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim.
+**Stand:** 2026-08-14 CEST (PR #36 P2 rails code merged flag-off; #26 closed earlier)
+**Live-Check:** `GET https://dql.thoughtproof.ai/dql/health` → `200 ok` · `commit_sha=9f3c1b4…` · cascade `pot-cli`
+**Zweck:** Ein-Seiten-Lagebild. Kein Train-Go. Kein Launch-Claim. **`SELF_SERVE_LIVE=false`**.
 
 ---
 
@@ -15,23 +15,26 @@
 | Endpoint | `https://dql.thoughtproof.ai` |
 | Health | `status=ok` · cascade `pot-cli` · SERV key bound |
 | Runtime schema | `0.4.3.2-deadline-1` · `v0431_active=true` |
-| Deploy commit | **`df652752`** — PR #31 consistency Class-B recall + prior hybrid stack · Health-SHA == main-SHA
+| Deploy commit | **`9f3c1b4`** — PR #36 P2 self-serve rails **code** merged · Health-SHA == main-SHA |
 | npm/package label | `0.2.0` **artifact only** (locked P0 #3) — cite `config_schema_version` for behavior |
 | Auth | Key-gate: non-sandbox braucht `X-DQL-Key`; `sandbox: true` free |
-| Flags | `capital_path_mode=true` · `disable_circuit_breaker=true` · `alias_gate_ready=false` · diagnostics on |
+| Payment rails | **Stripe OFF · x402 OFF · Upstash unbound · CDP not in Production** |
+| Self-serve | **`SELF_SERVE_LIVE=false`** — do not claim live |
+| Flags | `capital_path_mode` / CB / alias_gate / diagnostics — see live health JSON |
 | Cascade | `serv-nano` → `serv-swift` (OpenServ) |
 | Product lane | **Consumer Trust** (mandate vs geplante Aktion) — **nicht** Sentinel/PLV Banking |
 | Surfaces | API live · Extension DQL-path (dogfood) · Guardian PWA demo `200` (`guardian-pwa.vercel.app`) |
 | Proof artifacts | ADSB S4 claims mit Denominator · Blog decision-quality · Paris BLOCK receipt (Dmitry) |
 | Objection integrity | P1 surface-bind live (28.07) — verdicts unverändert, objections/reasoning gebunden |
 
-### Git-Stand nach PR #25 (2026-08-05)
+### Git-Stand nach PR #36 (2026-08-14)
 
 | | |
 |---|---|
-| **`origin/main`** | **`e2e62179`** — merge `fix(cascade): decouple… (#25)` · CI **grün** |
-| **Prod deploy** | **`e2e62179`** — live via Health verifiziert (`dql.thoughtproof.ai`) |
-| **Provenance track** | ✅ closed — Secondary-Outage → ehrliches REVIEW (nicht silent ALLOW); reopens #13/#14 closed via #24/#25 |
+| **`origin/main`** | **`9f3c1b4`** — merge PR #36 P2 self-serve rails flag-off · CI **grün** |
+| **Prod deploy** | **`9f3c1b4`** — live via Health verifiziert (`dql.thoughtproof.ai`) · Vercel target=production |
+| **P2 payment code** | ✅ deployed · rails **disabled** (honest status) |
+| **Preview x402 E2E proof** | Tx [`0x2fc1c4a4…22ed6`](https://basescan.org/tx/0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6) · $0.05 USDC · not a prod activation |
 | DNS | `try.thoughtproof.ai` **NXDOMAIN** · `guardian.thoughtproof.ai` **NXDOMAIN** |
 | `HANDOVER.md` | dieses Dokument |
 
@@ -60,10 +63,10 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 7. **try.thoughtproof.ai** — Playground stub **oder** Redirect — kein toter Name in Pitches
 8. **Smoke-card:** 2 feste Cases (ALLOW travel-ok · BLOCK budget-breach) mit Receipt-IDs
 
-### P2 — Gate vollständig (wenn Self-Serve gewollt)
-9. ✅ Stripe meter code path `dql_verify_call` @ **$0.05** — **flag-gated OFF** (`DQL_STRIPE_METER_ENABLED`). Needs Raul: create meter in Stripe + customer map + enable flag.
-10. ✅ x402 Base rail port (Sentinel CDP path, same wallet) — **flag-gated OFF** (`DQL_X402_ENABLED`). Enable + CDP keys when wanted.
-11. ✅ Upstash daily-cap multi-instance — unit-verified atomic INCR; Redis key = sha256(key) (no raw secret). Prod still needs live dual-instance smoke when Upstash bound.
+### P2 — Gate code complete (Self-Serve still OFF)
+9. ✅ Stripe meter code path `dql_verify_call` @ **$0.05** — **merged PR #36 · Production OFF**. Activation still needs: Stripe Dashboard meter/price + customer map + `DQL_STRIPE_METER_ENABLED` (explicit go).
+10. ✅ x402 Base rail (Sentinel CDP path, same wallet) — **merged PR #36 · Production OFF**. Preview challenge + live $0.05 E2E PASS; prod enable needs CDP keys + `DQL_X402_ENABLED` (explicit go, prefer after Stripe).
+11. ✅ Upstash daily-cap multi-instance — **merged PR #36 · unbound in Production**. Redis key = sha256(apiKey). Live dual-instance smoke when bound.
 
 ### P3 — Reliability debt (nur wenn capital/high-SLA)
 12. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)
@@ -97,27 +100,28 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 
 ## 3 Moves (wenn nur 3)
 
-1. **Cascade-Provenienz (#24)** — secondary error: Verdict behalten, `provider_error`/`circuit_rejected` setzen (fail-closed)
-2. **Ein Demo-Hostname** der auflöst (DNS oder Docs bereinigen)
-3. **Stripe an oder hard „invite-only key“** als ehrliche Public-Story — kein Halb-Gate
+1. **Ein Demo-Hostname** der auflöst (DNS oder Docs bereinigen)
+2. **Smoke-card** 2 feste Cases mit Receipt-IDs (ALLOW/BLOCK)
+3. **Monetarisierung nur mit eigenem Go:** Stripe first (controlled), then x402 prod canary — keep `SELF_SERVE_LIVE=false` until then
 
 ---
 
 ## Claim-Guard (Copy)
 
-**OK:** live DQL · 5 axes · nano→swift cascade · key-gated · sandbox free · consumer mandate check · objection-bound surface · main=prod `face93d7`
+**OK:** live DQL · 5 axes · nano→swift cascade · key-gated · sandbox free · consumer mandate check · objection-bound surface · main=prod `9f3c1b4` · P2 payment **code** deployed rails **off**
 
-**Nicht OK ohne Denominator/SHA:** „100% accurate“, „prevents bad actions“, „capital-path CB proven in prod“, „try.thoughtproof.ai live“, package `0.2.0` als Feature-Stand
+**Nicht OK ohne Denominator/SHA:** „100% accurate“, „prevents bad actions“, „capital-path CB proven in prod“, „try.thoughtproof.ai live“, package `0.2.0` als Feature-Stand, **„self-serve live“**, „x402/Stripe billing on“
 
 ---
 
-## Quellen (Check 2026-08-04, abends)
+## Quellen (Check 2026-08-14, abends)
 
-- Live: `dql.thoughtproof.ai/dql/health` → `commit_sha: face93d7affb3f56a13459075a53c466c0c4f08a`, schema `0.4.3.2-deadline-1` (Prod-Redeploy verifiziert)
-- Git: main=`face93d7` (PR #22 gemergt 2026-08-04, CI success run `30945813537` auf main; branch tip CI `30945662873`)
-- Cascade-Provenienz-Regression: [Issue #24](https://github.com/ThoughtProof/decision-quality-layer/issues/24) (reopens #13/#14 composition gap)
+- Live: `dql.thoughtproof.ai/dql/health` → `commit_sha: 9f3c1b4…`, schema `0.4.3.2-deadline-1` (PR #36 flag-off prod deploy verifiziert)
+- Git: main=`9f3c1b4` ([PR #36](https://github.com/ThoughtProof/decision-quality-layer/pull/36) gemergt 2026-08-14)
+- Payment docs: `docs/PAYMENT.md` · `SELF_SERVE_LIVE=false`
+- Preview x402 E2E proof: Basescan `0x2fc1c4a46e4219ac5bda23c907a3930d23ec08e9d1f2dbefcea0de7130f22ed6`
 - DNS fail: `try.thoughtproof.ai`, `guardian.thoughtproof.ai`
-- PWA: `guardian-pwa.vercel.app` → 200
+- PWA: `guardian-pwa.vercel.app` / `app.thoughtproof.ai` as applicable
 - Memory: Jul Kalibrierungsbogen · 28.07 objection-bind · PAYMENT.md Phase-2
 - ADSB/Blog: controlled autonomy / decision quality framing
 
