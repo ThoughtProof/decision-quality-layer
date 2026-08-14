@@ -96,6 +96,9 @@ Hard rules:
 2. **Stripe meter is awaited** (not fire-and-forget). Vercel drops dangling work after response.
 3. **No silent public facilitator fallback.** x402 requires CDP credentials **or** explicit `X402_FACILITATOR_URL`.
 4. **Hard timeouts** on facilitator + Stripe network calls; client errors sanitized.
+5. **Readiness before challenge.** Flag-on without facilitator readiness → `503 PAYMENT_UNAVAILABLE`, never a 402 challenge.
+6. **Unknown settlement ≠ not charged.** Timeout/connection-drop after settle request → `PAYMENT_STATUS_UNKNOWN` + reconcile id. Authoritative `success:false` → `PAYMENT_FAILED`.
+7. **Stripe price is Dashboard-side.** Meter event sends `value=1`; configure $0.05 on the Stripe Meter/Price object.
 
 | Rail | Status | Enable |
 |---|---|---|

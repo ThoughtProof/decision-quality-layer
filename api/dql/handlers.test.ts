@@ -546,6 +546,159 @@ describe('H2 — v0431_active rejects empty / partial per-alias CB entries', () 
 // sending the body, on every response path.
 // -----------------------------------------------------------------------------
 
+
+describe('PR #36 payment semantics hardening', () => {
+  const originalEnv = process.env;
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...originalEnv };
+    for (const k of Object.keys(process.env)) {
+      if (k.startsWith('DQL_') || k === 'SERV_API_KEY' || k === 'SERV_BASE_URL' || k.startsWith('X402_') || k.startsWith('STRIPE_')) {
+        delete process.env[k];
+      }
+    }
+  });
+  afterEach(() => {
+    process.env = originalEnv;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('invalid request → 400, no verify/settle network calls', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({}), text: async () => '', status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    process.env.DQL_X402_ENABLED = 'true';
+    process.env.X402_FACILITATOR_URL = 'https://fac.example';
+    const mod = await import('./verify.js');
+    const sig = Buffer.from(JSON.stringify({ network: 'base', payload: {} })).toString('base64');
+    const { req, res, state } = makeReqRes(
+      { not: 'a valid body' },
+      'POST',
+      { 'payment-signature': sig },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(400);
+    expect(state.jsonBody.code).toBe('INVALID_REQUEST');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('x402 enabled but not ready → 503, no payment-required challenge header', async () => {
+    process.env.DQL_X402_ENABLED = 'true';
+    // no CDP, no X402_FACILITATOR_URL
+    const mod = await import('./verify.js');
+    const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false });
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.code).toBe('PAYMENT_UNAVAILABLE');
+    expect(state.headers['payment-required']).toBeUndefined();
+  });
+
+  it('CONFIG_INVALID with x402 flag → 503 config, not challenge', async () => {
+    process.env.DQL_CASCADE = 'pot-cli';
+    process.env.DQL_X402_ENABLED = 'true';
+    process.env.X402_FACILITATOR_URL = 'https://fac.example';
+    const mod = await import('./verify.js');
+    const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: true });
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.code).toBe('CONFIG_INVALID');
+    expect(state.headers['payment-required']).toBeUndefined();
+  });
+
+  it('billable key awaits Stripe meter before handler ends', async () => {
+    let resolveFetch!: (v: any) => void;
+    const fetchPromise = new Promise((resolve) => {
+      resolveFetch = resolve;
+    });
+    let fetchStarted = false;
+    const fetchMock = vi.fn(async () => {
+      fetchStarted = true;
+      return fetchPromise;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    process.env.DQL_API_KEYS = JSON.stringify({
+      [DEV_KEY]: { owner: 'acme', dev_access: false, daily_cap: 1000 },
+    });
+    process.env.DQL_STRIPE_METER_ENABLED = 'true';
+    process.env.STRIPE_SECRET_KEY = 'sk_test_x';
+    process.env.DQL_STRIPE_CUSTOMER_MAP = JSON.stringify({ acme: 'cus_test123' });
+
+    const mod = await import('./verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      AUTH_HEADERS,
+    );
+
+    let finished = false;
+    const run = mod.default(req, res).then(() => {
+      finished = true;
+    });
+
+    // Allow microtasks to start the awaited meter call.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchStarted).toBe(true);
+    expect(finished).toBe(false); // still awaiting meter — not fire-and-forget
+
+    resolveFetch({
+      ok: true,
+      status: 200,
+      json: async () => ({ identifier: 'dql_ok' }),
+      text: async () => '',
+    });
+    await run;
+    expect(finished).toBe(true);
+    expect(state.statusCode).toBe(200);
+    expect(state.headers['X-DQL-Meter']).toBe('ok');
+    expect(fetchMock).toHaveBeenCalled();
+    const call0 = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(String(call0[0])).toContain('billing/meter_events');
+  });
+
+  it('x402 settle timeout after DQL → PAYMENT_STATUS_UNKNOWN, no not-charged claim', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes('/verify')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ isValid: true }),
+          text: async () => '',
+        };
+      }
+      if (String(url).includes('/settle')) {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    process.env.DQL_X402_ENABLED = 'true';
+    process.env.X402_FACILITATOR_URL = 'https://fac.example';
+
+    const mod = await import('./verify.js');
+    const sig = Buffer.from(
+      JSON.stringify({ network: 'base', payload: { authorization: { nonce: 'n-handler' } } }),
+    ).toString('base64');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'payment-signature': sig },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(502);
+    expect(state.jsonBody.code).toBe('PAYMENT_STATUS_UNKNOWN');
+    expect(JSON.stringify(state.jsonBody)).not.toMatch(/not charged/i);
+    expect(state.jsonBody.payment_id).toBe('n-handler');
+    // verify + settle attempted; DQL ran between them
+    const urls = fetchMock.mock.calls.map((c: any) => String(c[0]));
+    expect(urls.some((u: string) => u.includes('/verify'))).toBe(true);
+    expect(urls.some((u: string) => u.includes('/settle'))).toBe(true);
+  });
+});
+
 describe('H4 — sendJsonWithDiagnostics is wire-effective on every path', () => {
   const originalEnv = process.env;
   beforeEach(() => {

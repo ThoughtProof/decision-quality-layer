@@ -142,14 +142,14 @@ export async function emitStripeMeterEvent(opts: EmitStripeMeterOpts): Promise<S
       timeoutMs,
     );
     if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
+      // Never log Stripe response bodies (may contain account/customer details).
+      await resp.text().catch(() => '');
       console.warn(
         JSON.stringify({
           type: 'dql_stripe_meter_error',
           request_id: opts.requestId,
           owner: opts.owner,
           status: resp.status,
-          body: text.slice(0, 240),
           ts: new Date().toISOString(),
         }),
       );
@@ -170,11 +170,12 @@ export async function emitStripeMeterEvent(opts: EmitStripeMeterOpts): Promise<S
     );
     return { kind: 'ok', event_name: cfg.eventName, identifier: json.identifier ?? opts.requestId };
   } catch (err) {
+    // Coarse reason only — never raw err.message (may contain URLs/secrets).
     const reason =
       err instanceof Error && /aborted|timeout|AbortError/i.test(err.message)
         ? 'timeout'
-        : err instanceof Error
-          ? err.message
+        : err instanceof Error && /fetch failed|ECONN|ENOTFOUND|network/i.test(err.message)
+          ? 'network'
           : 'fetch_failed';
     console.warn(
       JSON.stringify({

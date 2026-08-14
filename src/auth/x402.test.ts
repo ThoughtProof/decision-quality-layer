@@ -3,9 +3,11 @@ import {
   buildX402Challenge,
   isX402Enabled,
   paymentWallet,
+  paymentReconcileId,
   processX402Payment,
   resolveFacilitatorUrl,
   sanitizePaymentClientError,
+  sanitizeServerLogReason,
   settleX402Payment,
   verifyX402Payment,
   type X402PaymentContext,
@@ -56,13 +58,36 @@ describe('resolveFacilitatorUrl', () => {
   });
 });
 
-describe('sanitizePaymentClientError', () => {
+describe('sanitizePaymentClientError / sanitizeServerLogReason', () => {
   it('maps timeout/network to clean client messages', () => {
     expect(sanitizePaymentClientError(new Error('The operation was aborted'))).toMatch(/timed out/i);
     expect(sanitizePaymentClientError(new Error('fetch failed'))).toMatch(/unreachable/i);
     expect(sanitizePaymentClientError(new Error('secret sk_live_xxx at host'))).toBe(
       'Payment facilitator error',
     );
+  });
+
+  it('server log reasons stay coarse (no secrets)', () => {
+    expect(sanitizeServerLogReason(new Error('The operation was aborted'))).toBe('timeout');
+    expect(sanitizeServerLogReason(new Error('fetch failed to https://secret.example'))).toBe(
+      'network',
+    );
+    expect(sanitizeServerLogReason(new Error('sk_live_xxx leaked'))).toBe('error');
+  });
+});
+
+describe('paymentReconcileId', () => {
+  it('prefers non-sensitive nonce/from fields', () => {
+    expect(
+      paymentReconcileId({
+        payload: { authorization: { from: '0xabc123', nonce: 'n-1' }, signature: 'sig' },
+      }),
+    ).toBe('n-1');
+  });
+
+  it('falls back to stable fingerprint without signatures', () => {
+    const id = paymentReconcileId({ network: 'base', scheme: 'exact' });
+    expect(id.startsWith('pay_')).toBe(true);
   });
 });
 
@@ -78,7 +103,6 @@ describe('buildX402Challenge', () => {
     expect(nets).toContain('base');
     expect(challenge.accepts[0]!.amount).toBe('50000'); // 0.05 * 1e6
     expect(paymentRequiredHeader.length).toBeGreaterThan(20);
-    // header is base64 of challenge
     const decoded = JSON.parse(Buffer.from(paymentRequiredHeader, 'base64').toString('utf8'));
     expect(decoded.x402Version).toBe(2);
   });
@@ -95,8 +119,20 @@ describe('verifyX402Payment / processX402Payment', () => {
     expect(r).toEqual({ kind: 'disabled' });
   });
 
-  it('enabled without signature → challenge', async () => {
+  it('flag on + no credentials + no signature → 503, not challenge', async () => {
     const r = await processX402Payment({ headers: {} } as any, { DQL_X402_ENABLED: 'true' });
+    expect(r.kind).toBe('reject');
+    if (r.kind === 'reject') {
+      expect(r.status).toBe(503);
+      expect(r.body.code).toBe('PAYMENT_UNAVAILABLE');
+    }
+  });
+
+  it('enabled + ready without signature → challenge', async () => {
+    const r = await processX402Payment(
+      { headers: {} } as any,
+      { DQL_X402_ENABLED: 'true', X402_FACILITATOR_URL: 'https://fac.example' },
+    );
     expect(r).toEqual({ kind: 'challenge' });
   });
 
@@ -194,7 +230,7 @@ describe('settleX402Payment', () => {
   });
 
   const ctx: X402PaymentContext = {
-    payload: { network: 'base', payload: { signature: 's' } },
+    payload: { network: 'base', payload: { signature: 's', authorization: { nonce: 'n-99' } } },
     paymentRequirements: {
       scheme: 'exact',
       network: 'base',
@@ -225,7 +261,7 @@ describe('settleX402Payment', () => {
     }
   });
 
-  it('settle failure does not claim paid', async () => {
+  it('authoritative success:false → PAYMENT_FAILED (not charged)', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => ({
@@ -238,7 +274,47 @@ describe('settleX402Payment', () => {
     const r = await settleX402Payment(ctx, {});
     expect(r.kind).toBe('reject');
     if (r.kind === 'reject') {
+      expect(r.body.code).toBe('PAYMENT_FAILED');
       expect(String(r.body.details)).toMatch(/not charged/i);
+      expect(r.body.payment_id).toBe('n-99');
+    }
+  });
+
+  it('settle timeout → PAYMENT_STATUS_UNKNOWN (never claims not charged)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      }),
+    );
+    const r = await settleX402Payment(ctx, {});
+    expect(r.kind).toBe('reject');
+    if (r.kind === 'reject') {
+      expect(r.status).toBe(502);
+      expect(r.body.code).toBe('PAYMENT_STATUS_UNKNOWN');
+      expect(JSON.stringify(r.body)).not.toMatch(/not charged/i);
+      expect(String(r.body.details)).toMatch(/Reconcile/i);
+      expect(r.body.payment_id).toBe('n-99');
+    }
+  });
+
+  it('settle HTTP error before accept → PAYMENT_UNAVAILABLE', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 503,
+        json: async () => ({}),
+        text: async () => 'service unavailable secret',
+      })),
+    );
+    const r = await settleX402Payment(ctx, {});
+    expect(r.kind).toBe('reject');
+    if (r.kind === 'reject') {
+      expect(r.body.code).toBe('PAYMENT_UNAVAILABLE');
+      expect(JSON.stringify(r.body)).not.toMatch(/secret|not charged/i);
     }
   });
 });

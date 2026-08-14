@@ -133,6 +133,61 @@ export function sanitizePaymentClientError(err: unknown): string {
   return 'Payment facilitator error';
 }
 
+/** Sanitize server-side log reasons — no raw secrets/hosts/stacks. */
+export function sanitizeServerLogReason(err: unknown): string {
+  const raw = err instanceof Error ? `${err.name}:${err.message}` : String(err);
+  if (/aborted|timeout|TimeoutError|AbortError/i.test(raw)) return 'timeout';
+  if (/fetch failed|ECONN|ENOTFOUND|network|EAI_AGAIN|socket hang up/i.test(raw)) {
+    return 'network';
+  }
+  // Keep only a coarse class token; never the full message.
+  return 'error';
+}
+
+/**
+ * Non-sensitive payment identifier for reconcile logs.
+ * Prefer payload nonce/authorization hash fields; never log signatures.
+ */
+export function paymentReconcileId(payload: Record<string, unknown>): string {
+  const nested =
+    payload.payload && typeof payload.payload === 'object'
+      ? (payload.payload as Record<string, unknown>)
+      : {};
+  const auth =
+    nested.authorization && typeof nested.authorization === 'object'
+      ? (nested.authorization as Record<string, unknown>)
+      : {};
+  const candidates = [
+    payload.nonce,
+    nested.nonce,
+    auth.nonce,
+    auth.from,
+    nested.from,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) {
+      // Truncate addresses/ids; never store full signature material.
+      return c.trim().slice(0, 42);
+    }
+  }
+  // Stable short fingerprint over non-signature fields only.
+  const safe = JSON.stringify({
+    network: payload.network ?? null,
+    scheme: payload.scheme ?? null,
+    accepted:
+      payload.accepted && typeof payload.accepted === 'object'
+        ? {
+            network: (payload.accepted as Record<string, unknown>).network ?? null,
+            amount: (payload.accepted as Record<string, unknown>).amount ?? null,
+          }
+        : null,
+  });
+  // Lightweight djb2 — avoid importing crypto just for a log id.
+  let h = 5381;
+  for (let i = 0; i < safe.length; i++) h = ((h << 5) + h) ^ safe.charCodeAt(i);
+  return `pay_${(h >>> 0).toString(16)}`;
+}
+
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
@@ -170,13 +225,12 @@ async function facilitatorVerify(
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
-    // Do not echo facilitator body to client path — log server-side only.
-    const text = await resp.text().catch(() => '');
+    // Never log facilitator response bodies (may contain sensitive payment details).
+    await resp.text().catch(() => '');
     console.warn(
       JSON.stringify({
         type: 'dql_x402_verify_http_error',
         status: resp.status,
-        body: text.slice(0, 240),
         ts: new Date().toISOString(),
       }),
     );
@@ -185,13 +239,18 @@ async function facilitatorVerify(
   return (await resp.json()) as { isValid: boolean; invalidReason?: string };
 }
 
+type FacilitatorSettleOutcome =
+  | { outcome: 'success'; success: true; txHash?: string; network?: string }
+  | { outcome: 'failed'; success: false; error?: string }
+  | { outcome: 'http_error'; success: false; error?: string };
+
 async function facilitatorSettle(
   payload: unknown,
   paymentRequirements: unknown,
   env: NodeJS.ProcessEnv,
   baseUrl: string,
   mode: 'cdp' | 'explicit',
-): Promise<{ success: boolean; txHash?: string; network?: string; error?: string }> {
+): Promise<FacilitatorSettleOutcome> {
   const cdp = mode === 'cdp' && hasCdpCredentials(env);
   const req = paymentRequirements as Record<string, unknown>;
   const body = cdp
@@ -208,23 +267,38 @@ async function facilitatorSettle(
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
+    // Never log facilitator response bodies.
+    await resp.text().catch(() => '');
     console.warn(
       JSON.stringify({
         type: 'dql_x402_settle_http_error',
         status: resp.status,
-        body: text.slice(0, 240),
         ts: new Date().toISOString(),
       }),
     );
-    return { success: false, error: `Facilitator settle failed (HTTP ${resp.status})` };
+    // HTTP failure before an accepted settle response — unavailable, not unknown.
+    return {
+      outcome: 'http_error',
+      success: false,
+      error: `Facilitator settle failed (HTTP ${resp.status})`,
+    };
   }
   const raw = (await resp.json()) as Record<string, unknown>;
+  if (raw.success === true) {
+    return {
+      outcome: 'success',
+      success: true,
+      txHash: (raw.transaction ?? raw.txHash) as string | undefined,
+      network: raw.network as string | undefined,
+    };
+  }
+  // Authoritative facilitator rejection after accepted request.
   return {
-    success: raw.success === true,
-    txHash: (raw.transaction ?? raw.txHash) as string | undefined,
-    network: raw.network as string | undefined,
-    error: (raw.error ?? raw.errorReason ?? raw.errorMessage) as string | undefined,
+    outcome: 'failed',
+    success: false,
+    error: typeof (raw.error ?? raw.errorReason ?? raw.errorMessage) === 'string'
+      ? String(raw.error ?? raw.errorReason ?? raw.errorMessage)
+      : 'settlement_rejected',
   };
 }
 
@@ -384,15 +458,13 @@ export async function verifyX402Payment(
 ): Promise<X402VerifyResult> {
   if (!isX402Enabled(env)) return { kind: 'disabled' };
 
-  const paymentSig = req.headers['payment-signature'] as string | undefined;
-  if (!paymentSig) return { kind: 'challenge' };
-
+  // Readiness BEFORE challenge: never advertise a payment path that cannot settle.
   const fac = resolveFacilitatorUrl(env);
   if (!fac.ok) {
     console.error(
       JSON.stringify({
         type: 'dql_x402_misconfigured',
-        reason: fac.reason,
+        reason: 'facilitator_not_ready',
         ts: new Date().toISOString(),
       }),
     );
@@ -400,11 +472,14 @@ export async function verifyX402Payment(
       kind: 'reject',
       status: 503,
       body: {
-        error: 'Payment rail misconfigured',
+        error: 'Payment rail unavailable',
         code: 'PAYMENT_UNAVAILABLE',
       },
     };
   }
+
+  const paymentSig = req.headers['payment-signature'] as string | undefined;
+  if (!paymentSig) return { kind: 'challenge' };
 
   const parsed = parsePaymentSignature(paymentSig);
   if (!parsed.ok) return parsed.result;
@@ -425,7 +500,8 @@ export async function verifyX402Payment(
     console.warn(
       JSON.stringify({
         type: 'dql_x402_verify_error',
-        reason: err instanceof Error ? err.message : String(err),
+        reason: sanitizeServerLogReason(err),
+        payment_id: paymentReconcileId(parsed.payload),
         ts: new Date().toISOString(),
       }),
     );
@@ -473,7 +549,8 @@ export async function settleX402Payment(
   ctx: X402PaymentContext,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<X402SettleResult> {
-  let settlement: { success: boolean; txHash?: string; network?: string; error?: string };
+  const paymentId = paymentReconcileId(ctx.payload);
+  let settlement: FacilitatorSettleOutcome;
   try {
     settlement = await facilitatorSettle(
       ctx.payload,
@@ -483,10 +560,59 @@ export async function settleX402Payment(
       ctx.facilitatorMode,
     );
   } catch (err) {
+    // Timeout / connection drop AFTER request may mean chain already settled.
+    // Never claim "not charged" when outcome is technically unknown.
+    const unknown = /aborted|timeout|TimeoutError|AbortError|fetch failed|ECONN|network|socket hang up/i.test(
+      err instanceof Error ? err.message : String(err),
+    );
     console.warn(
       JSON.stringify({
         type: 'dql_x402_settle_error',
-        reason: err instanceof Error ? err.message : String(err),
+        reason: sanitizeServerLogReason(err),
+        payment_id: paymentId,
+        outcome: unknown ? 'unknown' : 'error',
+        ts: new Date().toISOString(),
+      }),
+    );
+    if (unknown) {
+      return {
+        kind: 'reject',
+        status: 502,
+        body: {
+          error: 'Payment settlement status unknown',
+          code: 'PAYMENT_STATUS_UNKNOWN',
+          details:
+            'Do not retry the payment blindly. Reconcile using the payment identifier.',
+          payment_id: paymentId,
+        },
+      };
+    }
+    return {
+      kind: 'reject',
+      status: 502,
+      body: {
+        error: sanitizePaymentClientError(err),
+        code: 'PAYMENT_UNAVAILABLE',
+        details: 'Settlement request could not be completed; reconcile if unsure.',
+        payment_id: paymentId,
+      },
+    };
+  }
+
+  if (settlement.outcome === 'success') {
+    return {
+      kind: 'settled',
+      txHash: settlement.txHash,
+      network: settlement.network ?? ctx.clientNetwork,
+    };
+  }
+
+  if (settlement.outcome === 'http_error') {
+    // HTTP error before accepted settle response — unavailable, not a charge claim.
+    console.warn(
+      JSON.stringify({
+        type: 'dql_x402_settle_http_error_outcome',
+        payment_id: paymentId,
         ts: new Date().toISOString(),
       }),
     );
@@ -494,30 +620,31 @@ export async function settleX402Payment(
       kind: 'reject',
       status: 502,
       body: {
-        error: sanitizePaymentClientError(err),
+        error: 'Payment settlement unavailable',
         code: 'PAYMENT_UNAVAILABLE',
-        // DQL already ran; settle failed — do not claim paid.
-        details: 'Verification completed but settlement failed; not charged',
+        details: 'Settlement request was not accepted; reconcile if unsure.',
+        payment_id: paymentId,
       },
     };
   }
 
-  if (!settlement.success) {
-    return {
-      kind: 'reject',
-      status: 402,
-      body: {
-        error: 'Settlement failed',
-        code: 'PAYMENT_REQUIRED',
-        details: 'Verification completed but settlement failed; not charged',
-      },
-    };
-  }
-
+  // Authoritative success:false from facilitator.
+  console.warn(
+    JSON.stringify({
+      type: 'dql_x402_settle_failed',
+      payment_id: paymentId,
+      ts: new Date().toISOString(),
+    }),
+  );
   return {
-    kind: 'settled',
-    txHash: settlement.txHash,
-    network: settlement.network ?? ctx.clientNetwork,
+    kind: 'reject',
+    status: 402,
+    body: {
+      error: 'Payment settlement failed',
+      code: 'PAYMENT_FAILED',
+      details: 'Facilitator rejected settlement; not charged.',
+      payment_id: paymentId,
+    },
   };
 }
 
