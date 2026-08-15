@@ -34,7 +34,11 @@ import { StubCascade } from '../../src/engine/cascade.js';
 import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
 import { authorizeCall, extractApiKey, parseApiKeys } from '../../src/auth/keys.js';
-import { authorizeVerifyWithAccount, extractAccountToken } from '../../src/auth/account.js';
+import {
+  authorizeVerifyWithAccount,
+  extractAccountToken,
+  settleVerifyWithAccount,
+} from '../../src/auth/account.js';
 import { createKeyStore } from '../../src/auth/key-store.js';
 import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
 import { emitStripeMeterEvent, loadStripeMeterConfig } from '../../src/auth/stripe-meter.js';
@@ -196,7 +200,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               kind: 'allow';
               key: string;
               record: import('../../src/auth/keys.js').ApiKeyRecord;
-              billing: import('../../src/auth/keys.js').AllowBilling;
+              billing?: import('../../src/auth/keys.js').AllowBilling;
+              via?: 'key' | 'account';
             }
           | { kind: 'x402_verified'; ctx: X402PaymentContext }
           | { kind: 'deny'; status: number; payload: object };
@@ -252,12 +257,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             const auth = await authorizeVerifyWithAccount({
               headers,
               store: KEY_STORE,
-              usage: USAGE_GATE,
             });
             if (auth.kind === 'deny') {
               authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
             } else if (auth.kind === 'allow') {
-              authPath = { kind: 'allow', key: auth.key, record: auth.record, billing: auth.billing };
+              authPath = {
+                kind: 'allow',
+                key: auth.key,
+                record: auth.record,
+                via: 'account',
+              };
             } else {
               authPath = { kind: 'free_sandbox' };
             }
@@ -342,6 +351,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
           // 4) Payment settle / Stripe meter ONLY after successful DQL.
           if (authPath.kind === 'allow') {
+            if (authPath.via === 'account') {
+              if (!KEY_STORE) {
+                status = 503;
+                payload = {
+                  error: 'Account store unavailable',
+                  code: 'ACCOUNT_UNAVAILABLE',
+                };
+              } else {
+                const settled = await settleVerifyWithAccount({
+                  keyHash: authPath.key,
+                  record: authPath.record,
+                  store: KEY_STORE,
+                  usage: USAGE_GATE,
+                });
+                if (settled.kind === 'deny') {
+                  status = settled.status;
+                  payload = settled.payload;
+                } else if (settled.kind === 'allow') {
+                  authPath = {
+                    kind: 'allow',
+                    key: settled.key,
+                    record: settled.record,
+                    billing: settled.billing,
+                    via: 'account',
+                  };
+                }
+              }
+            }
+          }
+
+          if (authPath.kind === 'allow' && status === 200 && payload === null) {
             const price = priceForCall({
               sandbox: false,
               dev_access: authPath.record.dev_access,
@@ -431,13 +471,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               status = 200;
               payload = response;
             }
-          } else {
-            // sandbox
+          } else if (authPath.kind === 'free_sandbox') {
             res.setHeader('X-DQL-Billing', 'sandbox');
             res.setHeader('X-DQL-Price-Usd', '0.00');
             status = 200;
             payload = response;
           }
+          // Account settle deny (402/429/503) already set status+payload. Do not overwrite.
         }
       }
     }

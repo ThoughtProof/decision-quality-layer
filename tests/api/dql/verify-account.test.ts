@@ -13,6 +13,7 @@ import { STARTER_CREDITS } from '../../../src/auth/packs.js';
 
 const harness = vi.hoisted(() => ({
   store: null as InstanceType<typeof UpstashKeyStore> | null,
+  failVerify: false,
 }));
 
 vi.mock('../../../src/auth/key-store.js', async (importOriginal) => {
@@ -20,6 +21,17 @@ vi.mock('../../../src/auth/key-store.js', async (importOriginal) => {
   return {
     ...actual,
     createKeyStore: () => harness.store,
+  };
+});
+
+vi.mock('../../../src/engine/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/engine/index.js')>();
+  return {
+    ...actual,
+    runVerification: async (opts: Parameters<typeof actual.runVerification>[0]) => {
+      if (harness.failVerify) throw new Error('provider down');
+      return actual.runVerification(opts);
+    },
   };
 });
 
@@ -77,11 +89,13 @@ describe('POST /dql/verify — account token (dqla_)', () => {
       }
     }
     harness.store = new UpstashKeyStore(createMemoryKv());
+    harness.failVerify = false;
   });
 
   afterEach(() => {
     process.env = originalEnv;
     harness.store = null;
+    harness.failVerify = false;
   });
 
   async function mintStarter() {
@@ -222,6 +236,59 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     await mod.default(afterRevoke.req, afterRevoke.res);
     expect(afterRevoke.state.statusCode).toBe(401);
     expect(afterRevoke.state.jsonBody.code).toBe('ACCOUNT_UNAUTHORIZED');
+  });
+
+  it('CONFIG_INVALID after valid dqla_ leaves credits unchanged', async () => {
+    process.env.DQL_CASCADE = 'pot-cli';
+    const minted = await mintStarter();
+    const before = await harness.store!.creditBalance(sha256Hex(minted.plaintext));
+    expect(before).toBe(STARTER_CREDITS);
+
+    const mod = await import('../../../api/dql/verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'x-dql-account': minted.accountToken },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.code).toBe('CONFIG_INVALID');
+    expect(JSON.stringify(state.jsonBody)).not.toContain(minted.plaintext);
+    expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
+    expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+  });
+
+  it('thrown verify after valid dqla_ leaves credits unchanged', async () => {
+    harness.failVerify = true;
+    const minted = await mintStarter();
+    const mod = await import('../../../api/dql/verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'x-dql-account': minted.accountToken },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(500);
+    expect(state.jsonBody.code).toBe('INTERNAL_ERROR');
+    expect(JSON.stringify(state.jsonBody)).not.toContain(minted.plaintext);
+    expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
+    expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+  });
+
+  it('exhausted credits 402 when billing happens after success', async () => {
+    const minted = await mintStarter();
+    await harness.store!.setCreditBalance(sha256Hex(minted.plaintext), 0);
+    const mod = await import('../../../api/dql/verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'x-dql-account': minted.accountToken },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(402);
+    expect(state.jsonBody.code).toBe('CREDITS_EXHAUSTED');
+    expect(state.jsonBody.axes).toBeUndefined();
+    expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(0);
   });
 
   it('CORS allows X-DQL-Account', async () => {

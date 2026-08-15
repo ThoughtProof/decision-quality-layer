@@ -129,7 +129,8 @@ export type AuthDecision =
       kind: 'allow';
       key: string;
       record: ApiKeyRecord;
-      billing: AllowBilling;
+      /** Set after settle. Account auth is identity-only until post-verify settle. */
+      billing?: AllowBilling;
       /** `account` = authorized via `dqla_…` (log `key` is the stored hash, never a secret). */
       via?: 'key' | 'account';
     }

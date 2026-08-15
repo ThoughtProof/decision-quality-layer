@@ -80,13 +80,14 @@ const ACCOUNT_UNAUTHORIZED: AuthDecision = {
 
 /**
  * Authorize `POST /dql/verify` with the post-purchase account token.
- * Resolves `dqla_…` → live key hash / credit ledger. Never returns `dqlk_…`.
- * Missing/invalid/revoked → 401. Exhausted credits → existing 402.
+ * Identity only: valid `dqla_…` + live (non-revoked) key hash.
+ * Does not consume credits or increment daily-cap — that is
+ * `settleVerifyWithAccount` after a successful `runVerification()`.
+ * Missing/invalid/revoked → 401. Never returns `dqlk_…`.
  */
 export async function authorizeVerifyWithAccount(opts: {
   headers: HeaderMap;
   store: KeyStore;
-  usage: UsageGate;
 }): Promise<AuthDecision> {
   const token = extractAccountToken(opts.headers);
   if (!token) return ACCOUNT_UNAUTHORIZED;
@@ -94,25 +95,49 @@ export async function authorizeVerifyWithAccount(opts: {
   const stored = await opts.store.lookupByAccountToken(token);
   if (!stored || stored.revoked === true) return ACCOUNT_UNAUTHORIZED;
 
-  const record = storedToAuthRecord(stored);
+  return {
+    kind: 'allow',
+    key: stored.hash,
+    record: storedToAuthRecord(stored),
+    via: 'account',
+  };
+}
+
+/**
+ * Book daily-cap + prepaid credit after a successful verify.
+ * Same 429 / 402 / 503 outcomes as the previous in-auth booking.
+ * Call only after `runVerification()` returns; never on CONFIG_INVALID / throw.
+ */
+export async function settleVerifyWithAccount(opts: {
+  keyHash: string;
+  record: import('./keys.js').ApiKeyRecord;
+  store: KeyStore;
+  usage: UsageGate;
+}): Promise<AuthDecision> {
   const withinCap = opts.usage.checkAndRecordFromHash
-    ? await opts.usage.checkAndRecordFromHash(stored.hash, stored.daily_cap)
-    : await opts.usage.checkAndRecord(stored.hash, stored.daily_cap);
+    ? await opts.usage.checkAndRecordFromHash(opts.keyHash, opts.record.daily_cap)
+    : await opts.usage.checkAndRecord(opts.keyHash, opts.record.daily_cap);
   if (!withinCap) {
     return {
       kind: 'deny',
       status: 429,
       payload: {
-        error: `Daily cap of ${stored.daily_cap} calls exceeded for this key.`,
+        error: `Daily cap of ${opts.record.daily_cap} calls exceeded for this key.`,
         code: 'QUOTA_EXCEEDED',
         retry_after: 'next UTC day',
       },
     };
   }
 
-  const spent = await opts.store.consumeCredit(stored.hash);
+  const spent = await opts.store.consumeCredit(opts.keyHash);
   if (spent === 'consumed') {
-    return { kind: 'allow', key: stored.hash, record, billing: 'credit', via: 'account' };
+    return {
+      kind: 'allow',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: 'credit',
+      via: 'account',
+    };
   }
   if (spent === 'error') {
     return {
@@ -125,8 +150,14 @@ export async function authorizeVerifyWithAccount(opts: {
       },
     };
   }
-  if (record.payg_opt_in === true) {
-    return { kind: 'allow', key: stored.hash, record, billing: 'payg', via: 'account' };
+  if (opts.record.payg_opt_in === true) {
+    return {
+      kind: 'allow',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: 'payg',
+      via: 'account',
+    };
   }
   return {
     kind: 'deny',

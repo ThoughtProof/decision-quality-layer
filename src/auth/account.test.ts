@@ -9,6 +9,7 @@ import {
   maskEmail,
   revokeAccountKey,
   rotateAccountKey,
+  settleVerifyWithAccount,
 } from './account.js';
 import {
   finalizeCheckoutMint,
@@ -195,31 +196,83 @@ describe('reveal + account surface', () => {
     const allowed = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': minted.accountToken },
       store,
-      usage: allowGate,
     });
     expect(allowed.kind).toBe('allow');
     if (allowed.kind !== 'allow') return;
     expect(allowed.via).toBe('account');
-    expect(allowed.billing).toBe('credit');
+    expect(allowed.billing).toBeUndefined();
     expect(allowed.record.stripe_customer_id).toBe('cus_vfy');
     expect(allowed.key).toBe(sha256Hex(minted.plaintext));
     expect(allowed.key).not.toBe(minted.plaintext);
     expect(allowed.key).not.toBe(minted.accountToken);
     expect(JSON.stringify(allowed)).not.toContain(minted.plaintext);
     expect(JSON.stringify(allowed)).not.toContain(minted.accountToken);
+    // Auth is identity-only — credits stay put until settle after success.
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+
+    const settled = await settleVerifyWithAccount({
+      keyHash: allowed.key,
+      record: allowed.record,
+      store,
+      usage: allowGate,
+    });
+    expect(settled.kind).toBe('allow');
+    if (settled.kind === 'allow') expect(settled.billing).toBe('credit');
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
 
     const viaBearer = await authorizeVerifyWithAccount({
       headers: { authorization: `Bearer ${minted.accountToken}` },
       store,
-      usage: allowGate,
     });
     expect(viaBearer.kind).toBe('allow');
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
+    if (viaBearer.kind === 'allow') {
+      await settleVerifyWithAccount({
+        keyHash: viaBearer.key,
+        record: viaBearer.record,
+        store,
+        usage: allowGate,
+      });
+    }
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 2);
 
     expect(logs.join('\n')).not.toContain(minted.plaintext);
     expect(logs.join('\n')).not.toContain(minted.accountToken);
     spy.mockRestore();
+  });
+
+  it('authorizeVerifyWithAccount does not consume credits or daily-cap', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_noident',
+      customerId: 'cus_noident',
+      owner: selfServeOwner('cus_noident'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+
+    const denyGate: UsageGate = { checkAndRecord: async () => false };
+    const auth = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(auth.kind).toBe('allow');
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+
+    // Daily-cap brake is settle-only; a deny gate must not have been consulted at auth.
+    if (auth.kind === 'allow') {
+      const blocked = await settleVerifyWithAccount({
+        keyHash: auth.key,
+        record: auth.record,
+        store,
+        usage: denyGate,
+      });
+      expect(blocked.kind).toBe('deny');
+      if (blocked.kind === 'deny') expect(blocked.status).toBe(429);
+    }
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
   });
 
   it('verify with invalid/missing dqla_ is 401; dqla_ as X-DQL-Key stays 402', async () => {
@@ -237,7 +290,6 @@ describe('reveal + account surface', () => {
     const missing = await authorizeVerifyWithAccount({
       headers: {},
       store,
-      usage: allowGate,
     });
     expect(missing.kind).toBe('deny');
     if (missing.kind === 'deny') {
@@ -248,7 +300,6 @@ describe('reveal + account surface', () => {
     const bogus = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': 'dqla_not_a_real_token' },
       store,
-      usage: allowGate,
     });
     expect(bogus.kind).toBe('deny');
     if (bogus.kind === 'deny') expect(bogus.status).toBe(401);
@@ -281,12 +332,30 @@ describe('reveal + account surface', () => {
     const ok = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': minted.accountToken },
       store,
-      usage: allowGate,
     });
     expect(ok.kind).toBe('allow');
+    if (ok.kind !== 'allow') return;
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(1);
 
-    const stop = await authorizeVerifyWithAccount({
+    const first = await settleVerifyWithAccount({
+      keyHash: ok.key,
+      record: ok.record,
+      store,
+      usage: allowGate,
+    });
+    expect(first.kind).toBe('allow');
+    if (first.kind === 'allow') expect(first.billing).toBe('credit');
+
+    const stillIdentified = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(stillIdentified.kind).toBe('allow');
+    if (stillIdentified.kind !== 'allow') return;
+
+    const stop = await settleVerifyWithAccount({
+      keyHash: stillIdentified.key,
+      record: stillIdentified.record,
       store,
       usage: allowGate,
     });
@@ -336,13 +405,19 @@ describe('reveal + account surface', () => {
     const afterRotate = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': minted.accountToken },
       store,
-      usage: allowGate,
     });
     expect(afterRotate.kind).toBe('allow');
-    if (afterRotate.kind === 'allow') {
-      expect(afterRotate.key).toBe(sha256Hex(rotated.api_key));
-      expect(afterRotate.billing).toBe('credit');
-    }
+    if (afterRotate.kind !== 'allow') return;
+    expect(afterRotate.key).toBe(sha256Hex(rotated.api_key));
+    expect(await store.creditBalance(sha256Hex(rotated.api_key))).toBe(STARTER_CREDITS);
+    const settledRotate = await settleVerifyWithAccount({
+      keyHash: afterRotate.key,
+      record: afterRotate.record,
+      store,
+      usage: allowGate,
+    });
+    expect(settledRotate.kind).toBe('allow');
+    if (settledRotate.kind === 'allow') expect(settledRotate.billing).toBe('credit');
     expect(await store.creditBalance(sha256Hex(rotated.api_key))).toBe(STARTER_CREDITS - 1);
 
     const live = await authorizeAccount({
@@ -357,7 +432,6 @@ describe('reveal + account surface', () => {
     const afterRevoke = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': minted.accountToken },
       store,
-      usage: allowGate,
     });
     expect(afterRevoke.kind).toBe('deny');
     if (afterRevoke.kind === 'deny') {
