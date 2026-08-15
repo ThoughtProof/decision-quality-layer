@@ -16,9 +16,11 @@
  *   dql:credit-ledger:<sha256hex> → { grants: CreditGrant[] }
  *   dql:trial-email:<sha256(email)> → claim marker
  *   dql:trial-fp:<card_fingerprint> → claim marker
+ *   dql:account:<sha256(dqla_…)>    → live key hash (account session; hash only)
  *
  * Usage counters stay on `dql:usage:<sha256[:24]>:<day>` (src/auth/usage.ts).
  * Credits and daily-cap are both enforced; namespaces do not collide.
+ * Account tokens (`dqla_…`) are never stored in plaintext — hash only.
  */
 
 import { Redis } from '@upstash/redis';
@@ -26,6 +28,7 @@ import { Redis } from '@upstash/redis';
 import { DEFAULT_DAILY_CAP, type ApiKeyRecord } from './keys.js';
 import { keyDisplayPrefix, sha256Hex } from './key-hash.js';
 import type { CheckoutPack } from './packs.js';
+import { usageCounterKeyFromHash } from './usage.js';
 
 export const KEY_RECORD_PREFIX = 'dql:key:';
 export const OWNER_CUS_PREFIX = 'dql:owner-cus:';
@@ -37,6 +40,7 @@ export const CREDITS_PREFIX = 'dql:credits:';
 export const CREDIT_LEDGER_PREFIX = 'dql:credit-ledger:';
 export const TRIAL_EMAIL_PREFIX = 'dql:trial-email:';
 export const TRIAL_FP_PREFIX = 'dql:trial-fp:';
+export const ACCOUNT_PREFIX = 'dql:account:';
 
 export const REVEAL_TTL_SEC = 15 * 60;
 export const MINT_LOCK_TTL_SEC = 60;
@@ -56,6 +60,8 @@ export interface StoredKeyRecord {
   /** True if this key ever received a trial grant (distinct from paid packs). */
   trial: boolean;
   email_normalized?: string;
+  /** sha256 of the one-time-issued `dqla_…` account session. Never plaintext. */
+  account_token_hash?: string;
 }
 
 export type CheckoutFulfillStatus =
@@ -96,6 +102,8 @@ export interface CreditLedgerRecord {
 
 export interface RevealPayload {
   key: string;
+  /** Plaintext `dqla_…` — only inside the short-TTL reveal slot, consumed once. */
+  account_token?: string;
 }
 
 export interface KvStore {
@@ -125,15 +133,21 @@ export interface KeyStore {
   putCustomerKey(customerId: string, keyHash: string): Promise<void>;
   getCheckout(sessionId: string): Promise<CheckoutMintState | null>;
   putCheckout(state: CheckoutMintState): Promise<void>;
-  putReveal(token: string, plaintextKey: string, ttlSec?: number): Promise<void>;
-  consumeReveal(token: string): Promise<string | null>;
+  putReveal(token: string, payload: RevealPayload, ttlSec?: number): Promise<void>;
+  consumeReveal(token: string): Promise<RevealPayload | null>;
   acquireMintLock(sessionId: string): Promise<boolean>;
   consumeCredit(keyHash: string): Promise<ConsumeCreditResult>;
   addCredits(keyHash: string, amount: number): Promise<number>;
   creditBalance(keyHash: string): Promise<number>;
+  setCreditBalance(keyHash: string, amount: number): Promise<void>;
+  moveCredits(fromHash: string, toHash: string): Promise<number>;
+  moveCreditLedger(fromHash: string, toHash: string): Promise<void>;
   recordCreditGrant(keyHash: string, grant: CreditGrant): Promise<void>;
   getCreditLedger(keyHash: string): Promise<CreditLedgerRecord | null>;
   claimTrial(emailNormalized: string, cardFingerprint: string): Promise<TrialClaimResult>;
+  putAccountIndex(accountTokenHash: string, keyHash: string): Promise<void>;
+  lookupByAccountToken(plaintextToken: string): Promise<StoredKeyRecord | null>;
+  usageToday(keyHash: string, now?: Date): Promise<number>;
 }
 
 function asRecord(v: unknown): StoredKeyRecord | null {
@@ -168,6 +182,7 @@ function asRecord(v: unknown): StoredKeyRecord | null {
     payg_opt_in: r.payg_opt_in === true,
     trial: r.trial === true,
     email_normalized: typeof r.email_normalized === 'string' ? r.email_normalized : undefined,
+    account_token_hash: typeof r.account_token_hash === 'string' ? r.account_token_hash : undefined,
   };
 }
 
@@ -258,24 +273,24 @@ function asLedger(v: unknown): CreditLedgerRecord | null {
   return { grants };
 }
 
-function asReveal(v: unknown): string | null {
+function asReveal(v: unknown): RevealPayload | null {
   if (v == null) return null;
   if (typeof v === 'string') {
-    if (v.startsWith('dqlk_')) return v;
+    if (v.startsWith('dqlk_')) return { key: v };
     try {
-      const parsed = JSON.parse(v) as unknown;
-      if (typeof parsed === 'object' && parsed && typeof (parsed as RevealPayload).key === 'string') {
-        return (parsed as RevealPayload).key;
-      }
+      return asReveal(JSON.parse(v) as unknown);
     } catch {
       return null;
     }
-    return null;
   }
-  if (typeof v === 'object' && typeof (v as RevealPayload).key === 'string') {
-    return (v as RevealPayload).key;
-  }
-  return null;
+  if (typeof v !== 'object') return null;
+  const key = (v as RevealPayload).key;
+  if (typeof key !== 'string' || !key.startsWith('dqlk_')) return null;
+  const token = (v as RevealPayload).account_token;
+  return {
+    key,
+    account_token: typeof token === 'string' && token.startsWith('dqla_') ? token : undefined,
+  };
 }
 
 function customerId(v: unknown): string | undefined {
@@ -336,13 +351,11 @@ export class UpstashKeyStore implements KeyStore {
     await this.kv.set(`${CHECKOUT_PREFIX}${state.session_id}`, state);
   }
 
-  async putReveal(token: string, plaintextKey: string, ttlSec: number = REVEAL_TTL_SEC): Promise<void> {
-    await this.kv.set(`${REVEAL_PREFIX}${token}`, { key: plaintextKey } satisfies RevealPayload, {
-      ex: ttlSec,
-    });
+  async putReveal(token: string, payload: RevealPayload, ttlSec: number = REVEAL_TTL_SEC): Promise<void> {
+    await this.kv.set(`${REVEAL_PREFIX}${token}`, payload, { ex: ttlSec });
   }
 
-  async consumeReveal(token: string): Promise<string | null> {
+  async consumeReveal(token: string): Promise<RevealPayload | null> {
     const redisKey = `${REVEAL_PREFIX}${token}`;
     if (this.kv.getdel) {
       return asReveal(await this.kv.getdel(redisKey));
@@ -398,6 +411,56 @@ export class UpstashKeyStore implements KeyStore {
     if (!keyHash) return 0;
     try {
       return Math.max(0, asInt(await this.kv.get(`${CREDITS_PREFIX}${keyHash}`)));
+    } catch {
+      return 0;
+    }
+  }
+
+  async setCreditBalance(keyHash: string, amount: number): Promise<void> {
+    if (!keyHash) return;
+    await this.kv.set(`${CREDITS_PREFIX}${keyHash}`, Math.max(0, Math.floor(amount)));
+  }
+
+  async moveCredits(fromHash: string, toHash: string): Promise<number> {
+    const bal = await this.creditBalance(fromHash);
+    if (fromHash && fromHash !== toHash) await this.setCreditBalance(fromHash, 0);
+    if (bal > 0 && toHash) return this.addCredits(toHash, bal);
+    return this.creditBalance(toHash);
+  }
+
+  async moveCreditLedger(fromHash: string, toHash: string): Promise<void> {
+    if (!fromHash || !toHash || fromHash === toHash) return;
+    const ledger = await this.getCreditLedger(fromHash);
+    if (!ledger) return;
+    const destKey = `${CREDIT_LEDGER_PREFIX}${toHash}`;
+    const existing = asLedger(await this.kv.get(destKey)) ?? { grants: [] };
+    existing.grants.push(...ledger.grants);
+    await this.kv.set(destKey, existing);
+    await this.kv.del(`${CREDIT_LEDGER_PREFIX}${fromHash}`);
+  }
+
+  async putAccountIndex(accountTokenHash: string, keyHash: string): Promise<void> {
+    if (!accountTokenHash || !keyHash) return;
+    await this.kv.set(`${ACCOUNT_PREFIX}${accountTokenHash}`, keyHash);
+  }
+
+  async lookupByAccountToken(plaintextToken: string): Promise<StoredKeyRecord | null> {
+    if (!plaintextToken.startsWith('dqla_')) return null;
+    try {
+      const v = await this.kv.get(`${ACCOUNT_PREFIX}${sha256Hex(plaintextToken)}`);
+      const keyHash = typeof v === 'string' && v.length > 0 ? v : undefined;
+      if (!keyHash) return null;
+      return this.getRecordByHash(keyHash);
+    } catch {
+      return null;
+    }
+  }
+
+  async usageToday(keyHash: string, now: Date = new Date()): Promise<number> {
+    if (!keyHash) return 0;
+    try {
+      const day = now.toISOString().slice(0, 10);
+      return Math.max(0, asInt(await this.kv.get(usageCounterKeyFromHash(keyHash, day))));
     } catch {
       return 0;
     }
@@ -459,6 +522,7 @@ export function newStoredKeyRecord(opts: {
   paygOptIn?: boolean;
   trial?: boolean;
   emailNormalized?: string;
+  accountTokenHash?: string;
 }): StoredKeyRecord {
   return {
     hash: sha256Hex(opts.plaintextKey),
@@ -473,6 +537,7 @@ export function newStoredKeyRecord(opts: {
     payg_opt_in: opts.paygOptIn === true,
     trial: opts.trial === true,
     email_normalized: opts.emailNormalized,
+    account_token_hash: opts.accountTokenHash,
   };
 }
 

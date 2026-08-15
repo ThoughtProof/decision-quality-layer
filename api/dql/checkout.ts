@@ -1,10 +1,11 @@
 /**
  * POST /dql/checkout  — start Stripe Checkout (flag-gated, default OFF)
  *   body: { email, pack: "trial"|"starter"|"plus"|"payg" }
- * GET  /dql/checkout?session_id=cs_… — reveal minted key once
+ * GET  /dql/checkout?session_id=cs_… — reveal minted key + account token once
  *
  * Merge ≠ public billing. Merge ≠ live packs. Production stays closed until
  * `DQL_CHECKOUT_ENABLED=true` plus Stripe + Upstash + both pack prices.
+ * Account token (`dqla_…`) is not a verify key.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -68,18 +69,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (revealed.kind === 'ok') {
       const payload = {
         api_key: revealed.api_key,
+        account_token: revealed.account_token,
         prefix: revealed.prefix,
+        key_prefix: revealed.key_prefix,
+        credits: revealed.credits,
+        pack: revealed.pack,
+        trial: revealed.trial,
+        payg_opt_in: revealed.payg_opt_in,
         owner: revealed.owner,
         shown_once: true as const,
         header: 'X-DQL-Key',
-        pack: revealed.pack,
+        account_header: 'X-DQL-Account',
         no_freemium: true as const,
       };
       const accept = String(req.headers.accept ?? '');
       if (accept.includes('text/html')) {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.status(200);
-        res.end(renderRevealHtml(payload.api_key, payload.prefix));
+        res.end(
+          renderRevealHtml(payload.api_key, payload.account_token, payload.key_prefix),
+        );
         return;
       }
       return res.status(200).json(payload);
@@ -199,8 +208,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   });
 }
 
-function renderRevealHtml(apiKey: string, prefix: string): string {
-  const escaped = apiKey.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+function renderRevealHtml(apiKey: string, accountToken: string, prefix: string): string {
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>DQL API key</title>
 <meta name="robots" content="noindex, nofollow">
@@ -210,8 +219,11 @@ function renderRevealHtml(apiKey: string, prefix: string): string {
   p { color: #333; }
 </style></head><body>
 <h1>Your DQL API key</h1>
-<p>Shown once. Copy it now. Header: <code style="display:inline;padding:.2rem .4rem">X-DQL-Key</code> or <code style="display:inline;padding:.2rem .4rem">Authorization: Bearer</code>.</p>
-<p>Prefix ${prefix.replace(/</g, '')} · prepaid credits or opt-in PAYG · no freemium</p>
-<code>${escaped}</code>
+<p>Shown once. Copy both values now. Verify header: <code style="display:inline;padding:.2rem .4rem">X-DQL-Key</code>. Account header: <code style="display:inline;padding:.2rem .4rem">X-DQL-Account</code>.</p>
+<p>Prefix ${esc(prefix)} · prepaid credits or opt-in PAYG · no freemium</p>
+<p>API key</p>
+<code>${esc(apiKey)}</code>
+<p>Account token (not a verify key)</p>
+<code>${esc(accountToken)}</code>
 </body></html>`;
 }

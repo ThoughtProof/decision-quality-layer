@@ -2,12 +2,14 @@ import { createHmac } from 'node:crypto';
 import { describe, it, expect, vi } from 'vitest';
 import { authorizeCall, parseApiKeys, type UsageGate } from './keys.js';
 import {
+  checkoutRedirectUrls,
   createCheckoutSession,
   finalizeCheckoutMint,
   generateApiKey,
   handleStripeWebhookEvent,
   isCheckoutEnabled,
   loadCheckoutConfig,
+  publicAppUrl,
   publicBaseUrl,
   revealCheckoutKey,
 } from './checkout.js';
@@ -38,6 +40,26 @@ describe('checkout flags', () => {
     expect(publicBaseUrl({ DQL_PUBLIC_BASE_URL: 'https://dql.example/' })).toBe('https://dql.example');
     expect(publicBaseUrl({ VERCEL_URL: 'preview.vercel.app' })).toBe('https://preview.vercel.app');
   });
+
+  it('success/cancel land on the App only when DQL_PUBLIC_APP_URL is set', () => {
+    expect(publicAppUrl({})).toBe('');
+    const dql = checkoutRedirectUrls({ DQL_PUBLIC_BASE_URL: 'https://dql.thoughtproof.ai' });
+    expect(dql.successUrl).toBe(
+      'https://dql.thoughtproof.ai/dql/checkout?session_id={CHECKOUT_SESSION_ID}',
+    );
+    expect(dql.cancelUrl).toBe('https://dql.thoughtproof.ai/');
+    expect(dql.publicApp).toBe('');
+
+    const app = checkoutRedirectUrls({
+      DQL_PUBLIC_BASE_URL: 'https://dql.thoughtproof.ai',
+      DQL_PUBLIC_APP_URL: 'https://app.thoughtproof.ai/',
+    });
+    expect(app.successUrl).toBe(
+      'https://app.thoughtproof.ai/keys?session_id={CHECKOUT_SESSION_ID}',
+    );
+    expect(app.cancelUrl).toBe('https://app.thoughtproof.ai/pricing?canceled=1');
+    expect(app.successUrl).not.toContain('dql.thoughtproof.ai/dql/checkout');
+  });
 });
 
 describe('finalizeCheckoutMint + auth + meter + revoke', () => {
@@ -65,6 +87,8 @@ describe('finalizeCheckoutMint + auth + meter + revoke', () => {
 
     const joined = logs.join('\n');
     expect(joined).not.toContain(plaintext);
+    expect(joined).not.toContain(minted.accountToken);
+    expect(joined).not.toMatch(/dqla_[0-9a-f]{16}/);
     expect(joined).toContain('dql_key_mint');
 
     const canaryKey = 'dqlk_canary_bootstrap_bbbbbbbbbbbb';
@@ -206,6 +230,9 @@ describe('createCheckoutSession', () => {
       if (u.includes('/checkout/sessions')) {
         expect(String(init?.body)).toContain('mode=setup');
         expect(String(init?.body)).toContain('dql_checkout');
+        expect(String(init?.body)).toContain(
+          encodeURIComponent('https://dql.thoughtproof.ai/dql/checkout?session_id={CHECKOUT_SESSION_ID}'),
+        );
         expect(String(init?.body)).not.toMatch(/dqlk_[0-9a-f]{16}/);
         return {
           ok: true,
@@ -233,6 +260,48 @@ describe('createCheckoutSession', () => {
     expect(pending?.status).toBe('pending');
     expect(pending?.customer_id).toBe('cus_new1');
     expect(pending?.owner).toBe('ss:cus_new1');
+  });
+
+  it('uses App keys/pricing URLs when DQL_PUBLIC_APP_URL is set', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes('/customers') && (init?.method ?? 'GET') === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ data: [] }) };
+      }
+      if (u.includes('/customers') && init?.method === 'POST') {
+        return { ok: true, status: 200, json: async () => ({ id: 'cus_app1' }) };
+      }
+      if (u.includes('/checkout/sessions')) {
+        const body = String(init?.body);
+        expect(body).toContain(encodeURIComponent('https://app.thoughtproof.ai/keys'));
+        expect(body).toContain(encodeURIComponent('https://app.thoughtproof.ai/pricing?canceled=1'));
+        expect(body).not.toContain(encodeURIComponent('/dql/checkout?session_id'));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            id: 'cs_app1',
+            url: 'https://checkout.stripe.com/c/pay/cs_app1',
+          }),
+        };
+      }
+      throw new Error(`unexpected ${u}`);
+    }) as unknown as typeof fetch;
+
+    const r = await createCheckoutSession({
+      email: 'buyer@example.com',
+      pack: 'payg',
+      store,
+      config: loadCheckoutConfig({
+        DQL_CHECKOUT_ENABLED: 'true',
+        STRIPE_SECRET_KEY: 'sk_test_x',
+        DQL_PUBLIC_BASE_URL: 'https://dql.thoughtproof.ai',
+        DQL_PUBLIC_APP_URL: 'https://app.thoughtproof.ai',
+      }),
+      fetchImpl,
+    });
+    expect(r.kind).toBe('ok');
   });
 });
 
@@ -277,7 +346,14 @@ describe('revealCheckoutKey', () => {
     expect(first.kind).toBe('ok');
     if (first.kind !== 'ok') return;
     expect(first.api_key).toBe(minted.plaintext);
+    expect(first.account_token.startsWith('dqla_')).toBe(true);
+    expect(first.key_prefix).toBe(minted.prefix);
+    expect(first.credits).toBe(0);
+    expect(first.pack).toBe('payg');
+    expect(first.trial).toBe(false);
+    expect(first.payg_opt_in).toBe(true);
     expect(first.shown_once).toBe(true);
+    expect(first.account_token).toBe(minted.accountToken);
 
     const second = await revealCheckoutKey({
       sessionId: 'cs_reveal',
@@ -286,6 +362,10 @@ describe('revealCheckoutKey', () => {
       fetchImpl,
     });
     expect(second.kind).toBe('already_delivered');
+    if (second.kind === 'already_delivered') {
+      expect(JSON.stringify(second)).not.toContain(minted.plaintext);
+      expect(JSON.stringify(second)).not.toMatch(/dqla_[0-9a-f]{16}/);
+    }
   });
 });
 

@@ -30,8 +30,13 @@ export class NoopUsageGate implements UsageGate {
   }
 }
 
+/** Daily-cap counter from a stored key hash (sha256 hex of the plaintext). */
+export function usageCounterKeyFromHash(keyHash: string, dayUtc: string): string {
+  return `dql:usage:${keyHash.slice(0, 24)}:${dayUtc}`;
+}
+
 export function usageCounterKey(apiKey: string, dayUtc: string): string {
-  return `dql:usage:${usageRedisKeyId(apiKey)}:${dayUtc}`;
+  return usageCounterKeyFromHash(usageRedisKeyId(apiKey), dayUtc);
 }
 
 export class UpstashUsageGate implements UsageGate {
