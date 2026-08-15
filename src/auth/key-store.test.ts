@@ -81,8 +81,8 @@ describe('UpstashKeyStore (memory)', () => {
   it('reveal is one-time (GETDEL)', async () => {
     const store = new UpstashKeyStore(createMemoryKv());
     const key = generateApiKey();
-    await store.putReveal('tok_1', key, 60);
-    expect(await store.consumeReveal('tok_1')).toBe(key);
+    await store.putReveal('tok_1', { key }, 60);
+    expect(await store.consumeReveal('tok_1')).toEqual({ key });
     expect(await store.consumeReveal('tok_1')).toBeNull();
   });
 });

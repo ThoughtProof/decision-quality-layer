@@ -101,14 +101,21 @@ Merge does **not** turn on public billing and does **not** make packs live. `POS
 | `DQL_STRIPE_PRICE_STARTER` | for `pack=starter` | One-time Dashboard Price ($8 / 200 credits). Missing → that pack's POST is `503 CHECKOUT_UNAVAILABLE`. Do not hardcode `price_…` ids. |
 | `DQL_STRIPE_PRICE_PLUS` | for `pack=plus` | One-time Dashboard Price ($35 / 1000 credits). Missing → `503 CHECKOUT_UNAVAILABLE`. |
 | `DQL_STRIPE_PRICE_ID` | for `pack=payg` subscription | Existing metered PAYG price. When set, `pack=payg` is `mode=subscription`. When unset, `pack=payg` is `mode=setup` (card on file). Does not grant credits. |
-| `DQL_PUBLIC_BASE_URL` | no | Success URL origin. Default `https://$VERCEL_URL` or `https://dql.thoughtproof.ai`. |
-| `DQL_CHECKOUT_CANCEL_URL` | no | Cancel URL. Default `{publicBase}/`. |
+| `DQL_PUBLIC_BASE_URL` | no | DQL origin used when the App URL is unset. Default `https://$VERCEL_URL` or `https://dql.thoughtproof.ai`. |
+| `DQL_PUBLIC_APP_URL` | no | Optional App origin (example `https://app.thoughtproof.ai`). When set, Stripe `success_url` = `{app}/keys?session_id={CHECKOUT_SESSION_ID}` and cancel = `{app}/pricing?canceled=1`. When **unset**, keep the DQL reveal URL (fail-safe). Do not hardcode the App URL as the only path. |
+| `DQL_CHECKOUT_CANCEL_URL` | no | Optional cancel-URL override. Default `{app}/pricing?canceled=1` when App URL is set, else `{publicBase}/`. |
+| `DQL_BILLING_PORTAL_RETURN_URL` | no | Return URL for `POST /dql/account/portal`. Default `{app}/keys` when App URL is set, else `{publicBase}/`. |
+| `DQL_STRIPE_PORTAL_CONFIGURATION` | no | Optional Stripe Customer Portal Configuration id (`bpc_…`). If unset, Stripe uses the Dashboard default. Portal create **fails closed** (`503 PORTAL_UNAVAILABLE`) when Customer Portal is not activated. |
 
-Credit amounts (5 / 200 / 1000) are defined in `src/auth/packs.ts`, not in Stripe metadata. Ledger keys: `dql:credits:<sha256>` (balance), `dql:credit-ledger:<sha256>` (grants, including `trial=true`), `dql:trial-email:<sha256(email)>`, `dql:trial-fp:<fingerprint>`. Daily-cap stays on `dql:usage:…`.
+Credit amounts (5 / 200 / 1000) are defined in `src/auth/packs.ts`, not in Stripe metadata. Ledger keys: `dql:credits:<sha256>` (balance), `dql:credit-ledger:<sha256>` (grants, including `trial=true`), `dql:trial-email:<sha256(email)>`, `dql:trial-fp:<fingerprint>`, `dql:account:<sha256(dqla_…)>` (account session → live key hash). Daily-cap stays on `dql:usage:…`.
 
-Self-serve keys are always `dev_access: false`. PAYG is **opt-in** (`payg_opt_in` on the key). Zero credits + no PAYG → `402 CREDITS_EXHAUSTED`. Trial is the first 5 checks, once per email ∪ card fingerprint, card required — not a plan. `no_freemium=true`. Plaintext is never logged and is stored only in a 15-minute one-time reveal token. Success URL uses `session_id`, not the raw key.
+Self-serve keys are always `dev_access: false`. PAYG is **opt-in** (`payg_opt_in` on the key). Zero credits + no PAYG → `402 CREDITS_EXHAUSTED`. Trial is the first 5 checks, once per email ∪ card fingerprint, card required — not a plan. `no_freemium=true`. Plaintext key and account token are never logged; only hashes are persisted. The one-time reveal slot (15 min) holds both until `GET /dql/checkout?session_id=` consumes it. Success URL uses `session_id`, not the raw key.
 
-See `docs/PAYMENT.md` § Checkout / webhook and § Prepaid packs. Do not claim `SELF_SERVE_LIVE=true` until the flag is on and smoked.
+Post-purchase account routes (`GET /dql/account`, `POST /dql/account/portal|rotate|revoke`) authenticate with `X-DQL-Account: dqla_…` or `Authorization: Bearer dqla_…`. They do **not** turn on Checkout. The account token is not accepted as `X-DQL-Key`.
+
+See `docs/PAYMENT.md` § Checkout / webhook, § Post-purchase account API, and § Prepaid packs. Do not claim `SELF_SERVE_LIVE=true` and do not claim a live self-serve product until the flag is on and smoked.
+
+Header: `X-DQL-Key: dqlk_...` (verify) or `X-DQL-Account: dqla_...` (account). Alias for either: `Authorization: Bearer`.
 
 ### x402 (P2 Rail B — default OFF)
 

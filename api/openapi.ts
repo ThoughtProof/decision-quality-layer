@@ -36,7 +36,7 @@ const spec = {
     // bare `guidance` is not a valid OpenAPI 3.1 info property and fails
     // strict 3.1 validation (unevaluatedProperties). Content unchanged.
     'x-guidance':
-      'POST /dql/verify with (mandate, proposed_action, reasoning, context?) to receive per-axis verdicts plus an aggregate. Set `sandbox: true` in the body for a free deterministic mock response — useful for integration testing against the schema. GET /dql/axes for axis metadata (question and failure mode per axis). Live rails: X-DQL-Key (env ∪ Upstash store), Stripe meter dql_verify_call, x402 on Base. Public Checkout key-mint is code-complete behind DQL_CHECKOUT_ENABLED (default off) — not a live self-serve claim.',
+      'POST /dql/verify with (mandate, proposed_action, reasoning, context?) to receive per-axis verdicts plus an aggregate. Set `sandbox: true` in the body for a free deterministic mock response — useful for integration testing against the schema. GET /dql/axes for axis metadata (question and failure mode per axis). Live rails: X-DQL-Key (env ∪ Upstash store), Stripe meter dql_verify_call, x402 on Base. Public Checkout key-mint and the post-purchase account API are code-complete behind DQL_CHECKOUT_ENABLED (default off) — merge does not enable the flag and is not a live self-serve claim.',
     contact: {
       url: 'https://thoughtproof.ai',
       email: 'support@thoughtproof.ai',
@@ -248,9 +248,9 @@ const spec = {
       },
       get: {
         operationId: 'dqlCheckoutReveal',
-        summary: 'Reveal the minted API key once',
+        summary: 'Reveal the minted API key and account token once',
         description:
-          'Query `session_id` (Stripe Checkout Session id). Returns the plaintext key once. Does not put the key in the query string.',
+          'Query `session_id` (Stripe Checkout Session id). Returns `api_key` (`dqlk_…`) and `account_token` (`dqla_…`) once, plus `key_prefix`, `credits`, `pack`, `trial`, `payg_opt_in`. Replay → 409 KEY_ALREADY_DELIVERED (no key, no token). Does not put secrets in the query string. Account token is not a verify key.',
         security: [],
         parameters: [
           {
@@ -262,11 +262,63 @@ const spec = {
         ],
         responses: {
           '200': {
-            description: 'Key shown once',
+            description: 'Key and account token shown once',
           },
           '409': {
-            description: 'Key already delivered',
+            description: 'Key already delivered (no key, no token)',
           },
+        },
+      },
+    },
+    '/dql/account': {
+      get: {
+        operationId: 'dqlAccount',
+        summary: 'Post-purchase balance and usage',
+        description:
+          'Auth: `X-DQL-Account` or `Authorization: Bearer dqla_…`. Returns `key_prefix`, `credits`, `trial`, `payg_opt_in`, `usage_today`, `daily_cap`, `email_masked`. Never returns the full verify key. Invalid/missing token → 401. Not a login product. Code exists; Checkout flag stays default off — not a live self-serve claim.',
+        security: [{ dqlAccount: [] }],
+        responses: {
+          '200': { description: 'Account snapshot' },
+          '401': { description: 'Missing or invalid account token' },
+        },
+      },
+    },
+    '/dql/account/portal': {
+      post: {
+        operationId: 'dqlAccountPortal',
+        summary: 'Create a Stripe Customer Billing Portal session',
+        description:
+          'Returns `{ url }` for invoice history and payment method. Fail closed (`503 PORTAL_UNAVAILABLE`) if Stripe Customer Portal is not configured.',
+        security: [{ dqlAccount: [] }],
+        responses: {
+          '200': { description: 'Portal URL' },
+          '401': { description: 'Missing or invalid account token' },
+          '503': { description: 'Portal not configured' },
+        },
+      },
+    },
+    '/dql/account/rotate': {
+      post: {
+        operationId: 'dqlAccountRotate',
+        summary: 'Rotate the live verify key',
+        description:
+          'Issues a new `dqlk_…` once. Old hash is revoked. Credits, PAYG, customer, and account token are preserved.',
+        security: [{ dqlAccount: [] }],
+        responses: {
+          '200': { description: 'New API key shown once' },
+          '401': { description: 'Missing or invalid account token' },
+        },
+      },
+    },
+    '/dql/account/revoke': {
+      post: {
+        operationId: 'dqlAccountRevoke',
+        summary: 'Revoke the live verify key',
+        description: 'Key is dead. Prepaid credits remain unused. Account token is not a verify key.',
+        security: [{ dqlAccount: [] }],
+        responses: {
+          '200': { description: 'Revoked' },
+          '401': { description: 'Missing or invalid account token' },
         },
       },
     },
@@ -332,7 +384,14 @@ const spec = {
         in: 'header',
         name: 'X-DQL-Key',
         description:
-          'DQL API key (`dqlk_…`). Dev-access keys are granted manually (free). Self-serve keys are billable ($0.05/call) when Checkout is enabled. Alias: Authorization: Bearer. Contact support@thoughtproof.ai for dev access.',
+          'DQL API key (`dqlk_…`). Dev-access keys are granted manually (free). Self-serve keys are billable ($0.05/call) when Checkout is enabled. Alias: Authorization: Bearer. Contact support@thoughtproof.ai for dev access. Account tokens (`dqla_…`) are not accepted here.',
+      },
+      dqlAccount: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-DQL-Account',
+        description:
+          'Post-purchase account session (`dqla_…`). Shown once on checkout reveal. Alias: Authorization: Bearer dqla_…. Not a verify key. Not a login product.',
       },
     },
     schemas: {

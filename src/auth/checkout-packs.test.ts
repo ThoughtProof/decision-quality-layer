@@ -384,6 +384,9 @@ describe('createCheckoutSession pack modes', () => {
         expect(body).toContain('price_test_starter');
         expect(body).toContain('starter');
         expect(body).toContain('200');
+        expect(body).toContain(
+          encodeURIComponent('https://dql.thoughtproof.ai/dql/checkout?session_id={CHECKOUT_SESSION_ID}'),
+        );
         expect(body).not.toMatch(/dqlk_[0-9a-f]{16}/);
         return { id: 'cs_pack', url: 'https://checkout.stripe.com/c/pay/cs_pack' };
       },

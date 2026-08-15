@@ -34,3 +34,8 @@ export function keyDisplayPrefix(key: string): string {
 export function fingerprintCustomer(cus: string): string {
   return sha256Hex(cus).slice(0, 12);
 }
+
+/** Log-safe account-session id. Never include the plaintext `dqla_…` token. */
+export function fingerprintAccountToken(token: string): string {
+  return sha256Hex(token).slice(0, 12);
+}

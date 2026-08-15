@@ -68,7 +68,7 @@ Nur was den Drift schließt oder Demo/Revenue freimacht — **kein** Feature-Fes
 9. ✅ Stripe meter — **Production ON** (canary `dql-canary` → `cus_V4abfGkmWdyxyC`).
 10. ✅ x402 Base rail — **Production ON** (2026-08-14). CDP keys + flag live; challenge + $0.05 canary PASS.
 11. ✅ Upstash daily-cap multi-instance — **ON** (2026-08-15). Redis key = sha256(apiKey).
-11b. 🔲 Public Checkout mint — **code** (`POST /dql/checkout` + signed webhook + one-time reveal). **Flag OFF.** Do not claim `SELF_SERVE_LIVE=true` until `DQL_CHECKOUT_ENABLED` + smoke.
+11b. 🔲 Public Checkout mint — **code** (`POST /dql/checkout` + signed webhook + one-time key+`dqla_…` reveal + `/dql/account`). **Flag OFF.** Do not claim `SELF_SERVE_LIVE=true` or a live self-serve product until `DQL_CHECKOUT_ENABLED` + smoke.
 
 ### P3 — Reliability debt (nur wenn capital/high-SLA)
 12. Circuit-breaker **Recovery-Blindspot** fixen (beide OPEN → HALF_OPEN Probe mit *realer* Achsen-Last)

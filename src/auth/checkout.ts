@@ -10,16 +10,23 @@
  *   trial          → setup-mode card bind. 5 checks once per email ∪ fingerprint.
  *
  * Signed webhook `checkout.session.completed` (`metadata.dql_checkout=1`).
- * GET  /dql/checkout?session_id=cs_… → reveal plaintext ONCE (first mint).
+ * GET  /dql/checkout?session_id=cs_… → reveal plaintext key + account token ONCE.
  *
- * Plaintext is never logged. `no_freemium = true` — trial is not a plan.
+ * Plaintext key / `dqla_…` token are never logged. `no_freemium = true` —
+ * trial is not a plan. Account token is not a verify key.
  */
 
 import { randomBytes } from 'node:crypto';
 
 import { DEFAULT_DAILY_CAP } from './keys.js';
 import { truthy } from './env-flag.js';
-import { fingerprintCustomer, fingerprintKey, keyDisplayPrefix } from './key-hash.js';
+import {
+  fingerprintAccountToken,
+  fingerprintCustomer,
+  fingerprintKey,
+  keyDisplayPrefix,
+  sha256Hex,
+} from './key-hash.js';
 import {
   newStoredKeyRecord,
   selfServeOwner,
@@ -61,8 +68,40 @@ export function generateApiKey(): string {
   return `dqlk_${randomBytes(32).toString('hex')}`;
 }
 
+/** Opaque post-purchase session. Not a verify key. Store the hash only. */
+export function generateAccountToken(): string {
+  return `dqla_${randomBytes(32).toString('hex')}`;
+}
+
 export function generateRevealToken(): string {
   return randomBytes(24).toString('hex');
+}
+
+/** App origin for Stripe redirects. Unset → keep DQL reveal URL (fail-safe). */
+export function publicAppUrl(env: NodeJS.ProcessEnv = process.env): string {
+  return (env.DQL_PUBLIC_APP_URL ?? '').trim().replace(/\/$/, '');
+}
+
+export function checkoutRedirectUrls(env: NodeJS.ProcessEnv = process.env): {
+  successUrl: string;
+  cancelUrl: string;
+  publicApp: string;
+} {
+  const publicBase = publicBaseUrl(env);
+  const publicApp = publicAppUrl(env);
+  const cancelOverride = (env.DQL_CHECKOUT_CANCEL_URL ?? '').trim();
+  if (publicApp) {
+    return {
+      successUrl: `${publicApp}/keys?session_id={CHECKOUT_SESSION_ID}`,
+      cancelUrl: cancelOverride || `${publicApp}/pricing?canceled=1`,
+      publicApp,
+    };
+  }
+  return {
+    successUrl: `${publicBase}/dql/checkout?session_id={CHECKOUT_SESSION_ID}`,
+    cancelUrl: cancelOverride || `${publicBase}/`,
+    publicApp: '',
+  };
 }
 
 export interface CheckoutConfig {
@@ -74,7 +113,11 @@ export interface CheckoutConfig {
   priceStarter: string;
   pricePlus: string;
   publicBase: string;
+  publicApp: string;
+  successUrl: string;
   cancelUrl: string;
+  portalReturnUrl: string;
+  portalConfiguration: string;
 }
 
 export function loadCheckoutConfig(env: NodeJS.ProcessEnv = process.env): CheckoutConfig {
@@ -84,7 +127,10 @@ export function loadCheckoutConfig(env: NodeJS.ProcessEnv = process.env): Checko
   const priceStarter = (env.DQL_STRIPE_PRICE_STARTER ?? '').trim();
   const pricePlus = (env.DQL_STRIPE_PRICE_PLUS ?? '').trim();
   const publicBase = publicBaseUrl(env);
-  const cancelUrl = (env.DQL_CHECKOUT_CANCEL_URL ?? '').trim() || `${publicBase}/`;
+  const redirects = checkoutRedirectUrls(env);
+  const portalReturn =
+    (env.DQL_BILLING_PORTAL_RETURN_URL ?? '').trim() ||
+    (redirects.publicApp ? `${redirects.publicApp}/keys` : `${publicBase}/`);
   return {
     enabled: isCheckoutEnabled(env) && secretKey.length > 0,
     secretKey,
@@ -93,7 +139,11 @@ export function loadCheckoutConfig(env: NodeJS.ProcessEnv = process.env): Checko
     priceStarter,
     pricePlus,
     publicBase,
-    cancelUrl,
+    publicApp: redirects.publicApp,
+    successUrl: redirects.successUrl,
+    cancelUrl: redirects.cancelUrl,
+    portalReturnUrl: portalReturn,
+    portalConfiguration: (env.DQL_STRIPE_PORTAL_CONFIGURATION ?? '').trim(),
   };
 }
 
@@ -303,7 +353,7 @@ export async function createCheckoutSession(opts: {
   const owner = selfServeOwner(customerId);
   await opts.store.putCustomerMap(owner, customerId);
 
-  const successUrl = `${opts.config.publicBase}/dql/checkout?session_id={CHECKOUT_SESSION_ID}`;
+  const successUrl = opts.config.successUrl;
   let mode: 'payment' | 'setup' | 'subscription';
   if (pack === 'starter' || pack === 'plus') {
     mode = 'payment';
@@ -380,6 +430,7 @@ export type MintResult =
   | {
       kind: 'minted';
       plaintext: string;
+      accountToken: string;
       revealToken: string;
       prefix: string;
       owner: string;
@@ -387,6 +438,7 @@ export type MintResult =
       pack: CheckoutPack;
       credits_added: number;
       trial: boolean;
+      payg_opt_in: boolean;
     }
   | {
       kind: 'already_minted';
@@ -644,6 +696,7 @@ export async function finalizeCheckoutMint(opts: {
   }
 
   const plaintext = generateApiKey();
+  const accountToken = generateAccountToken();
   const record = newStoredKeyRecord({
     plaintextKey: plaintext,
     owner: opts.owner,
@@ -652,12 +705,14 @@ export async function finalizeCheckoutMint(opts: {
     paygOptIn: def.payg_opt_in,
     trial: def.trial,
     emailNormalized: opts.emailNormalized,
+    accountTokenHash: sha256Hex(accountToken),
   });
   const revealToken = generateRevealToken();
 
   await opts.store.putKey(record);
   await opts.store.putCustomerKey(opts.customerId, record.hash);
   await opts.store.putCustomerMap(opts.owner, opts.customerId);
+  await opts.store.putAccountIndex(record.account_token_hash!, record.hash);
 
   if (def.credits > 0) {
     await opts.store.addCredits(record.hash, def.credits);
@@ -670,7 +725,11 @@ export async function finalizeCheckoutMint(opts: {
     });
   }
 
-  await opts.store.putReveal(revealToken, plaintext, REVEAL_TTL_SEC);
+  await opts.store.putReveal(
+    revealToken,
+    { key: plaintext, account_token: accountToken },
+    REVEAL_TTL_SEC,
+  );
   await opts.store.putCheckout({
     session_id: opts.sessionId,
     customer_id: opts.customerId,
@@ -696,6 +755,7 @@ export async function finalizeCheckoutMint(opts: {
       payg_opt_in: def.payg_opt_in,
       customer_fingerprint: fingerprintCustomer(opts.customerId),
       key_fingerprint: fingerprintKey(plaintext),
+      account_fingerprint: fingerprintAccountToken(accountToken),
       prefix: record.prefix,
       ts: new Date().toISOString(),
     }),
@@ -704,6 +764,7 @@ export async function finalizeCheckoutMint(opts: {
   return {
     kind: 'minted',
     plaintext,
+    accountToken,
     revealToken,
     prefix: record.prefix,
     owner: opts.owner,
@@ -711,11 +772,24 @@ export async function finalizeCheckoutMint(opts: {
     pack: opts.pack,
     credits_added: def.credits,
     trial: def.trial,
+    payg_opt_in: def.payg_opt_in,
   };
 }
 
 export type RevealResult =
-  | { kind: 'ok'; api_key: string; prefix: string; owner: string; shown_once: true; pack?: CheckoutPack }
+  | {
+      kind: 'ok';
+      api_key: string;
+      account_token: string;
+      prefix: string;
+      key_prefix: string;
+      owner: string;
+      shown_once: true;
+      pack?: CheckoutPack;
+      credits: number;
+      trial: boolean;
+      payg_opt_in: boolean;
+    }
   | {
       kind: 'ok_existing';
       owner: string;
@@ -835,13 +909,19 @@ export async function revealCheckoutKey(opts: {
       delete checkout.reveal_token;
       await opts.store.putCheckout(checkout);
     }
+    const credits = await opts.store.creditBalance(sha256Hex(minted.plaintext));
     return {
       kind: 'ok',
       api_key: minted.plaintext,
+      account_token: minted.accountToken,
       prefix: minted.prefix,
+      key_prefix: minted.prefix,
       owner: minted.owner,
       shown_once: true,
       pack: minted.pack,
+      credits,
+      trial: minted.trial,
+      payg_opt_in: minted.payg_opt_in,
     };
   }
 
@@ -853,14 +933,21 @@ export async function revealCheckoutKey(opts: {
       delete checkout.reveal_token;
       await opts.store.putCheckout(checkout);
     }
-    if (leftover) {
+    if (leftover?.key && leftover.account_token) {
+      const rec = await opts.store.getRecordByHash(sha256Hex(leftover.key));
+      const credits = rec ? await opts.store.creditBalance(rec.hash) : 0;
       return {
         kind: 'ok',
-        api_key: leftover,
-        prefix: minted.prefix ?? keyDisplayPrefix(leftover),
+        api_key: leftover.key,
+        account_token: leftover.account_token,
+        prefix: minted.prefix ?? keyDisplayPrefix(leftover.key),
+        key_prefix: minted.prefix ?? keyDisplayPrefix(leftover.key),
         owner: minted.owner,
         shown_once: true,
         pack: minted.pack,
+        credits,
+        trial: rec?.trial === true,
+        payg_opt_in: rec?.payg_opt_in === true,
       };
     }
   }
@@ -929,7 +1016,11 @@ export function handleStripeWebhookEvent(opts: {
     priceStarter: '',
     pricePlus: '',
     publicBase: '',
+    publicApp: '',
+    successUrl: '',
     cancelUrl: '',
+    portalReturnUrl: '',
+    portalConfiguration: '',
   };
 
   return fulfillFromSession({

@@ -53,7 +53,7 @@ describe('POST /dql/checkout — flag default OFF', () => {
   });
 
   it('returns 503 CHECKOUT_DISABLED when flag is unset (merge ≠ public billing)', async () => {
-    const mod = await import('./checkout.js');
+    const mod = await import('../../../api/dql/checkout.js');
     const { req, res, state } = makeReqRes('POST', { body: { email: 'a@b.co' } });
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -61,14 +61,14 @@ describe('POST /dql/checkout — flag default OFF', () => {
   });
 
   it('GET without session_id → 400', async () => {
-    const mod = await import('./checkout.js');
+    const mod = await import('../../../api/dql/checkout.js');
     const { req, res, state } = makeReqRes('GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(400);
   });
 
   it('OPTIONS is 200', async () => {
-    const mod = await import('./checkout.js');
+    const mod = await import('../../../api/dql/checkout.js');
     const { req, res, state } = makeReqRes('OPTIONS');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -79,7 +79,7 @@ describe('POST /dql/checkout — flag default OFF', () => {
     process.env.STRIPE_SECRET_KEY = 'sk_test_x';
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./checkout.js');
+    const mod = await import('../../../api/dql/checkout.js');
     const missing = makeReqRes('POST', { body: { email: 'a@b.co' } });
     await mod.default(missing.req, missing.res);
     expect(missing.state.statusCode).toBe(400);
@@ -96,7 +96,7 @@ describe('POST /dql/checkout — flag default OFF', () => {
     process.env.STRIPE_SECRET_KEY = 'sk_test_x';
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./checkout.js');
+    const mod = await import('../../../api/dql/checkout.js');
     const { req, res, state } = makeReqRes('POST', {
       body: { email: 'a@b.co', pack: 'starter' },
     });

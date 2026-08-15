@@ -42,7 +42,9 @@ describe('packs (source of truth)', () => {
       'docs/ENV.md',
       'src/auth/packs.ts',
       'src/auth/checkout.ts',
+      'src/auth/account.ts',
       'api/dql/checkout.ts',
+      'api/dql/account.ts',
       'api/openapi.ts',
     ];
     for (const file of files) {
