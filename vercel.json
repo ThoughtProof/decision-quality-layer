@@ -4,6 +4,8 @@
   "rewrites": [
     { "source": "/openapi.json", "destination": "/api/openapi" },
     { "source": "/", "destination": "/api/index" },
+    { "source": "/dql/account", "destination": "/api/dql/account" },
+    { "source": "/dql/account/:action", "destination": "/api/dql/account?action=:action" },
     { "source": "/dql/(.*)", "destination": "/api/dql/$1" }
   ],
   "functions": {

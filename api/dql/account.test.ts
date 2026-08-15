@@ -2,10 +2,17 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 function makeReqRes(
   method: string,
-  opts: { body?: unknown; headers?: Record<string, string> } = {},
+  opts: {
+    body?: unknown;
+    headers?: Record<string, string>;
+    url?: string;
+    query?: Record<string, string>;
+  } = {},
 ) {
   const req = {
     method,
+    url: opts.url ?? '/dql/account',
+    query: opts.query ?? {},
     headers: { 'content-type': 'application/json', ...(opts.headers ?? {}) },
     body: opts.body,
   } as any;
@@ -29,7 +36,7 @@ function makeReqRes(
   return { req, res, state };
 }
 
-describe('GET /dql/account — handler', () => {
+describe('GET /dql/account — consolidated handler', () => {
   const originalEnv = process.env;
   beforeEach(() => {
     vi.resetModules();
@@ -70,9 +77,29 @@ describe('GET /dql/account — handler', () => {
     await mod.default(req, res);
     expect(state.statusCode).toBe(405);
   });
+
+  it('resolveAccountAction reads rewrite query and path', async () => {
+    const mod = await import('./account.js');
+    expect(mod.resolveAccountAction({ query: {}, url: '/dql/account' } as any)).toBe('root');
+    expect(
+      mod.resolveAccountAction({ query: { action: 'portal' }, url: '/api/dql/account' } as any),
+    ).toBe('portal');
+    expect(
+      mod.resolveAccountAction({
+        query: {},
+        url: '/dql/account/rotate?x=1',
+      } as any),
+    ).toBe('rotate');
+    expect(
+      mod.resolveAccountAction({
+        query: {},
+        url: '/api/dql/account/revoke',
+      } as any),
+    ).toBe('revoke');
+  });
 });
 
-describe('POST /dql/account/portal|rotate|revoke — handler auth', () => {
+describe('POST /dql/account/portal|rotate|revoke — consolidated handler auth', () => {
   const originalEnv = process.env;
   beforeEach(() => {
     vi.resetModules();
@@ -90,17 +117,22 @@ describe('POST /dql/account/portal|rotate|revoke — handler auth', () => {
   it('portal 401 without token', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./account/portal.js');
-    const { req, res, state } = makeReqRes('POST');
+    const mod = await import('./account.js');
+    const { req, res, state } = makeReqRes('POST', {
+      query: { action: 'portal' },
+      url: '/dql/account?action=portal',
+    });
     await mod.default(req, res);
     expect(state.statusCode).toBe(401);
   });
 
-  it('rotate 401 without token', async () => {
+  it('rotate 401 without token (path form)', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./account/rotate.js');
-    const { req, res, state } = makeReqRes('POST');
+    const mod = await import('./account.js');
+    const { req, res, state } = makeReqRes('POST', {
+      url: '/dql/account/rotate',
+    });
     await mod.default(req, res);
     expect(state.statusCode).toBe(401);
   });
@@ -108,9 +140,20 @@ describe('POST /dql/account/portal|rotate|revoke — handler auth', () => {
   it('revoke 401 without token', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./account/revoke.js');
-    const { req, res, state } = makeReqRes('POST');
+    const mod = await import('./account.js');
+    const { req, res, state } = makeReqRes('POST', {
+      query: { action: 'revoke' },
+    });
     await mod.default(req, res);
     expect(state.statusCode).toBe(401);
+  });
+
+  it('GET on portal action is 405', async () => {
+    const mod = await import('./account.js');
+    const { req, res, state } = makeReqRes('GET', {
+      query: { action: 'portal' },
+    });
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(405);
   });
 });
