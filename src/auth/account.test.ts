@@ -116,6 +116,9 @@ describe('reveal + account surface', () => {
     expect(minted.kind).toBe('minted');
     if (minted.kind !== 'minted') return;
 
+    const leftover = await store.consumeReveal(minted.revealToken);
+    expect(leftover?.account_token).toBe(minted.accountToken);
+
     const day = new Date().toISOString().slice(0, 10);
     await kv.set(usageCounterKeyFromHash(sha256Hex(minted.plaintext), day), 3);
 
