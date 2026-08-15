@@ -63,6 +63,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     signatureHeader,
     webhookSecret: cfg.webhookSecret,
     store,
+    secretKey: cfg.secretKey,
   });
 
   if (result.kind === 'unauthorized') {

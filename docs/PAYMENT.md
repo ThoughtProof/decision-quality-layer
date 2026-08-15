@@ -77,9 +77,9 @@ POST /dql/verify received
 - **Dev-access grant flow** — email-based today; do we want a lightweight form or is a mailto: link enough for v1?
 - **Refund / dispute policy** — if a customer disputes a Stripe charge, do we auto-refund below some threshold? Manual review above?
 
-## Implementation status (2026-08-14)
+## Implementation status (2026-08-15)
 
-**`SELF_SERVE_LIVE=partial`** — payment **rails** live in Production (x402 + Stripe meter canary + Upstash daily-cap). Checkout **code** exists (`POST /dql/checkout`, signed webhook, one-time key reveal) behind `DQL_CHECKOUT_ENABLED` (**default OFF**). Merge ≠ public billing. Do **not** claim `SELF_SERVE_LIVE=true` until Raul flips the flag and smokes Production. No public signup UX on `app.thoughtproof.ai` yet. No freemium.
+**`SELF_SERVE_LIVE=partial`** — payment **rails** live in Production (x402 + Stripe meter canary + Upstash daily-cap). Checkout **code** exists (`POST /dql/checkout`, signed webhook, one-time key reveal, prepaid ledger + trial guards) behind `DQL_CHECKOUT_ENABLED` (**default OFF**). Merge ≠ public billing. Merge ≠ live packs. Do **not** claim `SELF_SERVE_LIVE=true` until Raul flips the flag and smokes Production. No public signup UX on `app.thoughtproof.ai` yet. `no_freemium=true`.
 
 Code path **merged via [PR #36](https://github.com/ThoughtProof/decision-quality-layer/pull/36)** → `main` merge commit **`9f3c1b4`** (PR head `4c27363`).  
 Production: `dql.thoughtproof.ai` · cascade `pot-cli`.
@@ -108,9 +108,9 @@ Hard rules:
 | Stripe meter `dql_verify_call` | Merged · unit tests (awaited + timeout) | **ON** (canary owner `dql-canary` → `cus_V4abfGkmWdyxyC`) | Dashboard meter/price live; prod flag + secret + map |
 | x402 Base USDC | Merged · Preview + **Production canary PASS** | **ON** (`DQL_X402_ENABLED` + CDP keys) | live |
 | Upstash daily-cap multi-instance | Merged · unit-verified atomic INCR; Redis key = sha256(apiKey) | **ON** (shared Sentinel Upstash; keys `dql:usage:…`) | bound 2026-08-15; over-cap → 429 `QUOTA_EXCEEDED` |
-| Stripe Checkout → persist `dqlk_…` | **Code** · unit tests (mint → auth → revoke; env canary; no key in logs) | **OFF** (`DQL_CHECKOUT_ENABLED` unset) | flag + webhook secret + Upstash; see below |
+| Stripe Checkout → persist `dqlk_…` + prepaid ledger | **Code** · unit tests (pack mint → decrement → hard-stop; PAYG meter; trial email∪fingerprint; daily-cap; flag default OFF) | **OFF** (`DQL_CHECKOUT_ENABLED` unset) | flag + **both** pack prices in Dashboard + ledger deployed + webhook secret + Upstash; see below |
 
-Auth + customer-map + daily-cap consult **env ∪ Upstash store**. `DQL_API_KEYS` and `DQL_STRIPE_CUSTOMER_MAP` remain bootstrap (canary / guardian-pwa / manual `dev_access`). Self-serve keys are `dev_access: false`, stored as sha256 only, bound to `cus_…`. Plaintext is shown **once** on `GET /dql/checkout?session_id=cs_…` (session id in the query, never the raw key).
+Auth + customer-map + daily-cap + prepaid credits consult **env ∪ Upstash store**. `DQL_API_KEYS` and `DQL_STRIPE_CUSTOMER_MAP` remain bootstrap (canary / guardian-pwa / manual `dev_access`). Self-serve keys are `dev_access: false`, stored as sha256 only, bound to `cus_…`. One live key per Stripe customer. Plaintext is shown **once** on `GET /dql/checkout?session_id=cs_…` (session id in the query, never the raw key). Env canary `dql-canary` is unchanged (env wins; credits do not apply).
 
 ### Checkout / webhook (local + prod flag)
 
@@ -127,23 +127,50 @@ export STRIPE_WEBHOOK_SECRET=whsec_…          # from stripe listen
 export DQL_PUBLIC_BASE_URL=http://localhost:3002
 export UPSTASH_REDIS_REST_URL=…               # required to persist keys
 export UPSTASH_REDIS_REST_TOKEN=…
-# Optional: Dashboard metered price so Checkout uses subscription mode
-# (pay-as-you-go invoices). Without it, Checkout is setup-mode (card on file).
+# Pack prices — create one-time Prices in Dashboard; do not commit price_… ids.
+# export DQL_STRIPE_PRICE_STARTER=price_…   # $8 / 200 credits
+# export DQL_STRIPE_PRICE_PLUS=price_…      # $35 / 1000 credits
+# Optional metered PAYG price (subscription mode). Without it, pack=payg is setup-mode.
 # export DQL_STRIPE_PRICE_ID=price_…
 DQL_CASCADE=stub npx vercel dev --listen 3002
 
 curl -s -X POST http://localhost:3002/dql/checkout \
   -H 'content-type: application/json' \
-  -d '{"email":"you@example.com"}'
-# → { "url": "https://checkout.stripe.com/…", "session_id": "cs_…" }
+  -d '{"email":"you@example.com","pack":"starter"}'
+# → { "url": "https://checkout.stripe.com/…", "session_id": "cs_…", "pack": "starter", "no_freemium": true }
 # Complete Checkout, then:
 curl -s 'http://localhost:3002/dql/checkout?session_id=cs_…'
-# → { "api_key": "dqlk_…", "shown_once": true }   # once only
+# → { "api_key": "dqlk_…", "shown_once": true }   # once only (first mint)
 ```
 
-Stripe Dashboard webhook (prod): endpoint `https://dql.thoughtproof.ai/dql/webhooks/stripe`, event `checkout.session.completed`, signing secret → `STRIPE_WEBHOOK_SECRET`. Shared ThoughtProof Stripe account: only sessions with `metadata.dql_checkout=1` are minted; other events are ignored.
+`pack` is required (`trial` | `starter` | `plus` | `payg`). Missing/unknown → `400 INVALID_REQUEST`. A pack whose Stripe price env is unset → `503 CHECKOUT_UNAVAILABLE` (fail closed). Flag off → `503 CHECKOUT_DISABLED`.
 
-**Prod flip (Raul):** set `DQL_CHECKOUT_ENABLED=true` **after** `STRIPE_WEBHOOK_SECRET` + Upstash are bound. Redeploy. Smoke: one test Checkout → reveal once → `POST /dql/verify` with `X-DQL-Key` → `X-DQL-Meter: ok`. Until that smoke, keep **`SELF_SERVE_LIVE=partial`**.
+Stripe Dashboard webhook (prod): endpoint `https://dql.thoughtproof.ai/dql/webhooks/stripe`, event `checkout.session.completed`, signing secret → `STRIPE_WEBHOOK_SECRET`. Shared ThoughtProof Stripe account: only sessions with `metadata.dql_checkout=1` are fulfilled; other events are ignored.
+
+**Prod flip (Raul):** set `DQL_CHECKOUT_ENABLED=true` only after **all** of: `STRIPE_WEBHOOK_SECRET`, Upstash, prepaid ledger deployed, trial email∪fingerprint guards deployed, **and** both `DQL_STRIPE_PRICE_STARTER` + `DQL_STRIPE_PRICE_PLUS` exist as one-time Prices in the Stripe Dashboard. Redeploy. Smoke: pack Checkout → reveal once → N prepaid verifies decrement → N+1 `402 CREDITS_EXHAUSTED`; PAYG opt-in meters; trial is 5 checks then hard-stop. Until that smoke, keep **`SELF_SERVE_LIVE=partial`**. Do not claim live packs from a merge.
+
+### Prepaid packs, PAYG opt-in, trial (code; flag OFF)
+
+Same `dqlk_…` key. Daily-cap (`dql:usage:…`) still applies. Sandbox stays free/keyless. x402 path untouched.
+
+| `pack` | Stripe Checkout | Grant | After 0 credits |
+|---|---|---|---|
+| `starter` | `mode=payment` · `DQL_STRIPE_PRICE_STARTER` | 200 prepaid credits ($8) | hard-stop unless `payg_opt_in` |
+| `plus` | `mode=payment` · `DQL_STRIPE_PRICE_PLUS` | 1000 prepaid credits ($35) | hard-stop unless `payg_opt_in` |
+| `payg` | `mode=subscription` if `DQL_STRIPE_PRICE_ID`, else `setup` | no credits; sets `payg_opt_in` | existing Stripe meter @ $0.05 / live verify |
+| `trial` | `mode=setup` (card bind, $0) | 5 checks, `trial=true` on the ledger | hard-stop unless `payg_opt_in` |
+
+Credit amounts live in `src/auth/packs.ts` (not Stripe metadata as the source of truth). Balance is `dql:credits:<sha256>`; grant history is `dql:credit-ledger:<sha256>` so trial grants (`trial=true`) are distinct from paid pack grants. Never a second live key for the same Stripe customer — a later pack **adds credits** to the existing key.
+
+**Verify (`POST /dql/verify`, non-sandbox, store key):**
+1. Daily-cap (existing `429 QUOTA_EXCEEDED`).
+2. If credit balance > 0 → decrement 1 atomically, allow, **do not** Stripe-meter (`X-DQL-Billing: credit`).
+3. If balance 0 and `payg_opt_in` → existing Stripe meter path.
+4. If balance 0 and not PAYG → `402 CREDITS_EXHAUSTED` (hard-stop; never silently allow).
+
+**Trial rules (not a plan):** card + email required. Once per `email_normalized` ∪ Stripe `card_fingerprint` (reuse of either burns it → `409 TRIAL_ALREADY_USED`). No card fingerprint after setup → `402 TRIAL_REQUIRES_CARD`, no credits. Consumer copy: trial / first 5 checks. `no_freemium=true`.
+
+Webhook HMAC still required. No plaintext keys in logs.
 
 Webhook signature is required. No Stripe secrets in the repo.
 
@@ -171,4 +198,4 @@ Webhook signature is required. No Stripe secrets in the repo.
 - Smoke: counter@cap → **429** `QUOTA_EXCEEDED` (`dql_msthu647_ip91cp`); after reset → **200** metered (`dql_msthu6sb_amgn7z`)
 - Artifact: `memory/artifacts/dql-upstash-prod-bind-2026-08-15.json`
 
-**Honest claims:** crypto pay-per-call (x402) and fiat meter emit (Stripe canary) work in Production. Daily-cap brake is live. Checkout **code** can mint a persisted billable key, but the public flag is **OFF** — not a live self-serve claim. No freemium. Invite/dev keys still free. Env canary `dql-canary` → `cus_V4abfGkmWdyxyC` is unchanged.
+**Honest claims:** crypto pay-per-call (x402) and fiat meter emit (Stripe canary) work in Production. Daily-cap brake is live. Checkout **code** can mint a persisted key, grant prepaid credits, and gate a 5-check trial, but the public flag is **OFF** and pack price env vars are unset in Production — not a live self-serve or live-pack claim. `no_freemium=true`. Invite/dev keys still free (manual). Env canary `dql-canary` → `cus_V4abfGkmWdyxyC` is unchanged.

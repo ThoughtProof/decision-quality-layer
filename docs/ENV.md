@@ -87,22 +87,28 @@ Billable keys only (`dev_access: false`). Idempotency key = DQL `request_id`. Me
 
 **Pricing note:** the API meter event sends `value=1` (one call unit). The **$0.05 USD** price must be configured on the Stripe Meter / Price object in the Dashboard — not in the event payload.
 
-### Public Checkout (self-serve mint — default OFF)
+### Public Checkout (self-serve mint + packs — default OFF)
 
-Merge does **not** turn on public billing. `POST /dql/checkout` returns `503 CHECKOUT_DISABLED` until the flag is on.
+Merge does **not** turn on public billing and does **not** make packs live. `POST /dql/checkout` returns `503 CHECKOUT_DISABLED` until the flag is on. Do not set `DQL_CHECKOUT_ENABLED` until the prepaid ledger, trial guards, **and** both pack Prices exist in the Stripe Dashboard.
+
+`POST` body: `{ "email": "…", "pack": "trial"|"starter"|"plus"|"payg" }`. Missing/unknown `pack` → `400 INVALID_REQUEST`.
 
 | Variable | Required | Effect |
 |----------|----------|--------|
 | `DQL_CHECKOUT_ENABLED` | no | `true`/`1`/`on` to create Checkout Sessions. **Default off.** |
 | `STRIPE_SECRET_KEY` | with flag | Same secret as the meter rail. |
 | `STRIPE_WEBHOOK_SECRET` | webhook | `whsec_…` from Stripe Dashboard or `stripe listen`. Unsigned webhooks are rejected. |
-| `DQL_STRIPE_PRICE_ID` | recommended | Dashboard metered price id. When set, Checkout is `mode=subscription` (pay-as-you-go invoices). When unset, Checkout is `mode=setup` (card on file; attach the metered price in Dashboard if invoices should generate). |
+| `DQL_STRIPE_PRICE_STARTER` | for `pack=starter` | One-time Dashboard Price ($8 / 200 credits). Missing → that pack's POST is `503 CHECKOUT_UNAVAILABLE`. Do not hardcode `price_…` ids. |
+| `DQL_STRIPE_PRICE_PLUS` | for `pack=plus` | One-time Dashboard Price ($35 / 1000 credits). Missing → `503 CHECKOUT_UNAVAILABLE`. |
+| `DQL_STRIPE_PRICE_ID` | for `pack=payg` subscription | Existing metered PAYG price. When set, `pack=payg` is `mode=subscription`. When unset, `pack=payg` is `mode=setup` (card on file). Does not grant credits. |
 | `DQL_PUBLIC_BASE_URL` | no | Success URL origin. Default `https://$VERCEL_URL` or `https://dql.thoughtproof.ai`. |
 | `DQL_CHECKOUT_CANCEL_URL` | no | Cancel URL. Default `{publicBase}/`. |
 
-Self-serve keys are always `dev_access: false`. Plaintext is never logged and is stored only in a 15-minute one-time reveal token. Success URL uses `session_id`, not the raw key.
+Credit amounts (5 / 200 / 1000) are defined in `src/auth/packs.ts`, not in Stripe metadata. Ledger keys: `dql:credits:<sha256>` (balance), `dql:credit-ledger:<sha256>` (grants, including `trial=true`), `dql:trial-email:<sha256(email)>`, `dql:trial-fp:<fingerprint>`. Daily-cap stays on `dql:usage:…`.
 
-See `docs/PAYMENT.md` § Checkout / webhook for local `stripe listen` + prod flip. Do not claim `SELF_SERVE_LIVE=true` until the flag is on and smoked.
+Self-serve keys are always `dev_access: false`. PAYG is **opt-in** (`payg_opt_in` on the key). Zero credits + no PAYG → `402 CREDITS_EXHAUSTED`. Trial is the first 5 checks, once per email ∪ card fingerprint, card required — not a plan. `no_freemium=true`. Plaintext is never logged and is stored only in a 15-minute one-time reveal token. Success URL uses `session_id`, not the raw key.
+
+See `docs/PAYMENT.md` § Checkout / webhook and § Prepaid packs. Do not claim `SELF_SERVE_LIVE=true` until the flag is on and smoked.
 
 ### x402 (P2 Rail B — default OFF)
 

@@ -8,23 +8,35 @@
  * Redis layout (never plaintext after create):
  *   dql:key:<sha256hex>           → StoredKeyRecord
  *   dql:owner-cus:<owner>         → cus_…
+ *   dql:cus-key:<cus_…>           → key hash (one live key per customer)
  *   dql:checkout:<session_id>     → CheckoutMintState
  *   dql:reveal:<token>            → { key }  (short TTL, GETDEL once)
  *   dql:mint-lock:<session_id>    → "1" (short TTL, mint race)
+ *   dql:credits:<sha256hex>       → integer balance (atomic DECR)
+ *   dql:credit-ledger:<sha256hex> → { grants: CreditGrant[] }
+ *   dql:trial-email:<sha256(email)> → claim marker
+ *   dql:trial-fp:<card_fingerprint> → claim marker
  *
  * Usage counters stay on `dql:usage:<sha256[:24]>:<day>` (src/auth/usage.ts).
+ * Credits and daily-cap are both enforced; namespaces do not collide.
  */
 
 import { Redis } from '@upstash/redis';
 
 import { DEFAULT_DAILY_CAP, type ApiKeyRecord } from './keys.js';
 import { keyDisplayPrefix, sha256Hex } from './key-hash.js';
+import type { CheckoutPack } from './packs.js';
 
 export const KEY_RECORD_PREFIX = 'dql:key:';
 export const OWNER_CUS_PREFIX = 'dql:owner-cus:';
+export const CUS_KEY_PREFIX = 'dql:cus-key:';
 export const CHECKOUT_PREFIX = 'dql:checkout:';
 export const REVEAL_PREFIX = 'dql:reveal:';
 export const MINT_LOCK_PREFIX = 'dql:mint-lock:';
+export const CREDITS_PREFIX = 'dql:credits:';
+export const CREDIT_LEDGER_PREFIX = 'dql:credit-ledger:';
+export const TRIAL_EMAIL_PREFIX = 'dql:trial-email:';
+export const TRIAL_FP_PREFIX = 'dql:trial-fp:';
 
 export const REVEAL_TTL_SEC = 15 * 60;
 export const MINT_LOCK_TTL_SEC = 60;
@@ -39,17 +51,47 @@ export interface StoredKeyRecord {
   dev_access: false;
   daily_cap: number;
   source: 'self_serve';
+  /** PAYG meter is opt-in. Zero credits + false → hard-stop. */
+  payg_opt_in: boolean;
+  /** True if this key ever received a trial grant (distinct from paid packs). */
+  trial: boolean;
+  email_normalized?: string;
 }
+
+export type CheckoutFulfillStatus =
+  | 'pending'
+  | 'minted'
+  | 'credits_added'
+  | 'payg_enabled'
+  | 'trial_used'
+  | 'trial_no_card'
+  | 'rejected';
 
 export interface CheckoutMintState {
   session_id: string;
   customer_id: string;
   owner: string;
-  status: 'pending' | 'minted';
+  status: CheckoutFulfillStatus;
+  pack?: CheckoutPack;
   key_hash?: string;
   prefix?: string;
   reveal_token?: string;
   minted_at?: string;
+  credits_added?: number;
+  trial?: boolean;
+  reason?: string;
+}
+
+export interface CreditGrant {
+  pack: CheckoutPack;
+  credits: number;
+  trial: boolean;
+  session_id: string;
+  at: string;
+}
+
+export interface CreditLedgerRecord {
+  grants: CreditGrant[];
 }
 
 export interface RevealPayload {
@@ -65,7 +107,12 @@ export interface KvStore {
   ): Promise<'OK' | string | boolean | null>;
   del(...keys: string[]): Promise<number>;
   getdel?<T = unknown>(key: string): Promise<T | null>;
+  incrby(key: string, n: number): Promise<number>;
+  decr(key: string): Promise<number>;
 }
+
+export type ConsumeCreditResult = 'consumed' | 'empty' | 'error';
+export type TrialClaimResult = 'ok' | 'already_used';
 
 export interface KeyStore {
   lookup(plaintextKey: string): Promise<ApiKeyRecord | undefined>;
@@ -74,11 +121,19 @@ export interface KeyStore {
   revokeByHash(hash: string): Promise<boolean>;
   getCustomerByOwner(owner: string): Promise<string | undefined>;
   putCustomerMap(owner: string, customerId: string): Promise<void>;
+  getKeyHashByCustomer(customerId: string): Promise<string | undefined>;
+  putCustomerKey(customerId: string, keyHash: string): Promise<void>;
   getCheckout(sessionId: string): Promise<CheckoutMintState | null>;
   putCheckout(state: CheckoutMintState): Promise<void>;
   putReveal(token: string, plaintextKey: string, ttlSec?: number): Promise<void>;
   consumeReveal(token: string): Promise<string | null>;
   acquireMintLock(sessionId: string): Promise<boolean>;
+  consumeCredit(keyHash: string): Promise<ConsumeCreditResult>;
+  addCredits(keyHash: string, amount: number): Promise<number>;
+  creditBalance(keyHash: string): Promise<number>;
+  recordCreditGrant(keyHash: string, grant: CreditGrant): Promise<void>;
+  getCreditLedger(keyHash: string): Promise<CreditLedgerRecord | null>;
+  claimTrial(emailNormalized: string, cardFingerprint: string): Promise<TrialClaimResult>;
 }
 
 function asRecord(v: unknown): StoredKeyRecord | null {
@@ -110,6 +165,9 @@ function asRecord(v: unknown): StoredKeyRecord | null {
         ? Math.floor(r.daily_cap)
         : DEFAULT_DAILY_CAP,
     source: 'self_serve',
+    payg_opt_in: r.payg_opt_in === true,
+    trial: r.trial === true,
+    email_normalized: typeof r.email_normalized === 'string' ? r.email_normalized : undefined,
   };
 }
 
@@ -127,16 +185,77 @@ function asCheckout(v: unknown): CheckoutMintState | null {
   const r = obj as Record<string, unknown>;
   if (typeof r.session_id !== 'string' || typeof r.customer_id !== 'string') return null;
   if (typeof r.owner !== 'string') return null;
+  const status = parseCheckoutStatus(r.status);
   return {
     session_id: r.session_id,
     customer_id: r.customer_id,
     owner: r.owner,
-    status: r.status === 'minted' ? 'minted' : 'pending',
+    status,
+    pack: isPackSlug(r.pack) ? r.pack : undefined,
     key_hash: typeof r.key_hash === 'string' ? r.key_hash : undefined,
     prefix: typeof r.prefix === 'string' ? r.prefix : undefined,
     reveal_token: typeof r.reveal_token === 'string' ? r.reveal_token : undefined,
     minted_at: typeof r.minted_at === 'string' ? r.minted_at : undefined,
+    credits_added: typeof r.credits_added === 'number' ? r.credits_added : undefined,
+    trial: r.trial === true ? true : undefined,
+    reason: typeof r.reason === 'string' ? r.reason : undefined,
   };
+}
+
+const CHECKOUT_STATUSES: CheckoutFulfillStatus[] = [
+  'pending',
+  'minted',
+  'credits_added',
+  'payg_enabled',
+  'trial_used',
+  'trial_no_card',
+  'rejected',
+];
+
+function parseCheckoutStatus(v: unknown): CheckoutFulfillStatus {
+  return typeof v === 'string' && (CHECKOUT_STATUSES as string[]).includes(v)
+    ? (v as CheckoutFulfillStatus)
+    : 'pending';
+}
+
+function isPackSlug(v: unknown): v is CheckoutPack {
+  return v === 'trial' || v === 'starter' || v === 'plus' || v === 'payg';
+}
+
+function asInt(v: unknown): number {
+  if (typeof v === 'number' && Number.isFinite(v)) return Math.floor(v);
+  if (typeof v === 'string' && /^-?\d+$/.test(v.trim())) return parseInt(v, 10);
+  return 0;
+}
+
+function asLedger(v: unknown): CreditLedgerRecord | null {
+  if (v == null) return null;
+  let obj: unknown = v;
+  if (typeof v === 'string') {
+    try {
+      obj = JSON.parse(v);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof obj !== 'object' || obj === null) return null;
+  const grantsRaw = (obj as { grants?: unknown }).grants;
+  if (!Array.isArray(grantsRaw)) return { grants: [] };
+  const grants: CreditGrant[] = [];
+  for (const g of grantsRaw) {
+    if (typeof g !== 'object' || g === null) continue;
+    const row = g as Record<string, unknown>;
+    if (!isPackSlug(row.pack)) continue;
+    if (typeof row.credits !== 'number' || typeof row.session_id !== 'string') continue;
+    grants.push({
+      pack: row.pack,
+      credits: Math.floor(row.credits),
+      trial: row.trial === true,
+      session_id: row.session_id,
+      at: typeof row.at === 'string' ? row.at : new Date().toISOString(),
+    });
+  }
+  return { grants };
 }
 
 function asReveal(v: unknown): string | null {
@@ -240,6 +359,82 @@ export class UpstashKeyStore implements KeyStore {
     });
     return res === 'OK' || res === 'ok' || res === true;
   }
+
+  async getKeyHashByCustomer(customerId: string): Promise<string | undefined> {
+    if (!customerId.startsWith('cus_')) return undefined;
+    try {
+      const v = await this.kv.get(`${CUS_KEY_PREFIX}${customerId}`);
+      return typeof v === 'string' && v.length > 0 ? v : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async putCustomerKey(customerId: string, keyHash: string): Promise<void> {
+    if (!customerId.startsWith('cus_') || !keyHash) return;
+    await this.kv.set(`${CUS_KEY_PREFIX}${customerId}`, keyHash);
+  }
+
+  async consumeCredit(keyHash: string): Promise<ConsumeCreditResult> {
+    if (!keyHash) return 'error';
+    const redisKey = `${CREDITS_PREFIX}${keyHash}`;
+    try {
+      const n = await this.kv.decr(redisKey);
+      if (n >= 0) return 'consumed';
+      await this.kv.incrby(redisKey, 1);
+      return 'empty';
+    } catch {
+      return 'error';
+    }
+  }
+
+  async addCredits(keyHash: string, amount: number): Promise<number> {
+    const n = Math.floor(amount);
+    if (!keyHash || n <= 0) return this.creditBalance(keyHash);
+    return this.kv.incrby(`${CREDITS_PREFIX}${keyHash}`, n);
+  }
+
+  async creditBalance(keyHash: string): Promise<number> {
+    if (!keyHash) return 0;
+    try {
+      return Math.max(0, asInt(await this.kv.get(`${CREDITS_PREFIX}${keyHash}`)));
+    } catch {
+      return 0;
+    }
+  }
+
+  async recordCreditGrant(keyHash: string, grant: CreditGrant): Promise<void> {
+    const redisKey = `${CREDIT_LEDGER_PREFIX}${keyHash}`;
+    const existing = asLedger(await this.kv.get(redisKey)) ?? { grants: [] };
+    existing.grants.push(grant);
+    await this.kv.set(redisKey, existing);
+  }
+
+  async getCreditLedger(keyHash: string): Promise<CreditLedgerRecord | null> {
+    try {
+      return asLedger(await this.kv.get(`${CREDIT_LEDGER_PREFIX}${keyHash}`));
+    } catch {
+      return null;
+    }
+  }
+
+  async claimTrial(emailNormalized: string, cardFingerprint: string): Promise<TrialClaimResult> {
+    const email = emailNormalized.trim().toLowerCase();
+    const fp = cardFingerprint.trim();
+    if (!email || !fp) return 'already_used';
+    const emailKey = `${TRIAL_EMAIL_PREFIX}${sha256Hex(email)}`;
+    const fpKey = `${TRIAL_FP_PREFIX}${fp}`;
+    const marker = { at: new Date().toISOString() };
+    const emailOk = await this.kv.set(emailKey, marker, { nx: true });
+    if (!nxOk(emailOk)) return 'already_used';
+    const fpOk = await this.kv.set(fpKey, marker, { nx: true });
+    if (!nxOk(fpOk)) return 'already_used';
+    return 'ok';
+  }
+}
+
+function nxOk(res: 'OK' | string | boolean | null): boolean {
+  return res === 'OK' || res === 'ok' || res === true;
 }
 
 export function storedToAuthRecord(rec: StoredKeyRecord): ApiKeyRecord {
@@ -250,6 +445,8 @@ export function storedToAuthRecord(rec: StoredKeyRecord): ApiKeyRecord {
     stripe_customer_id: rec.stripe_customer_id,
     revoked: rec.revoked,
     source: 'store',
+    payg_opt_in: rec.payg_opt_in === true,
+    trial: rec.trial === true,
   };
 }
 
@@ -259,6 +456,9 @@ export function newStoredKeyRecord(opts: {
   stripeCustomerId: string;
   dailyCap?: number;
   now?: () => Date;
+  paygOptIn?: boolean;
+  trial?: boolean;
+  emailNormalized?: string;
 }): StoredKeyRecord {
   return {
     hash: sha256Hex(opts.plaintextKey),
@@ -270,6 +470,9 @@ export function newStoredKeyRecord(opts: {
     dev_access: false,
     daily_cap: opts.dailyCap ?? DEFAULT_DAILY_CAP,
     source: 'self_serve',
+    payg_opt_in: opts.paygOptIn === true,
+    trial: opts.trial === true,
+    email_normalized: opts.emailNormalized,
   };
 }
 
@@ -297,6 +500,8 @@ export function createKeyStore(env: NodeJS.ProcessEnv = process.env): KeyStore |
     },
     del: (...keys) => redis.del(...keys),
     getdel: (key) => redis.getdel(key),
+    incrby: (key, n) => redis.incrby(key, n),
+    decr: (key) => redis.decr(key),
   };
   return new UpstashKeyStore(kv);
 }
@@ -339,6 +544,18 @@ export function createMemoryKv(): KvStore & { dump(): Map<string, unknown> } {
       if (!row) return null;
       data.delete(key);
       return row.value as T;
+    },
+    async incrby(key, n) {
+      const row = alive(key);
+      const next = asInt(row?.value) + n;
+      data.set(key, { value: next, exp: row?.exp });
+      return next;
+    },
+    async decr(key) {
+      const row = alive(key);
+      const next = asInt(row?.value) - 1;
+      data.set(key, { value: next, exp: row?.exp });
+      return next;
     },
     dump() {
       const out = new Map<string, unknown>();

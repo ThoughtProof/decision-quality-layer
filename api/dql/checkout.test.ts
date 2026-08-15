@@ -73,4 +73,35 @@ describe('POST /dql/checkout — flag default OFF', () => {
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
   });
+
+  it('flag on + missing/unknown pack → 400 INVALID_REQUEST', async () => {
+    process.env.DQL_CHECKOUT_ENABLED = 'true';
+    process.env.STRIPE_SECRET_KEY = 'sk_test_x';
+    process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
+    const mod = await import('./checkout.js');
+    const missing = makeReqRes('POST', { body: { email: 'a@b.co' } });
+    await mod.default(missing.req, missing.res);
+    expect(missing.state.statusCode).toBe(400);
+    expect(missing.state.jsonBody.code).toBe('INVALID_REQUEST');
+
+    const unknown = makeReqRes('POST', { body: { email: 'a@b.co', pack: 'builder' } });
+    await mod.default(unknown.req, unknown.res);
+    expect(unknown.state.statusCode).toBe(400);
+    expect(unknown.state.jsonBody.code).toBe('INVALID_REQUEST');
+  });
+
+  it('flag on + starter without pack price → 503 CHECKOUT_UNAVAILABLE', async () => {
+    process.env.DQL_CHECKOUT_ENABLED = 'true';
+    process.env.STRIPE_SECRET_KEY = 'sk_test_x';
+    process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
+    const mod = await import('./checkout.js');
+    const { req, res, state } = makeReqRes('POST', {
+      body: { email: 'a@b.co', pack: 'starter' },
+    });
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(503);
+    expect(state.jsonBody.code).toBe('CHECKOUT_UNAVAILABLE');
+  });
 });
