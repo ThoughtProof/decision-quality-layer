@@ -138,20 +138,18 @@ export async function readRawBody(req: {
   body?: unknown;
   on?: (event: string, cb: (chunk: Buffer | string) => void) => void;
 }): Promise<string> {
+  // Vercel may still parse JSON into req.body even with `bodyParser: false`.
+  // The Node stream still has the exact bytes Stripe signed — prefer that.
+  // Never JSON.stringify a parsed object for HMAC (key order / whitespace diverge).
+  if (typeof req.on === 'function') {
+    return await new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      req.on!('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      req.on!('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      req.on!('error', (err) => reject(err));
+    });
+  }
   if (typeof req.body === 'string') return req.body;
   if (Buffer.isBuffer(req.body)) return req.body.toString('utf8');
-  if (req.body != null && typeof req.body === 'object') {
-    // Parsed JSON cannot be used for HMAC — caller must disable bodyParser.
-    throw new Error('raw_body_unavailable');
-  }
-  return await new Promise((resolve, reject) => {
-    if (typeof req.on !== 'function') {
-      reject(new Error('raw_body_unavailable'));
-      return;
-    }
-    const chunks: Buffer[] = [];
-    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', (err) => reject(err));
-  });
+  throw new Error('raw_body_unavailable');
 }
