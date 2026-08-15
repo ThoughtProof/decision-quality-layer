@@ -92,7 +92,7 @@ export function emitUsageLine(opts: {
   devAccess: boolean;
   priceUsd: number;
   verdict?: string;
-  billingRail?: 'dev-access' | 'stripe' | 'x402' | 'metered-log-only' | 'sandbox';
+  billingRail?: 'dev-access' | 'stripe' | 'x402' | 'metered-log-only' | 'sandbox' | 'credit';
 }): void {
   console.log(
     JSON.stringify({

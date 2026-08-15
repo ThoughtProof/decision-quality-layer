@@ -1,9 +1,10 @@
 /**
  * POST /dql/checkout  — start Stripe Checkout (flag-gated, default OFF)
+ *   body: { email, pack: "trial"|"starter"|"plus"|"payg" }
  * GET  /dql/checkout?session_id=cs_… — reveal minted key once
  *
- * Merge ≠ public billing. Production stays closed until
- * `DQL_CHECKOUT_ENABLED=true` plus Stripe + Upstash secrets.
+ * Merge ≠ public billing. Merge ≠ live packs. Production stays closed until
+ * `DQL_CHECKOUT_ENABLED=true` plus Stripe + Upstash + both pack prices.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -71,7 +72,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         owner: revealed.owner,
         shown_once: true as const,
         header: 'X-DQL-Key',
-        price_usd_per_call: 0.05,
+        pack: revealed.pack,
+        no_freemium: true as const,
       };
       const accept = String(req.headers.accept ?? '');
       if (accept.includes('text/html')) {
@@ -81,6 +83,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return;
       }
       return res.status(200).json(payload);
+    }
+    if (revealed.kind === 'ok_existing') {
+      return res.status(200).json({
+        already_had_key: true,
+        pack: revealed.pack,
+        credits_added: revealed.credits_added,
+        balance: revealed.balance,
+        payg_opt_in: revealed.payg_opt_in,
+        prefix: revealed.prefix,
+        owner: revealed.owner,
+        no_freemium: true,
+      });
+    }
+    if (revealed.kind === 'trial_used') {
+      return res.status(409).json({
+        error: 'Trial already used for this email or card.',
+        code: 'TRIAL_ALREADY_USED',
+        no_freemium: true,
+      });
+    }
+    if (revealed.kind === 'trial_no_card') {
+      return res.status(402).json({
+        error: 'Trial requires a card on file.',
+        code: 'TRIAL_REQUIRES_CARD',
+        no_freemium: true,
+      });
     }
     if (revealed.kind === 'pending' || revealed.kind === 'in_progress') {
       return res.status(202).json({
@@ -127,12 +155,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  const email =
-    typeof req.body === 'object' && req.body && typeof (req.body as { email?: unknown }).email === 'string'
-      ? (req.body as { email: string }).email
-      : '';
+  const body = typeof req.body === 'object' && req.body ? (req.body as Record<string, unknown>) : {};
+  const email = typeof body.email === 'string' ? body.email : '';
+  const pack = body.pack;
 
-  const created = await createCheckoutSession({ email, store, config: cfg });
+  const created = await createCheckoutSession({ email, pack, store, config: cfg });
   if (created.kind === 'disabled') {
     return res.status(503).json({
       error: 'Public checkout is not enabled.',
@@ -141,11 +168,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
   if (created.kind === 'invalid') {
     return res.status(400).json({
-      error: 'A valid email is required.',
+      error:
+        created.reason === 'invalid_pack'
+          ? 'pack must be trial, starter, plus, or payg.'
+          : 'A valid email is required.',
       code: 'INVALID_REQUEST',
     });
   }
-  if (created.kind === 'unconfigured' || created.kind === 'error') {
+  if (created.kind === 'unconfigured') {
+    return res.status(503).json({
+      error:
+        created.reason === 'missing_pack_price'
+          ? 'This pack is not configured (Stripe price missing).'
+          : 'Checkout is not configured.',
+      code: 'CHECKOUT_UNAVAILABLE',
+    });
+  }
+  if (created.kind === 'error') {
     return res.status(502).json({
       error: 'Unable to start checkout.',
       code: 'CHECKOUT_UNAVAILABLE',
@@ -155,6 +194,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   return res.status(200).json({
     url: created.url,
     session_id: created.session_id,
+    pack: created.pack,
+    no_freemium: true,
   });
 }
 
@@ -170,7 +211,7 @@ function renderRevealHtml(apiKey: string, prefix: string): string {
 </style></head><body>
 <h1>Your DQL API key</h1>
 <p>Shown once. Copy it now. Header: <code style="display:inline;padding:.2rem .4rem">X-DQL-Key</code> or <code style="display:inline;padding:.2rem .4rem">Authorization: Bearer</code>.</p>
-<p>Prefix ${prefix.replace(/</g, '')} · $0.05 / call · no freemium</p>
+<p>Prefix ${prefix.replace(/</g, '')} · prepaid credits or opt-in PAYG · no freemium</p>
 <code>${escaped}</code>
 </body></html>`;
 }

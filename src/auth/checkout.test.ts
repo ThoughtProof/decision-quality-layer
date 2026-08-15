@@ -55,6 +55,7 @@ describe('finalizeCheckoutMint + auth + meter + revoke', () => {
       customerId,
       owner,
       store,
+      pack: 'payg',
     });
     expect(minted.kind).toBe('minted');
     if (minted.kind !== 'minted') return;
@@ -135,12 +136,14 @@ describe('finalizeCheckoutMint + auth + meter + revoke', () => {
       customerId: 'cus_dup',
       owner: 'ss:cus_dup',
       store,
+      pack: 'payg',
     });
     const b = await finalizeCheckoutMint({
       sessionId: 'cs_dup',
       customerId: 'cus_dup',
       owner: 'ss:cus_dup',
       store,
+      pack: 'payg',
     });
     expect(a.kind).toBe('minted');
     expect(b.kind).toBe('already_minted');
@@ -159,6 +162,7 @@ describe('createCheckoutSession', () => {
     expect(
       await createCheckoutSession({
         email: 'not-an-email',
+        pack: 'payg',
         store,
         config: cfg,
         fetchImpl: (async () => {
@@ -170,10 +174,23 @@ describe('createCheckoutSession', () => {
     expect(
       await createCheckoutSession({
         email: 'a@b.co',
+        pack: 'payg',
         store,
         config: { ...cfg, enabled: false },
       }),
     ).toEqual({ kind: 'disabled' });
+
+    expect(
+      await createCheckoutSession({
+        email: 'a@b.co',
+        pack: 'nope',
+        store,
+        config: cfg,
+        fetchImpl: (async () => {
+          throw new Error('stripe must not be called');
+        }) as unknown as typeof fetch,
+      }),
+    ).toEqual({ kind: 'invalid', reason: 'invalid_pack' });
   });
 
   it('creates customer + setup-mode session and persists pending checkout', async () => {
@@ -204,6 +221,7 @@ describe('createCheckoutSession', () => {
 
     const r = await createCheckoutSession({
       email: 'buyer@example.com',
+      pack: 'payg',
       store,
       config: cfg,
       fetchImpl,
@@ -226,6 +244,7 @@ describe('revealCheckoutKey', () => {
       customerId: 'cus_r',
       owner: 'ss:cus_r',
       store,
+      pack: 'payg',
     });
     expect(minted.kind).toBe('minted');
     if (minted.kind !== 'minted') return;
@@ -239,7 +258,7 @@ describe('revealCheckoutKey', () => {
           id: 'cs_reveal',
           status: 'complete',
           customer: 'cus_r',
-          metadata: { dql_checkout: '1', owner: 'ss:cus_r' },
+          metadata: { dql_checkout: '1', owner: 'ss:cus_r', pack: 'payg' },
         }),
       };
     }) as unknown as typeof fetch;
@@ -282,7 +301,7 @@ describe('handleStripeWebhookEvent', () => {
         object: {
           id: 'cs_unsigned',
           customer: 'cus_x',
-          metadata: { dql_checkout: '1', owner: 'ss:cus_x' },
+          metadata: { dql_checkout: '1', owner: 'ss:cus_x', pack: 'payg' },
         },
       },
     });
@@ -309,7 +328,7 @@ describe('handleStripeWebhookEvent', () => {
         object: {
           id: 'cs_signed',
           customer: 'cus_signed',
-          metadata: { dql_checkout: '1', owner: 'ss:cus_signed' },
+          metadata: { dql_checkout: '1', owner: 'ss:cus_signed', pack: 'payg' },
         },
       },
     });
@@ -338,6 +357,29 @@ describe('handleStripeWebhookEvent', () => {
     });
     expect(denied.kind).toBe('deny');
     spy.mockRestore();
+  });
+
+  it('ignores DQL sessions with no pack (fail closed, no mint)', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const body = JSON.stringify({
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: 'cs_nopack',
+          customer: 'cus_nopack',
+          metadata: { dql_checkout: '1', owner: 'ss:cus_nopack' },
+        },
+      },
+    });
+    const r = await handleStripeWebhookEvent({
+      rawBody: body,
+      signatureHeader: sign(body, secret, t),
+      webhookSecret: secret,
+      store,
+      nowSec: t,
+    });
+    expect(r).toEqual({ kind: 'ignored', reason: 'invalid_pack' });
+    expect(await store.getCheckout('cs_nopack')).toBeNull();
   });
 
   it('ignores non-DQL sessions on a shared Stripe account', async () => {

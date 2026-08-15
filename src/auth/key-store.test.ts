@@ -57,6 +57,27 @@ describe('UpstashKeyStore (memory)', () => {
     expect(await store.lookup(key)).toBeUndefined();
   });
 
+  it('credits decrement atomically and trial claim is once per email ∪ fingerprint', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_c',
+      stripeCustomerId: 'cus_c',
+    });
+    await store.putKey(rec);
+    expect(await store.addCredits(rec.hash, 2)).toBe(2);
+    expect(await store.consumeCredit(rec.hash)).toBe('consumed');
+    expect(await store.consumeCredit(rec.hash)).toBe('consumed');
+    expect(await store.consumeCredit(rec.hash)).toBe('empty');
+    expect(await store.creditBalance(rec.hash)).toBe(0);
+
+    expect(await store.claimTrial('a@b.co', 'fp_1')).toBe('ok');
+    expect(await store.claimTrial('a@b.co', 'fp_2')).toBe('already_used');
+    expect(await store.claimTrial('c@d.co', 'fp_1')).toBe('already_used');
+    expect(await store.claimTrial('e@f.co', 'fp_3')).toBe('ok');
+  });
+
   it('reveal is one-time (GETDEL)', async () => {
     const store = new UpstashKeyStore(createMemoryKv());
     const key = generateApiKey();
@@ -96,6 +117,7 @@ describe('authorizeCall env ∪ store', () => {
         plaintextKey: key,
         owner: 'ss:cus_mint',
         stripeCustomerId: 'cus_mint',
+        paygOptIn: true,
       }),
     );
 

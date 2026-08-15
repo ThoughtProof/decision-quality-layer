@@ -31,6 +31,7 @@
 import { timingSafeEqual } from 'node:crypto';
 
 import { PRICE_USD_PER_CALL } from '../pricing.js';
+import { sha256Hex } from './key-hash.js';
 
 export interface ApiKeyRecord {
   owner: string;
@@ -40,11 +41,17 @@ export interface ApiKeyRecord {
   stripe_customer_id?: string;
   revoked?: boolean;
   source?: 'env' | 'store';
+  /** Store keys only. PAYG meter is opt-in; false + 0 credits → hard-stop. */
+  payg_opt_in?: boolean;
+  /** Store keys only. True when a trial grant is on this key (not a paid pack). */
+  trial?: boolean;
 }
 
 /** Optional persisted-key lookup (Upstash). Env registry is checked first. */
 export interface KeyLookup {
   lookup(plaintextKey: string): Promise<ApiKeyRecord | undefined>;
+  /** Atomic prepaid decrement. Store keys only. */
+  consumeCredit?(keyHash: string): Promise<'consumed' | 'empty' | 'error'>;
 }
 
 export const DEFAULT_DAILY_CAP = 1000;
@@ -98,15 +105,19 @@ export function extractApiKey(headers: HeaderMap): string | null {
 
 export interface AuthErrorPayload {
   error: string;
-  code: 'PAYMENT_REQUIRED' | 'QUOTA_EXCEEDED';
+  code: 'PAYMENT_REQUIRED' | 'QUOTA_EXCEEDED' | 'CREDITS_EXHAUSTED' | 'CREDITS_UNAVAILABLE';
   price_usd_per_call?: number;
   access?: string;
   retry_after?: string;
+  no_freemium?: true;
 }
+
+/** How a store/env key is billed after daily-cap. */
+export type AllowBilling = 'dev-access' | 'credit' | 'payg' | 'env-metered';
 
 export type AuthDecision =
   | { kind: 'free_sandbox' }
-  | { kind: 'allow'; key: string; record: ApiKeyRecord }
+  | { kind: 'allow'; key: string; record: ApiKeyRecord; billing: AllowBilling }
   | { kind: 'deny'; status: number; payload: AuthErrorPayload };
 
 /** Usage accounting port — implemented by Upstash (src/auth/usage.ts) or a
@@ -170,7 +181,56 @@ export async function authorizeCall(opts: {
     };
   }
 
-  return { kind: 'allow', key, record };
+  if (record.dev_access) {
+    return { kind: 'allow', key, record, billing: 'dev-access' };
+  }
+
+  // Prepaid ledger applies to store-minted keys only. Env canary / bootstrap
+  // keys keep the existing meter path (env wins; dql-canary unchanged).
+  if (record.source === 'store') {
+    const consume = opts.store?.consumeCredit;
+    if (!consume) {
+      return {
+        kind: 'deny',
+        status: 503,
+        payload: {
+          error: 'Credit ledger unavailable.',
+          code: 'CREDITS_UNAVAILABLE',
+          no_freemium: true,
+        },
+      };
+    }
+    const spent = await consume.call(opts.store, sha256Hex(key));
+    if (spent === 'consumed') {
+      return { kind: 'allow', key, record, billing: 'credit' };
+    }
+    if (spent === 'error') {
+      return {
+        kind: 'deny',
+        status: 503,
+        payload: {
+          error: 'Credit ledger unavailable.',
+          code: 'CREDITS_UNAVAILABLE',
+          no_freemium: true,
+        },
+      };
+    }
+    if (record.payg_opt_in === true) {
+      return { kind: 'allow', key, record, billing: 'payg' };
+    }
+    return {
+      kind: 'deny',
+      status: 402,
+      payload: {
+        error: 'Prepaid credits exhausted. Opt in to pay-as-you-go or buy a credit pack.',
+        code: 'CREDITS_EXHAUSTED',
+        price_usd_per_call: PRICE_USD_PER_CALL,
+        no_freemium: true,
+      },
+    };
+  }
+
+  return { kind: 'allow', key, record, billing: 'env-metered' };
 }
 
 /**

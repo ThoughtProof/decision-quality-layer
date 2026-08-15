@@ -189,7 +189,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         type AuthPath =
           | { kind: 'free_sandbox' }
-          | { kind: 'allow'; key: string; record: import('../../src/auth/keys.js').ApiKeyRecord }
+          | {
+              kind: 'allow';
+              key: string;
+              record: import('../../src/auth/keys.js').ApiKeyRecord;
+              billing: import('../../src/auth/keys.js').AllowBilling;
+            }
           | { kind: 'x402_verified'; ctx: X402PaymentContext }
           | { kind: 'deny'; status: number; payload: object };
 
@@ -225,7 +230,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           if (auth.kind === 'deny') {
             authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
           } else if (auth.kind === 'allow') {
-            authPath = { kind: 'allow', key: auth.key, record: auth.record };
+            authPath = { kind: 'allow', key: auth.key, record: auth.record, billing: auth.billing };
           } else {
             authPath = { kind: 'free_sandbox' };
           }
@@ -254,7 +259,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           if (auth.kind === 'deny') {
             authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
           } else if (auth.kind === 'allow') {
-            authPath = { kind: 'allow', key: auth.key, record: auth.record };
+            authPath = { kind: 'allow', key: auth.key, record: auth.record, billing: auth.billing };
           } else {
             authPath = { kind: 'free_sandbox' };
           }
@@ -298,25 +303,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               dev_access: authPath.record.dev_access,
             });
             const rail = authPath.record.dev_access ? 'dev-access' : 'metered-log-only';
+            const usedCredit = authPath.billing === 'credit';
             res.setHeader(
               'X-DQL-Billing',
-              authPath.record.dev_access ? 'dev-access' : 'metered',
+              authPath.record.dev_access ? 'dev-access' : usedCredit ? 'credit' : 'metered',
             );
-            res.setHeader('X-DQL-Price-Usd', price.toFixed(2));
+            res.setHeader('X-DQL-Price-Usd', usedCredit ? '0.00' : price.toFixed(2));
             emitUsageLine({
               requestId,
               key: authPath.key,
               owner: authPath.record.owner,
               devAccess: authPath.record.dev_access,
-              priceUsd: price,
+              priceUsd: usedCredit ? 0 : price,
               verdict: (response as { verdict?: string }).verdict,
-              billingRail: rail,
+              billingRail: usedCredit ? 'credit' : rail,
             });
             // Stripe meter: AWAITED (not fire-and-forget). Vercel drops
             // dangling promises after response. Errors are logged; product
             // already delivered — do not convert 200 → 5xx. Idempotency-Key
             // = requestId allows safe retry of failed meter posts.
-            if (!authPath.record.dev_access && price > 0) {
+            // Prepaid credit calls must not also emit a meter event.
+            if (!authPath.record.dev_access && !usedCredit && price > 0) {
               const meterCfg = loadStripeMeterConfig();
               const customerId =
                 authPath.record.stripe_customer_id ??

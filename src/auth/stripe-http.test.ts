@@ -1,6 +1,7 @@
 import { createHmac } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { describe, it, expect } from 'vitest';
-import { verifyStripeSignature } from './stripe-http.js';
+import { readRawBody, verifyStripeSignature } from './stripe-http.js';
 
 function sign(payload: string, secret: string, t: number): string {
   const hex = createHmac('sha256', secret).update(`${t}.${payload}`, 'utf8').digest('hex');
@@ -48,5 +49,33 @@ describe('verifyStripeSignature', () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('timestamp_out_of_tolerance');
+  });
+});
+
+describe('readRawBody', () => {
+  it('prefers Node stream bytes over a parsed req.body object (exact Stripe payload)', async () => {
+    // Whitespace / key order that JSON.stringify(parsed) would not reproduce.
+    const raw = '{ "type": "checkout.session.completed", "b": 2, "a": 1 }';
+    const req = new EventEmitter() as EventEmitter & { body?: unknown };
+    req.body = JSON.parse(raw);
+    expect(JSON.stringify(req.body)).not.toBe(raw);
+
+    queueMicrotask(() => {
+      req.emit('data', Buffer.from(raw, 'utf8'));
+      req.emit('end');
+    });
+
+    await expect(readRawBody(req)).resolves.toBe(raw);
+  });
+
+  it('falls back to string or Buffer body when no stream is available', async () => {
+    await expect(readRawBody({ body: '{"ok":true}' })).resolves.toBe('{"ok":true}');
+    await expect(readRawBody({ body: Buffer.from('{"ok":true}', 'utf8') })).resolves.toBe('{"ok":true}');
+  });
+
+  it('fails closed on a parsed object with no stream (never re-serializes for HMAC)', async () => {
+    await expect(readRawBody({ body: { type: 'checkout.session.completed' } })).rejects.toThrow(
+      'raw_body_unavailable',
+    );
   });
 });

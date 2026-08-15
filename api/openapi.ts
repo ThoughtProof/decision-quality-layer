@@ -202,9 +202,9 @@ const spec = {
     '/dql/checkout': {
       post: {
         operationId: 'dqlCheckout',
-        summary: 'Start Stripe Checkout for a billable API key',
+        summary: 'Start Stripe Checkout for a prepaid pack, trial, or PAYG opt-in',
         description:
-          'Default OFF (`DQL_CHECKOUT_ENABLED`). Creates a Stripe Customer and Checkout Session. On completion the webhook (or GET reveal) mints one `dqlk_…` key (`dev_access: false`) bound to `cus_…`. Not a live self-serve claim until the flag is on and smoked.',
+          'Default OFF (`DQL_CHECKOUT_ENABLED`). Merge does not enable live packs. `pack` is required: `trial` (card bind + first 5 checks, once per email ∪ card fingerprint), `starter` (200 credits), `plus` (1000 credits), or `payg` (opt-in meter, no prepaid credits). Missing pack price env → 503 CHECKOUT_UNAVAILABLE. `no_freemium=true`. Not a live self-serve claim until the flag is on, both pack prices exist, and the ledger is deployed.',
         security: [],
         requestBody: {
           required: true,
@@ -212,9 +212,10 @@ const spec = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['email'],
+                required: ['email', 'pack'],
                 properties: {
                   email: { type: 'string', format: 'email' },
+                  pack: { type: 'string', enum: ['trial', 'starter', 'plus', 'payg'] },
                 },
               },
             },
@@ -230,13 +231,18 @@ const spec = {
                   properties: {
                     url: { type: 'string', format: 'uri' },
                     session_id: { type: 'string' },
+                    pack: { type: 'string' },
+                    no_freemium: { type: 'boolean' },
                   },
                 },
               },
             },
           },
+          '400': {
+            description: 'Missing/unknown pack or invalid email (`INVALID_REQUEST`)',
+          },
           '503': {
-            description: 'Checkout disabled or unconfigured',
+            description: 'Checkout disabled (`CHECKOUT_DISABLED`) or pack price missing (`CHECKOUT_UNAVAILABLE`)',
           },
         },
       },
