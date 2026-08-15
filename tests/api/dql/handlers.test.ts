@@ -86,7 +86,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
   });
 
   it('DQL_CASCADE unset (default stub) + sandbox=true → 200 UNCERTAIN', async () => {
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: true });
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -96,7 +96,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
   });
 
   it('Phase 2: non-sandbox WITHOUT key → 402 PAYMENT_REQUIRED', async () => {
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false });
     await mod.default(req, res);
     expect(state.statusCode).toBe(402);
@@ -107,7 +107,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
 
   it('Phase 2: non-sandbox with INVALID key → 402', async () => {
     armKeyEnv();
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
       'POST',
@@ -120,7 +120,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
 
   it('Phase 2: valid dev key → 200 + billing headers (dev-access, $0.00)', async () => {
     armKeyEnv();
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
       'POST',
@@ -137,7 +137,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
 
   it('Phase 2: empty registry fails closed (presented key still 402)', async () => {
     // beforeEach wiped DQL_API_KEYS — no armKeyEnv().
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
       'POST',
@@ -150,7 +150,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
   it('DQL_CASCADE=pot-cli WITHOUT required env → 503 CONFIG_INVALID even for sandbox=true (Blocker 1)', async () => {
     process.env.DQL_CASCADE = 'pot-cli';
     // No SERV_API_KEY, no DQL_CAPITAL_PATH_MODE → resolver fails at cold-start.
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: true });
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -161,7 +161,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
   it('DQL_CASCADE=pot-cli WITHOUT required env → 503 CONFIG_INVALID for sandbox=false too', async () => {
     process.env.DQL_CASCADE = 'pot-cli';
     armKeyEnv();
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
       'POST',
@@ -175,7 +175,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
   it('DQL_CASCADE=mystery (unknown) → 503 CONFIG_INVALID (parseRuntimeMode throws)', async () => {
     process.env.DQL_CASCADE = 'mystery';
     armKeyEnv();
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
       'POST',
@@ -188,7 +188,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
 
   it('DQL_CASCADE=stub + invalid body → 400 INVALID_REQUEST', async () => {
     armKeyEnv();
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({}, 'POST', AUTH_HEADERS);
     await mod.default(req, res);
     expect(state.statusCode).toBe(400);
@@ -197,7 +197,7 @@ describe('B5 — /dql/verify handler contract (cold-start honest)', () => {
 
   it('DQL_CASCADE=stub + valid body + sandbox=false → 200 UNCERTAIN (stub cascade)', async () => {
     armKeyEnv();
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
       'POST',
@@ -233,7 +233,7 @@ describe('M7 + M8 — /dql/health handler contract', () => {
 
   it('DQL_CASCADE=pot-cli WITHOUT required env → 503 CONFIG_INVALID + never echoes serv_base_url', async () => {
     process.env.DQL_CASCADE = 'pot-cli';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -243,7 +243,7 @@ describe('M7 + M8 — /dql/health handler contract', () => {
   });
 
   it('DQL_CASCADE=stub → 200 with default fields + alias_gate_ready=false (non-canary)', async () => {
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -265,7 +265,7 @@ describe('M7 + M8 — /dql/health handler contract', () => {
       'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
     // VERCEL_GIT_COMMIT_SHA intentionally unset.
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -285,7 +285,7 @@ describe('M7 + M8 — /dql/health handler contract', () => {
       'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
     process.env.VERCEL_GIT_COMMIT_SHA = 'abc1234def5678';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -301,7 +301,7 @@ describe('M7 + M8 — /dql/health handler contract', () => {
   it('Regression: VERCEL_GIT_COMMIT_SHA="" (CLI-Deploy) + DQL_COMMIT_SHA → Escape-Hatch greift', async () => {
     process.env.VERCEL_GIT_COMMIT_SHA = '';
     process.env.DQL_COMMIT_SHA = '9be505c7d4b004d164634aa205986346c78f6f09';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -311,7 +311,7 @@ describe('M7 + M8 — /dql/health handler contract', () => {
   it('Regression: VERCEL_GIT_COMMIT_SHA nicht-leer gewinnt weiterhin über DQL_COMMIT_SHA (Präferenzordnung)', async () => {
     process.env.VERCEL_GIT_COMMIT_SHA = 'platform1234567890';
     process.env.DQL_COMMIT_SHA = 'escape1234567890';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -321,7 +321,7 @@ describe('M7 + M8 — /dql/health handler contract', () => {
   it('Regression: beide leer → commit_sha bleibt null (kein Leer-String-Durchschlag)', async () => {
     process.env.VERCEL_GIT_COMMIT_SHA = '';
     process.env.DQL_COMMIT_SHA = '';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -374,7 +374,7 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
 
   it('baseline: fully safe canary posture → alias_gate_ready=true', async () => {
     primeSafeCanary();
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -384,7 +384,7 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
   it('capital_path_mode=false collapses alias_gate_ready to false (Hermes gegenbeweis)', async () => {
     primeSafeCanary();
     process.env.DQL_CAPITAL_PATH_MODE = '0';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -395,7 +395,7 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
   it('disable_circuit_breaker=true collapses alias_gate_ready to false (Hermes gegenbeweis)', async () => {
     primeSafeCanary();
     process.env.DQL_DISABLE_CIRCUIT_BREAKER = '1';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -411,7 +411,7 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
     // guard fallback.
     primeSafeCanary();
     process.env.DQL_RUNTIME_DIAGNOSTICS = '0';
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -424,7 +424,7 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
     // v0431_active=0 removes the CB_CONFIG_BY_ALIAS requirement, but the
     // key was already set to a valid explicit config, so resolver stays
     // clean. Health returns 200 with alias_gate_ready=false.
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -435,7 +435,7 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
   it('commit_sha missing collapses alias_gate_ready to false (M8 pin)', async () => {
     primeSafeCanary();
     delete process.env.VERCEL_GIT_COMMIT_SHA;
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -449,7 +449,7 @@ describe('H1 — alias_gate_ready collapses on any safety-posture defect', () =>
     // Missing SERV_API_KEY in pot-cli → resolver ConfigError → 503.
     // Again this pin doubles as an invariant on both the resolver rule
     // and the alias_gate guard.
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -501,7 +501,7 @@ describe('H2 — v0431_active rejects empty / partial per-alias CB entries', () 
       'serv-nano': {},
       'serv-swift': {},
     });
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -514,7 +514,7 @@ describe('H2 — v0431_active rejects empty / partial per-alias CB entries', () 
       'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5 },
       'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -527,7 +527,7 @@ describe('H2 — v0431_active rejects empty / partial per-alias CB entries', () 
       'serv-nano': { tripP90LatencyMs: 10_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
       'serv-swift': { tripP90LatencyMs: 15_000, tripFailureRate: 0.5, cooldownMs: 30_000, windowSize: 20, windowAgeMs: 60_000, minSamples: 5, probeMaxLatencyMs: 15_000 },
     });
-    const mod = await import('./health.js');
+    const mod = await import('../../../api/dql/health.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -569,7 +569,7 @@ describe('PR #36 payment semantics hardening', () => {
     vi.stubGlobal('fetch', fetchMock);
     process.env.DQL_X402_ENABLED = 'true';
     process.env.X402_FACILITATOR_URL = 'https://fac.example';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const sig = Buffer.from(JSON.stringify({ network: 'base', payload: {} })).toString('base64');
     const { req, res, state } = makeReqRes(
       { not: 'a valid body' },
@@ -585,7 +585,7 @@ describe('PR #36 payment semantics hardening', () => {
   it('x402 enabled but not ready → 503, no payment-required challenge header', async () => {
     process.env.DQL_X402_ENABLED = 'true';
     // no CDP, no X402_FACILITATOR_URL
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false });
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -597,7 +597,7 @@ describe('PR #36 payment semantics hardening', () => {
     process.env.DQL_CASCADE = 'pot-cli';
     process.env.DQL_X402_ENABLED = 'true';
     process.env.X402_FACILITATOR_URL = 'https://fac.example';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: true });
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -624,7 +624,7 @@ describe('PR #36 payment semantics hardening', () => {
     process.env.STRIPE_SECRET_KEY = 'sk_test_x';
     process.env.DQL_STRIPE_CUSTOMER_MAP = JSON.stringify({ acme: 'cus_test123' });
 
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
       'POST',
@@ -666,7 +666,7 @@ describe('PR #36 payment semantics hardening', () => {
     vi.stubGlobal('fetch', fetchMock);
     process.env.DQL_X402_ENABLED = 'true';
     process.env.X402_FACILITATOR_URL = 'https://fac.example';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const sig = Buffer.from(JSON.stringify({ network: 'base', payload: {} })).toString('base64');
     const { req, res, state } = makeReqRes(
       { ...validVerifyBody, sandbox: false },
@@ -694,7 +694,7 @@ describe('PR #36 payment semantics hardening', () => {
     vi.stubGlobal('fetch', fetchMock);
     process.env.DQL_X402_ENABLED = 'true';
     process.env.X402_FACILITATOR_URL = 'https://fac.example';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const sig = Buffer.from(
       JSON.stringify({ network: 'base', payload: { authorization: { nonce: 'n-http5xx' } } }),
     ).toString('base64');
@@ -732,7 +732,7 @@ describe('PR #36 payment semantics hardening', () => {
     process.env.DQL_X402_ENABLED = 'true';
     process.env.X402_FACILITATOR_URL = 'https://fac.example';
 
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const sig = Buffer.from(
       JSON.stringify({ network: 'base', payload: { authorization: { nonce: 'n-handler' } } }),
     ).toString('base64');
@@ -775,7 +775,7 @@ describe('H4 — sendJsonWithDiagnostics is wire-effective on every path', () =>
     // Under stub, RUNTIME.kind==='stub' → no collector → header absent.
     // We exercise that branch first for baseline, then a pot-cli-like case.
     process.env.DQL_CASCADE = 'stub';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: true });
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -786,7 +786,7 @@ describe('H4 — sendJsonWithDiagnostics is wire-effective on every path', () =>
   it('503 CONFIG_INVALID path → status/body preserved AND flush attempted (no throw, no body mutation)', async () => {
     // pot-cli without SERV_API_KEY → RUNTIME.kind==='error' → 503.
     process.env.DQL_CASCADE = 'pot-cli';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: true });
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -802,7 +802,7 @@ describe('H4 — sendJsonWithDiagnostics is wire-effective on every path', () =>
   it('400 INVALID_REQUEST path preserves status/body under H4 refactor', async () => {
     process.env.DQL_CASCADE = 'stub';
     armKeyEnv();
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes({ garbage: true }, 'POST', AUTH_HEADERS);
     await mod.default(req, res);
     expect(state.statusCode).toBe(400);
@@ -811,7 +811,7 @@ describe('H4 — sendJsonWithDiagnostics is wire-effective on every path', () =>
 
   it('405 METHOD_NOT_ALLOWED path preserves status/body under H4 refactor', async () => {
     process.env.DQL_CASCADE = 'stub';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(undefined, 'GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(405);
@@ -820,7 +820,7 @@ describe('H4 — sendJsonWithDiagnostics is wire-effective on every path', () =>
 
   it('OPTIONS preflight still 200 + ends without body under H4 refactor', async () => {
     process.env.DQL_CASCADE = 'stub';
-    const mod = await import('./verify.js');
+    const mod = await import('../../../api/dql/verify.js');
     const { req, res, state } = makeReqRes(undefined, 'OPTIONS');
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
@@ -857,8 +857,8 @@ describe('H4 — sendJsonWithDiagnostics ordering: setHeader BEFORE res.json', (
     // Direct unit test against the exported helper. Guarantees the sequence
     // is right regardless of which upstream branch triggered the send.
     vi.resetModules();
-    const mod = await import('./verify.js');
-    const rd = await import('../../src/engine/runtime-diagnostics.js');
+    const mod = await import('../../../api/dql/verify.js');
+    const rd = await import('../../../src/engine/runtime-diagnostics.js');
     const collector = new rd.RuntimeDiagnosticsCollector('req-h4-order');
     // Populate one attempt so the header actually gets emitted.
     collector.recordAttempt({
@@ -896,8 +896,8 @@ describe('H4 — sendJsonWithDiagnostics ordering: setHeader BEFORE res.json', (
 describe('M2 follow-up — truncation counts include binding_summaries', () => {
   it('over-cap snapshot: counts expose binding_summaries retained + dropped, X-DQL-Diagnostics is absent, Truncated=1', async () => {
     vi.resetModules();
-    const mod = await import('./verify.js');
-    const rd = await import('../../src/engine/runtime-diagnostics.js');
+    const mod = await import('../../../api/dql/verify.js');
+    const rd = await import('../../../src/engine/runtime-diagnostics.js');
     // Force a snapshot that exceeds 8 KiB when serialized. Overflow the
     // binding_summaries cap (default 50) with 55 pushes → dropped=5, kept=50.
     // Attempts fill the rest of the payload to guarantee > 8 KiB.

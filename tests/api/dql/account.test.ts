@@ -54,7 +54,7 @@ describe('GET /dql/account — consolidated handler', () => {
   it('401 without account token; does not require checkout flag', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     const { req, res, state } = makeReqRes('GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(401);
@@ -62,7 +62,7 @@ describe('GET /dql/account — consolidated handler', () => {
   });
 
   it('503 when store is unavailable', async () => {
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     const { req, res, state } = makeReqRes('GET', {
       headers: { 'x-dql-account': 'dqla_test' },
     });
@@ -72,14 +72,14 @@ describe('GET /dql/account — consolidated handler', () => {
   });
 
   it('rejects POST on the GET account route', async () => {
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     const { req, res, state } = makeReqRes('POST');
     await mod.default(req, res);
     expect(state.statusCode).toBe(405);
   });
 
   it('resolveAccountAction reads rewrite query and path', async () => {
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     expect(mod.resolveAccountAction({ query: {}, url: '/dql/account' } as any)).toBe('root');
     expect(
       mod.resolveAccountAction({ query: { action: 'portal' }, url: '/api/dql/account' } as any),
@@ -117,7 +117,7 @@ describe('POST /dql/account/portal|rotate|revoke — consolidated handler auth',
   it('portal 401 without token', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     const { req, res, state } = makeReqRes('POST', {
       query: { action: 'portal' },
       url: '/dql/account?action=portal',
@@ -129,7 +129,7 @@ describe('POST /dql/account/portal|rotate|revoke — consolidated handler auth',
   it('rotate 401 without token (path form)', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     const { req, res, state } = makeReqRes('POST', {
       url: '/dql/account/rotate',
     });
@@ -140,7 +140,7 @@ describe('POST /dql/account/portal|rotate|revoke — consolidated handler auth',
   it('revoke 401 without token', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     const { req, res, state } = makeReqRes('POST', {
       query: { action: 'revoke' },
     });
@@ -149,7 +149,7 @@ describe('POST /dql/account/portal|rotate|revoke — consolidated handler auth',
   });
 
   it('GET on portal action is 405', async () => {
-    const mod = await import('./account.js');
+    const mod = await import('../../../api/dql/account.js');
     const { req, res, state } = makeReqRes('GET', {
       query: { action: 'portal' },
     });

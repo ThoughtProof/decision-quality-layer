@@ -39,7 +39,7 @@ describe('POST /dql/webhooks/stripe', () => {
   });
 
   it('503 when STRIPE_WEBHOOK_SECRET is missing', async () => {
-    const mod = await import('./stripe.js');
+    const mod = await import('../../../../api/dql/webhooks/stripe.js');
     const { req, res, state } = makeReqRes('POST', { body: '{}' });
     await mod.default(req, res);
     expect(state.statusCode).toBe(503);
@@ -50,7 +50,7 @@ describe('POST /dql/webhooks/stripe', () => {
     process.env.STRIPE_WEBHOOK_SECRET = 'whsec_' + 'a'.repeat(24);
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
-    const mod = await import('./stripe.js');
+    const mod = await import('../../../../api/dql/webhooks/stripe.js');
     const { req, res, state } = makeReqRes('POST', {
       body: { type: 'checkout.session.completed' },
       headers: { 'stripe-signature': 't=1,v1=abcd' },
@@ -60,7 +60,7 @@ describe('POST /dql/webhooks/stripe', () => {
   });
 
   it('rejects GET', async () => {
-    const mod = await import('./stripe.js');
+    const mod = await import('../../../../api/dql/webhooks/stripe.js');
     const { req, res, state } = makeReqRes('GET');
     await mod.default(req, res);
     expect(state.statusCode).toBe(405);

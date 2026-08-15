@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import handler from './openapi';
+import handler from '../../api/openapi.js';
 
 type AnyObj = Record<string, any>;
 
