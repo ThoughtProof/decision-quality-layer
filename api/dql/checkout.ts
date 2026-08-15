@@ -131,8 +131,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         error: 'API key already delivered. It is shown only once.',
         code: 'KEY_ALREADY_DELIVERED',
         prefix: revealed.prefix,
+        key_prefix: revealed.prefix,
         owner: revealed.owner,
-        access: 'dev-access keys: raul@thoughtproof.ai',
+        account_token: revealed.account_token,
+        credits: revealed.credits,
+        pack: revealed.pack,
+        // Client should open /account and rotate if the one-time key was lost.
+        recovery: revealed.account_token ? 'account_rotate' : undefined,
       });
     }
     if (revealed.kind === 'invalid') {

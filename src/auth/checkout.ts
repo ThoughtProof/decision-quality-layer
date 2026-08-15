@@ -801,7 +801,15 @@ export type RevealResult =
     }
   | { kind: 'pending' }
   | { kind: 'in_progress' }
-  | { kind: 'already_delivered'; prefix?: string; owner?: string }
+  | {
+      kind: 'already_delivered';
+      prefix?: string;
+      owner?: string;
+      /** Fresh handle so the buyer can open /account and rotate if reveal was lost. */
+      account_token?: string;
+      credits?: number;
+      pack?: CheckoutPack;
+    }
   | { kind: 'trial_used' }
   | { kind: 'trial_no_card' }
   | { kind: 'invalid'; reason: string }
@@ -952,10 +960,40 @@ export async function revealCheckoutKey(opts: {
     }
   }
 
+  // Reveal already consumed (double-fetch / lost tab). Re-issue account handle
+  // so the buyer can open /account and rotate — never leave them with nothing.
+  if (minted.kind === 'already_minted') {
+    const checkout = await opts.store.getCheckout(session.id);
+    const keyHash = checkout?.key_hash;
+    const rec = keyHash ? await opts.store.getRecordByHash(keyHash) : null;
+    if (rec && rec.revoked !== true) {
+      const accountToken = generateAccountToken();
+      const accountHash = sha256Hex(accountToken);
+      const next: typeof rec = { ...rec, account_token_hash: accountHash };
+      await opts.store.putKey(next);
+      await opts.store.putAccountIndex(accountHash, next.hash);
+      const credits = await opts.store.creditBalance(next.hash);
+      return {
+        kind: 'already_delivered',
+        prefix: next.prefix,
+        owner: next.owner,
+        account_token: accountToken,
+        credits,
+        pack: minted.pack ?? checkout?.pack,
+      };
+    }
+    return {
+      kind: 'already_delivered',
+      prefix: minted.prefix,
+      owner: minted.owner,
+      pack: minted.pack,
+    };
+  }
+
   return {
     kind: 'already_delivered',
-    prefix: minted.kind === 'already_minted' ? minted.prefix : undefined,
-    owner: minted.kind === 'already_minted' ? minted.owner : undefined,
+    prefix: undefined,
+    owner: undefined,
   };
 }
 

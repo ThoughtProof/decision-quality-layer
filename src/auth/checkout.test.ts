@@ -363,8 +363,11 @@ describe('revealCheckoutKey', () => {
     });
     expect(second.kind).toBe('already_delivered');
     if (second.kind === 'already_delivered') {
+      // Plaintext API key must never leak again — but a fresh account handle
+      // is re-issued so the buyer can open /account and rotate.
       expect(JSON.stringify(second)).not.toContain(minted.plaintext);
-      expect(JSON.stringify(second)).not.toMatch(/dqla_[0-9a-f]{16}/);
+      expect(second.account_token?.startsWith('dqla_')).toBe(true);
+      expect(second.account_token).not.toBe(minted.accountToken);
     }
   });
 });
