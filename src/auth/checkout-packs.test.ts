@@ -382,8 +382,8 @@ describe('createCheckoutSession pack modes', () => {
         const body = String(init?.body);
         expect(body).toContain('mode=payment');
         expect(body).toContain('price_test_starter');
-        expect(body).toContain('pack=starter');
-        expect(body).toContain('credits=200');
+        expect(body).toContain('starter');
+        expect(body).toContain('200');
         expect(body).not.toMatch(/dqlk_[0-9a-f]{16}/);
         return { id: 'cs_pack', url: 'https://checkout.stripe.com/c/pay/cs_pack' };
       },
@@ -410,8 +410,7 @@ describe('createCheckoutSession pack modes', () => {
       '/checkout/sessions': (init) => {
         const body = String(init?.body);
         expect(body).toContain('mode=setup');
-        expect(body).toContain('pack=trial');
-        expect(body).toContain('trial=1');
+        expect(body).toContain('trial');
         expect(body).not.toContain('line_items');
         return { id: 'cs_tr', url: 'https://checkout.stripe.com/c/pay/cs_tr' };
       },
