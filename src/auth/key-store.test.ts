@@ -125,6 +125,138 @@ describe('UpstashKeyStore (memory)', () => {
     expect(await store.usageToday(rec.hash)).toBe(1);
   });
 
+  it('parallel reserveVerify same requestId debits once', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_same',
+      stripeCustomerId: 'cus_same',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+
+    const [a, b] = await Promise.all([
+      store.reserveVerify({
+        requestId: 'dql_same_id',
+        keyHash: rec.hash,
+        dailyCap: 10,
+        paygOptIn: false,
+      }),
+      store.reserveVerify({
+        requestId: 'dql_same_id',
+        keyHash: rec.hash,
+        dailyCap: 10,
+        paygOptIn: false,
+      }),
+    ]);
+    expect(a.kind).toBe('ok');
+    expect(b.kind).toBe('ok');
+    if (a.kind === 'ok' && b.kind === 'ok') {
+      expect(a.reservation.requestId).toBe('dql_same_id');
+      expect(b.reservation.requestId).toBe('dql_same_id');
+      expect(a.reservation.status).toBe(b.reservation.status);
+    }
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+  });
+
+  it('parallel double-release restores credit and cap once', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_rel',
+      stripeCustomerId: 'cus_rel',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+    const held = await store.reserveVerify({
+      requestId: 'dql_dbl_rel',
+      keyHash: rec.hash,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(held.kind).toBe('ok');
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+
+    await Promise.all([
+      store.releaseVerifyReservation('dql_dbl_rel'),
+      store.releaseVerifyReservation('dql_dbl_rel'),
+    ]);
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash)).toBe(0);
+  });
+
+  it('commit then release does not refund; release then commit does not debit', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_state',
+      stripeCustomerId: 'cus_state',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 3);
+
+    const c = await store.reserveVerify({
+      requestId: 'dql_commit_first',
+      keyHash: rec.hash,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(c.kind).toBe('ok');
+    await store.commitVerifyReservation('dql_commit_first');
+    await store.releaseVerifyReservation('dql_commit_first');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+
+    const r = await store.reserveVerify({
+      requestId: 'dql_release_first',
+      keyHash: rec.hash,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(r.kind).toBe('ok');
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+    await store.releaseVerifyReservation('dql_release_first');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+    await store.commitVerifyReservation('dql_release_first');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+  });
+
+  it('parallel commit+release does not double-refund or extra-debit', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_race2',
+      stripeCustomerId: 'cus_race2',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+    const held = await store.reserveVerify({
+      requestId: 'dql_c_or_r',
+      keyHash: rec.hash,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(held.kind).toBe('ok');
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+
+    await Promise.all([
+      store.commitVerifyReservation('dql_c_or_r'),
+      store.releaseVerifyReservation('dql_c_or_r'),
+    ]);
+    const credits = await store.creditBalance(rec.hash);
+    const usage = await store.usageToday(rec.hash);
+    expect(credits === 1 || credits === 2).toBe(true);
+    if (credits === 1) expect(usage).toBe(1);
+    else expect(usage).toBe(0);
+  });
+
   it('reveal is one-time (GETDEL)', async () => {
     const store = new UpstashKeyStore(createMemoryKv());
     const key = generateApiKey();

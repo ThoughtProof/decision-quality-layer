@@ -113,7 +113,7 @@ Self-serve keys are always `dev_access: false`. PAYG is **opt-in** (`payg_opt_in
 
 Post-purchase account routes (`GET /dql/account`, `POST /dql/account/portal|rotate|revoke`) authenticate with `X-DQL-Account: dqla_…` or `Authorization: Bearer dqla_…`. They do **not** turn on Checkout. The account token is not accepted as `X-DQL-Key`.
 
-`POST /dql/verify` also accepts that same account header: `X-DQL-Account: dqla_…` or `Authorization: Bearer dqla_…`. Admission **reserves** prepaid credit (or confirmed PAYG) and daily-cap **before** the engine runs; success **commits**, CONFIG_INVALID / thrown verify **releases** so balance and cap are unchanged. The verify response never includes the raw `dqlk_…`. Invalid/missing token → **401**. Exhausted credits → existing **402** (engine is not invoked). `dqla_…` pasted as `X-DQL-Key` is still rejected. This is an app-credential path for bots/MCP clients — not a self-serve product claim and it does not flip `DQL_CHECKOUT_ENABLED`.
+`POST /dql/verify` also accepts that same account header: `X-DQL-Account: dqla_…` or `Authorization: Bearer dqla_…`. Admission **atomically reserves** prepaid credit (or confirmed PAYG) and daily-cap **before** the engine runs (one Redis Lua EVAL / equivalent); success **commits**, CONFIG_INVALID / thrown verify **releases** so balance and cap are unchanged. Parallel same-id reserves debit once. Optional `Idempotency-Key` or a validated `X-Request-Id` is the reservation id (echoed on `X-Request-Id`); omit it and the server generates one. The verify response never includes the raw `dqlk_…`. Invalid/missing token → **401**. Exhausted credits → existing **402** (engine is not invoked). `dqla_…` pasted as `X-DQL-Key` is still rejected. This is an app-credential path for bots/MCP clients — not a self-serve product claim and it does not flip `DQL_CHECKOUT_ENABLED`.
 
 See `docs/PAYMENT.md` § Checkout / webhook, § Post-purchase account API, and § Prepaid packs. Do not claim `SELF_SERVE_LIVE=true` and do not claim a live self-serve product until the flag is on and smoked.
 
@@ -134,7 +134,7 @@ When enabled but **not ready** (flag on, no CDP, no facilitator URL): `503 PAYME
 
 Payment sequence: validate → verify authorization → DQL → settle → respond. Settlement timeouts return `PAYMENT_STATUS_UNKNOWN` (do not claim "not charged").
 
-Header: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or `Authorization: Bearer dqlk_...`. Account token: `X-DQL-Account: dqla_...` (CORS-allowed) or `Authorization: Bearer dqla_...`.
+Header: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or `Authorization: Bearer dqlk_...`. Account token: `X-DQL-Account: dqla_...` (CORS-allowed) or `Authorization: Bearer dqla_...`. Optional `Idempotency-Key` / `X-Request-Id` (CORS-allowed) is the account-path reservation id.
 
 Sandbox (`{"sandbox":true}`) stays free and keyless.
 

@@ -42,6 +42,7 @@ import {
   reserveVerifyWithAccount,
 } from '../../src/auth/account.js';
 import { createKeyStore } from '../../src/auth/key-store.js';
+import { generateVerifyRequestId, resolveVerifyRequestId } from '../../src/auth/request-id.js';
 import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
 import { emitStripeMeterEvent, loadStripeMeterConfig } from '../../src/auth/stripe-meter.js';
 import {
@@ -114,7 +115,8 @@ const USAGE_GATE = createUsageGate(process.env);
 const KEY_STORE = createKeyStore(process.env);
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const requestId = `dql_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const resolvedId = resolveVerifyRequestId(req.headers as Record<string, unknown>);
+  const requestId = resolvedId.kind === 'ok' ? resolvedId.id : generateVerifyRequestId();
   let accountHold: { requestId: string } | null = null;
 
   // v0.4.3.1 §C+integration: per-request diagnostics collector, created ONLY
@@ -149,7 +151,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-DQL-Key, X-DQL-Account, PAYMENT-SIGNATURE, Payment-Signature',
+      'Content-Type, Authorization, X-DQL-Key, X-DQL-Account, Idempotency-Key, X-Request-Id, PAYMENT-SIGNATURE, Payment-Signature',
     );
     res.setHeader(
       'Access-Control-Expose-Headers',
@@ -174,7 +176,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).end();
     }
 
-    if (req.method !== 'POST') {
+    if (resolvedId.kind === 'invalid') {
+      status = 400;
+      payload = {
+        error: 'Idempotency-Key must be 8–128 characters of [A-Za-z0-9._:-] and must not look like a secret.',
+        code: 'INVALID_IDEMPOTENCY_KEY',
+      };
+    } else if (req.method !== 'POST') {
       status = 405;
       payload = { error: 'Method not allowed', code: 'METHOD_NOT_ALLOWED', allowed: ['POST'] };
     } else {

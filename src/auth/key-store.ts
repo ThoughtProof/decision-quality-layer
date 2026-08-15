@@ -31,6 +31,13 @@ import { DEFAULT_DAILY_CAP, type ApiKeyRecord } from './keys.js';
 import { keyDisplayPrefix, sha256Hex } from './key-hash.js';
 import type { CheckoutPack } from './packs.js';
 import { usageCounterKeyFromHash } from './usage.js';
+import {
+  LUA_COMMIT,
+  LUA_RELEASE,
+  LUA_RESERVE,
+  dispatchMemoryEval,
+  parseReserveEval,
+} from './verify-reservation-atomic.js';
 
 export const KEY_RECORD_PREFIX = 'dql:key:';
 export const OWNER_CUS_PREFIX = 'dql:owner-cus:';
@@ -122,6 +129,8 @@ export interface KvStore {
   getdel?<T = unknown>(key: string): Promise<T | null>;
   incrby(key: string, n: number): Promise<number>;
   decr(key: string): Promise<number>;
+  /** Atomic script. Memory store runs the JS equivalent synchronously. */
+  eval(script: string, keys: string[], args: string[]): Promise<unknown>;
 }
 
 export type ConsumeCreditResult = 'consumed' | 'empty' | 'error';
@@ -271,35 +280,6 @@ function parseCheckoutStatus(v: unknown): CheckoutFulfillStatus {
 
 function isPackSlug(v: unknown): v is CheckoutPack {
   return v === 'trial' || v === 'starter' || v === 'plus' || v === 'payg';
-}
-
-function asReservation(v: unknown): VerifyReservation | null {
-  if (v == null) return null;
-  let obj: unknown = v;
-  if (typeof v === 'string') {
-    try {
-      obj = JSON.parse(v);
-    } catch {
-      return null;
-    }
-  }
-  if (typeof obj !== 'object' || obj === null) return null;
-  const r = obj as Record<string, unknown>;
-  if (typeof r.requestId !== 'string' || typeof r.keyHash !== 'string') return null;
-  if (typeof r.dayUtc !== 'string') return null;
-  const status = r.status;
-  if (status !== 'held' && status !== 'committed' && status !== 'released') return null;
-  const billing = r.billing === 'payg' ? 'payg' : r.billing === 'credit' ? 'credit' : null;
-  if (!billing) return null;
-  return {
-    requestId: r.requestId,
-    keyHash: r.keyHash,
-    dayUtc: r.dayUtc,
-    creditHeld: r.creditHeld === true,
-    capHeld: r.capHeld === true,
-    billing,
-    status,
-  };
 }
 
 function asInt(v: unknown): number {
@@ -558,85 +538,46 @@ export class UpstashKeyStore implements KeyStore {
     now?: Date;
   }): Promise<ReserveVerifyResult> {
     if (!opts.requestId || !opts.keyHash) return { kind: 'error' };
-    const reserveKey = `${RESERVE_PREFIX}${opts.requestId}`;
-    let creditHeld = false;
-    let capHeld = false;
-    let dayUtc = '';
+    const dayUtc = (opts.now ?? new Date()).toISOString().slice(0, 10);
     try {
-      const existing = asReservation(await this.kv.get(reserveKey));
-      if (existing && (existing.status === 'held' || existing.status === 'committed')) {
-        return { kind: 'ok', reservation: existing };
-      }
-
-      const spent = await this.consumeCredit(opts.keyHash);
-      if (spent === 'consumed') creditHeld = true;
-      else if (spent === 'error') return { kind: 'error' };
-      else if (!opts.paygOptIn) return { kind: 'empty' };
-
-      dayUtc = (opts.now ?? new Date()).toISOString().slice(0, 10);
-      const usageKey = usageCounterKeyFromHash(opts.keyHash, dayUtc);
-      const count = await this.kv.incrby(usageKey, 1);
-      capHeld = true;
-      if (count > opts.dailyCap) {
-        await this.kv.incrby(usageKey, -1);
-        capHeld = false;
-        if (creditHeld) {
-          await this.addCredits(opts.keyHash, 1);
-          creditHeld = false;
-        }
-        return { kind: 'quota' };
-      }
-
-      const reservation: VerifyReservation = {
-        requestId: opts.requestId,
-        keyHash: opts.keyHash,
-        dayUtc,
-        creditHeld,
-        capHeld: true,
-        billing: creditHeld ? 'credit' : 'payg',
-        status: 'held',
-      };
-      await this.kv.set(reserveKey, reservation, { ex: RESERVE_TTL_SEC });
-      return { kind: 'ok', reservation };
+      const raw = await this.kv.eval(
+        LUA_RESERVE,
+        [
+          `${RESERVE_PREFIX}${opts.requestId}`,
+          `${CREDITS_PREFIX}${opts.keyHash}`,
+          usageCounterKeyFromHash(opts.keyHash, dayUtc),
+        ],
+        [
+          opts.requestId,
+          opts.keyHash,
+          dayUtc,
+          String(opts.dailyCap),
+          opts.paygOptIn ? '1' : '0',
+          String(RESERVE_TTL_SEC),
+        ],
+      );
+      return parseReserveEval(raw);
     } catch {
-      try {
-        if (creditHeld) await this.addCredits(opts.keyHash, 1);
-        if (capHeld && dayUtc) {
-          const usageKey = usageCounterKeyFromHash(opts.keyHash, dayUtc);
-          const next = await this.kv.incrby(usageKey, -1);
-          if (next < 0) await this.kv.incrby(usageKey, 1);
-        }
-      } catch {
-        // Best-effort rollback; do not mask the reservation failure.
-      }
       return { kind: 'error' };
     }
   }
 
   async commitVerifyReservation(requestId: string): Promise<void> {
     if (!requestId) return;
-    const reserveKey = `${RESERVE_PREFIX}${requestId}`;
-    const existing = asReservation(await this.kv.get(reserveKey));
-    if (!existing || existing.status !== 'held') return;
-    existing.status = 'committed';
-    await this.kv.set(reserveKey, existing, { ex: RESERVE_TTL_SEC });
+    try {
+      await this.kv.eval(LUA_COMMIT, [`${RESERVE_PREFIX}${requestId}`], [String(RESERVE_TTL_SEC)]);
+    } catch {
+      // Commit is best-effort after a successful verify; debit already held.
+    }
   }
 
   async releaseVerifyReservation(requestId: string): Promise<void> {
     if (!requestId) return;
-    const reserveKey = `${RESERVE_PREFIX}${requestId}`;
-    const existing = asReservation(await this.kv.get(reserveKey));
-    if (!existing || existing.status !== 'held') return;
-    if (existing.creditHeld) await this.addCredits(existing.keyHash, 1);
-    if (existing.capHeld) {
-      const usageKey = usageCounterKeyFromHash(existing.keyHash, existing.dayUtc);
-      const next = await this.kv.incrby(usageKey, -1);
-      if (next < 0) await this.kv.incrby(usageKey, 1);
+    try {
+      await this.kv.eval(LUA_RELEASE, [`${RESERVE_PREFIX}${requestId}`], [String(RESERVE_TTL_SEC)]);
+    } catch {
+      // Caller already failed; do not throw over a release error.
     }
-    existing.status = 'released';
-    existing.creditHeld = false;
-    existing.capHeld = false;
-    await this.kv.set(reserveKey, existing, { ex: RESERVE_TTL_SEC });
   }
 
   async recordCreditGrant(keyHash: string, grant: CreditGrant): Promise<void> {
@@ -740,6 +681,7 @@ export function createKeyStore(env: NodeJS.ProcessEnv = process.env): KeyStore |
     getdel: (key) => redis.getdel(key),
     incrby: (key, n) => redis.incrby(key, n),
     decr: (key) => redis.decr(key),
+    eval: (script, keys, args) => redis.eval(script, keys, args),
   };
   return new UpstashKeyStore(kv);
 }
@@ -794,6 +736,28 @@ export function createMemoryKv(): KvStore & { dump(): Map<string, unknown> } {
       const next = asInt(row?.value) - 1;
       data.set(key, { value: next, exp: row?.exp });
       return next;
+    },
+    eval(script, keys, args) {
+      // Fully synchronous: equivalent to Redis EVAL (no interleaving).
+      const sync = {
+        get(key: string): unknown {
+          const row = alive(key);
+          return row ? row.value : null;
+        },
+        set(key: string, value: unknown, exSec?: number) {
+          data.set(key, {
+            value,
+            exp: exSec != null ? now() + exSec * 1000 : undefined,
+          });
+        },
+        incrby(key: string, n: number) {
+          const row = alive(key);
+          const next = asInt(row?.value) + n;
+          data.set(key, { value: next, exp: row?.exp });
+          return next;
+        },
+      };
+      return Promise.resolve(dispatchMemoryEval(sync, script, keys, args));
     },
     dump() {
       const out = new Map<string, unknown>();

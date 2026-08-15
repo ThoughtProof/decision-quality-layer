@@ -105,7 +105,8 @@ export async function authorizeVerifyWithAccount(opts: {
 
 /**
  * Atomic pre-execution reservation of prepaid credit (or confirmed PAYG)
- * and daily-cap. Call before `runVerification()`. Idempotent per requestId.
+ * and daily-cap (one Redis EVAL). Call before `runVerification()`.
+ * Idempotent per requestId (client Idempotency-Key / X-Request-Id).
  * Failure → 402 / 429 / 503 and the engine must not run.
  */
 export async function reserveVerifyWithAccount(opts: {

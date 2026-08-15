@@ -355,5 +355,63 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     await mod.default(req, res);
     expect(state.statusCode).toBe(200);
     expect(state.headers['Access-Control-Allow-Headers']).toMatch(/X-DQL-Account/);
+    expect(state.headers['Access-Control-Allow-Headers']).toMatch(/Idempotency-Key/);
+  });
+
+  it('client Idempotency-Key is the reservation id; retry does not double-debit', async () => {
+    const minted = await mintStarter();
+    const hash = sha256Hex(minted.plaintext);
+    const mod = await import('../../../api/dql/verify.js');
+    const headers = {
+      'x-dql-account': minted.accountToken,
+      'idempotency-key': 'client-retry-key-01',
+    };
+    const first = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(first.req, first.res);
+    expect(first.state.statusCode).toBe(200);
+    expect(first.state.headers['X-Request-Id']).toBe('client-retry-key-01');
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+
+    const retry = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(retry.req, retry.res);
+    expect(retry.state.statusCode).toBe(200);
+    expect(retry.state.headers['X-Request-Id']).toBe('client-retry-key-01');
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+    expect(await harness.store!.usageToday(hash)).toBe(1);
+  });
+
+  it('client X-Request-Id is the reservation id when Idempotency-Key is absent', async () => {
+    const minted = await mintStarter();
+    const hash = sha256Hex(minted.plaintext);
+    const mod = await import('../../../api/dql/verify.js');
+    const headers = {
+      'x-dql-account': minted.accountToken,
+      'x-request-id': 'req-client-id-42',
+    };
+    const first = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(first.req, first.res);
+    expect(first.state.statusCode).toBe(200);
+    expect(first.state.headers['X-Request-Id']).toBe('req-client-id-42');
+
+    const retry = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(retry.req, retry.res);
+    expect(retry.state.statusCode).toBe(200);
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+  });
+
+  it('invalid Idempotency-Key is 400 and does not run verify', async () => {
+    const minted = await mintStarter();
+    const mod = await import('../../../api/dql/verify.js');
+    const { req, res, state } = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', {
+      'x-dql-account': minted.accountToken,
+      'idempotency-key': 'dqlk_looks_like_a_secret',
+    });
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(400);
+    expect(state.jsonBody.code).toBe('INVALID_IDEMPOTENCY_KEY');
+    expect(harness.verifyCalls).toBe(0);
+    expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+    expect(JSON.stringify(state.jsonBody)).not.toContain(minted.plaintext);
+    expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
   });
 });

@@ -381,6 +381,46 @@ describe('reveal + account surface', () => {
     expect(await store.creditBalance(hash)).toBe(0);
   });
 
+  it('parallel reserveVerify same requestId with 2 credits debits once', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_sameid',
+      customerId: 'cus_sameid',
+      owner: selfServeOwner('cus_sameid'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+    const hash = sha256Hex(minted.plaintext);
+    await store.setCreditBalance(hash, 2);
+    const auth = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(auth.kind).toBe('allow');
+    if (auth.kind !== 'allow') return;
+
+    const [a, b] = await Promise.all([
+      reserveVerifyWithAccount({
+        requestId: 'dql_same_parallel',
+        keyHash: auth.key,
+        record: auth.record,
+        store,
+      }),
+      reserveVerifyWithAccount({
+        requestId: 'dql_same_parallel',
+        keyHash: auth.key,
+        record: auth.record,
+        store,
+      }),
+    ]);
+    expect(a.kind).toBe('allow');
+    expect(b.kind).toBe('allow');
+    expect(await store.creditBalance(hash)).toBe(1);
+    expect(await store.usageToday(hash)).toBe(1);
+  });
+
   it('verify with invalid/missing dqla_ is 401; dqla_ as X-DQL-Key stays 402', async () => {
     const store = new UpstashKeyStore(createMemoryKv());
     const minted = await finalizeCheckoutMint({

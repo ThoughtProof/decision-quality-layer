@@ -59,7 +59,25 @@ const spec = {
         operationId: 'dqlVerify',
         summary: 'Verify a proposed agent action across five axes',
         description:
-          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md. Auth: `X-DQL-Key: dqlk_…` (unchanged) or `X-DQL-Account: dqla_…` / `Authorization: Bearer dqla_…` (bills the bound credit ledger; response never includes the raw verify key). `dqla_…` is not accepted as `X-DQL-Key`. Invalid/missing account token → 401. Exhausted credits → 402. Not a self-serve product claim.',
+          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md. Auth: `X-DQL-Key: dqlk_…` (unchanged) or `X-DQL-Account: dqla_…` / `Authorization: Bearer dqla_…` (bills the bound credit ledger; response never includes the raw verify key). `dqla_…` is not accepted as `X-DQL-Key`. Invalid/missing account token → 401. Exhausted credits → 402 before the engine. Account path: atomic reserve → verify → commit/release. Optional `Idempotency-Key` / validated `X-Request-Id` is the reservation id. Not a self-serve product claim.',
+        parameters: [
+          {
+            name: 'Idempotency-Key',
+            in: 'header',
+            required: false,
+            description:
+              'Optional client idempotency key for account-token verify admission. Charset [A-Za-z0-9._:-], length 8–128. Becomes the reservation id and is echoed as X-Request-Id. Values that look like secrets (`dqlk_`, `dqla_`, `sk_…`) are rejected (400 INVALID_IDEMPOTENCY_KEY).',
+            schema: { type: 'string', minLength: 8, maxLength: 128 },
+          },
+          {
+            name: 'X-Request-Id',
+            in: 'header',
+            required: false,
+            description:
+              'Optional client request id used as the reservation id when Idempotency-Key is absent and the value passes the same charset/length checks. Invalid values are ignored and the server generates an id. Echoed on the response X-Request-Id.',
+            schema: { type: 'string' },
+          },
+        ],
         requestBody: {
           required: true,
           content: {
@@ -355,12 +373,12 @@ const spec = {
       },
       DqlRequestId: {
         description:
-          'Server-generated request correlation id; identical to DqlResponse.id and DiagnosticsSnapshot.requestId. Incoming X-Request-Id headers are ignored — the id is never echoed from the caller.',
+          'Request correlation id; identical to DqlResponse.id and DiagnosticsSnapshot.requestId. Echoes a valid client `Idempotency-Key` or `X-Request-Id` when present; otherwise a server-generated `dql_…` id. Used as the account-path reservation id.',
         schema: {
           // R3: opaker String-Vertrag, KEIN pattern — der Generator kann im
           // Randfall (Math.random() === 0) einen leeren Suffix erzeugen.
           type: 'string',
-          description: 'Server-generated opaque id with dql_ prefix.',
+          description: 'Opaque request id (client idempotency key or server-generated dql_ prefix).',
           example: 'dql_abc123_x7k9p2',
         },
       },
