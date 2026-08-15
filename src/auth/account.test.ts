@@ -91,15 +91,28 @@ describe('reveal + account surface', () => {
     expect(first.payg_opt_in).toBe(false);
     expect(first.key_prefix).toBe(minted.prefix);
 
+    // Within TTL, remount/double-fetch still returns the same key.
     const replay = await revealCheckoutKey({
       sessionId: 'cs_acct',
       store,
       config: cfg,
       fetchImpl,
     });
-    expect(replay.kind).toBe('already_delivered');
-    expect(JSON.stringify(replay)).not.toContain(first.api_key);
-    expect(JSON.stringify(replay)).not.toContain(first.account_token);
+    expect(replay.kind).toBe('ok');
+    if (replay.kind === 'ok') {
+      expect(replay.api_key).toBe(first.api_key);
+      expect(replay.account_token).toBe(first.account_token);
+    }
+
+    await store.clearSessionReveal('cs_acct');
+    const afterTtl = await revealCheckoutKey({
+      sessionId: 'cs_acct',
+      store,
+      config: cfg,
+      fetchImpl,
+    });
+    expect(afterTtl.kind).toBe('already_delivered');
+    expect(JSON.stringify(afterTtl)).not.toContain(first.api_key);
   });
 
   it('GET account works with token, not with the verify key', async () => {
@@ -118,6 +131,8 @@ describe('reveal + account surface', () => {
 
     const leftover = await store.consumeReveal(minted.revealToken);
     expect(leftover?.account_token).toBe(minted.accountToken);
+    // Durable store must not keep plaintext after the short session-reveal TTL window.
+    await store.clearSessionReveal('cs_get');
 
     const day = new Date().toISOString().slice(0, 10);
     await kv.set(usageCounterKeyFromHash(sha256Hex(minted.plaintext), day), 3);

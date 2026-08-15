@@ -355,19 +355,32 @@ describe('revealCheckoutKey', () => {
     expect(first.shown_once).toBe(true);
     expect(first.account_token).toBe(minted.accountToken);
 
+    // Within TTL the same session can re-read the key (double-fetch / remount safe).
     const second = await revealCheckoutKey({
       sessionId: 'cs_reveal',
       store,
       config: cfg,
       fetchImpl,
     });
-    expect(second.kind).toBe('already_delivered');
-    if (second.kind === 'already_delivered') {
-      // Plaintext API key must never leak again — but a fresh account handle
-      // is re-issued so the buyer can open /account and rotate.
-      expect(JSON.stringify(second)).not.toContain(minted.plaintext);
-      expect(second.account_token?.startsWith('dqla_')).toBe(true);
-      expect(second.account_token).not.toBe(minted.accountToken);
+    expect(second.kind).toBe('ok');
+    if (second.kind === 'ok') {
+      expect(second.api_key).toBe(minted.plaintext);
+      expect(second.account_token).toBe(minted.accountToken);
+    }
+
+    // After TTL window is cleared, only recovery handle — never the old key again.
+    await store.clearSessionReveal('cs_reveal');
+    const third = await revealCheckoutKey({
+      sessionId: 'cs_reveal',
+      store,
+      config: cfg,
+      fetchImpl,
+    });
+    expect(third.kind).toBe('already_delivered');
+    if (third.kind === 'already_delivered') {
+      expect(JSON.stringify(third)).not.toContain(minted.plaintext);
+      expect(third.account_token?.startsWith('dqla_')).toBe(true);
+      expect(third.account_token).not.toBe(minted.accountToken);
     }
   });
 });

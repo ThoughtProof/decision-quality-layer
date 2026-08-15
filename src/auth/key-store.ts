@@ -10,7 +10,8 @@
  *   dql:owner-cus:<owner>         → cus_…
  *   dql:cus-key:<cus_…>           → key hash (one live key per customer)
  *   dql:checkout:<session_id>     → CheckoutMintState
- *   dql:reveal:<token>            → { key }  (short TTL, GETDEL once)
+ *   dql:reveal:<token>            → { key, account_token }  (short TTL; legacy one-shot)
+ *   dql:session-reveal:<cs_…>     → { key, account_token }  (short TTL; re-readable)
  *   dql:mint-lock:<session_id>    → "1" (short TTL, mint race)
  *   dql:credits:<sha256hex>       → integer balance (atomic DECR)
  *   dql:credit-ledger:<sha256hex> → { grants: CreditGrant[] }
@@ -35,6 +36,7 @@ export const OWNER_CUS_PREFIX = 'dql:owner-cus:';
 export const CUS_KEY_PREFIX = 'dql:cus-key:';
 export const CHECKOUT_PREFIX = 'dql:checkout:';
 export const REVEAL_PREFIX = 'dql:reveal:';
+export const SESSION_REVEAL_PREFIX = 'dql:session-reveal:';
 export const MINT_LOCK_PREFIX = 'dql:mint-lock:';
 export const CREDITS_PREFIX = 'dql:credits:';
 export const CREDIT_LEDGER_PREFIX = 'dql:credit-ledger:';
@@ -135,6 +137,10 @@ export interface KeyStore {
   putCheckout(state: CheckoutMintState): Promise<void>;
   putReveal(token: string, payload: RevealPayload, ttlSec?: number): Promise<void>;
   consumeReveal(token: string): Promise<RevealPayload | null>;
+  /** Session-scoped reveal: re-readable until TTL (survives double-fetch / remount). */
+  putSessionReveal(sessionId: string, payload: RevealPayload, ttlSec?: number): Promise<void>;
+  getSessionReveal(sessionId: string): Promise<RevealPayload | null>;
+  clearSessionReveal(sessionId: string): Promise<void>;
   acquireMintLock(sessionId: string): Promise<boolean>;
   consumeCredit(keyHash: string): Promise<ConsumeCreditResult>;
   addCredits(keyHash: string, amount: number): Promise<number>;
@@ -363,6 +369,25 @@ export class UpstashKeyStore implements KeyStore {
     const v = asReveal(await this.kv.get(redisKey));
     if (v != null) await this.kv.del(redisKey);
     return v;
+  }
+
+  async putSessionReveal(
+    sessionId: string,
+    payload: RevealPayload,
+    ttlSec: number = REVEAL_TTL_SEC,
+  ): Promise<void> {
+    if (!sessionId.startsWith('cs_')) return;
+    await this.kv.set(`${SESSION_REVEAL_PREFIX}${sessionId}`, payload, { ex: ttlSec });
+  }
+
+  async getSessionReveal(sessionId: string): Promise<RevealPayload | null> {
+    if (!sessionId.startsWith('cs_')) return null;
+    return asReveal(await this.kv.get(`${SESSION_REVEAL_PREFIX}${sessionId}`));
+  }
+
+  async clearSessionReveal(sessionId: string): Promise<void> {
+    if (!sessionId.startsWith('cs_')) return;
+    await this.kv.del(`${SESSION_REVEAL_PREFIX}${sessionId}`);
   }
 
   async acquireMintLock(sessionId: string): Promise<boolean> {

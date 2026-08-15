@@ -725,11 +725,10 @@ export async function finalizeCheckoutMint(opts: {
     });
   }
 
-  await opts.store.putReveal(
-    revealToken,
-    { key: plaintext, account_token: accountToken },
-    REVEAL_TTL_SEC,
-  );
+  const revealPayload = { key: plaintext, account_token: accountToken };
+  await opts.store.putReveal(revealToken, revealPayload, REVEAL_TTL_SEC);
+  // Session-scoped copy survives double-fetch / remount within TTL.
+  await opts.store.putSessionReveal(opts.sessionId, revealPayload, REVEAL_TTL_SEC);
   await opts.store.putCheckout({
     session_id: opts.sessionId,
     customer_id: opts.customerId,
@@ -910,8 +909,55 @@ export async function revealCheckoutKey(opts: {
     };
   }
 
+  // Prefer session-scoped reveal (re-readable within TTL) over one-shot token.
+  const sessionReveal = await opts.store.getSessionReveal(session.id);
+  if (sessionReveal?.key && sessionReveal.account_token) {
+    // Drop legacy one-shot token so expiry of session-reveal is authoritative.
+    if (minted.kind === 'already_minted' && minted.revealToken) {
+      await opts.store.consumeReveal(minted.revealToken);
+      const checkout = await opts.store.getCheckout(session.id);
+      if (checkout?.reveal_token) {
+        delete checkout.reveal_token;
+        await opts.store.putCheckout(checkout);
+      }
+    } else if (minted.kind === 'minted' && minted.revealToken) {
+      await opts.store.consumeReveal(minted.revealToken);
+      const checkout = await opts.store.getCheckout(session.id);
+      if (checkout?.reveal_token) {
+        delete checkout.reveal_token;
+        await opts.store.putCheckout(checkout);
+      }
+    }
+    const rec = await opts.store.getRecordByHash(sha256Hex(sessionReveal.key));
+    const credits = rec ? await opts.store.creditBalance(rec.hash) : 0;
+    return {
+      kind: 'ok',
+      api_key: sessionReveal.key,
+      account_token: sessionReveal.account_token,
+      prefix: rec?.prefix ?? keyDisplayPrefix(sessionReveal.key),
+      key_prefix: rec?.prefix ?? keyDisplayPrefix(sessionReveal.key),
+      owner: rec?.owner ?? (minted.kind === 'minted' || minted.kind === 'already_minted' ? minted.owner : ''),
+      shown_once: true,
+      pack:
+        minted.kind === 'minted' || minted.kind === 'already_minted'
+          ? minted.pack
+          : rec?.trial
+            ? 'trial'
+            : undefined,
+      credits,
+      trial: rec?.trial === true,
+      payg_opt_in: rec?.payg_opt_in === true,
+    };
+  }
+
   if (minted.kind === 'minted') {
+    // Keep session reveal for remounts; drop one-shot token only.
     if (minted.revealToken) await opts.store.consumeReveal(minted.revealToken);
+    await opts.store.putSessionReveal(
+      session.id,
+      { key: minted.plaintext, account_token: minted.accountToken },
+      REVEAL_TTL_SEC,
+    );
     const checkout = await opts.store.getCheckout(session.id);
     if (checkout) {
       delete checkout.reveal_token;
@@ -933,7 +979,7 @@ export async function revealCheckoutKey(opts: {
     };
   }
 
-  // already_minted — consume leftover reveal if webhook won the race.
+  // already_minted — lift leftover one-shot token into session reveal (re-readable).
   if (minted.kind === 'already_minted' && minted.revealToken) {
     const leftover = await opts.store.consumeReveal(minted.revealToken);
     const checkout = await opts.store.getCheckout(session.id);
@@ -942,6 +988,7 @@ export async function revealCheckoutKey(opts: {
       await opts.store.putCheckout(checkout);
     }
     if (leftover?.key && leftover.account_token) {
+      await opts.store.putSessionReveal(session.id, leftover, REVEAL_TTL_SEC);
       const rec = await opts.store.getRecordByHash(sha256Hex(leftover.key));
       const credits = rec ? await opts.store.creditBalance(rec.hash) : 0;
       return {
