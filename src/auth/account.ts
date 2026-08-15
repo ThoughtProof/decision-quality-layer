@@ -3,7 +3,8 @@
  *
  * Identity after checkout is an account token (`dqla_…`), not the raw
  * `dqlk_…` verify key. The token is shown once on reveal; only its hash
- * is stored. Account token is never a verify key.
+ * is stored. Account token is never accepted as `X-DQL-Key`. It does
+ * authorize `POST /dql/verify` via `X-DQL-Account` / Bearer `dqla_…`.
  *
  * Merge ≠ flag-on ≠ self-serve product. These routes do not enable
  * `DQL_CHECKOUT_ENABLED`.
@@ -12,11 +13,14 @@
 import { fingerprintAccountToken, fingerprintKey, sha256Hex } from './key-hash.js';
 import {
   newStoredKeyRecord,
+  storedToAuthRecord,
   type KeyStore,
   type StoredKeyRecord,
 } from './key-store.js';
 import { generateApiKey } from './checkout.js';
 import { stripeFormRequest } from './stripe-http.js';
+import { PRICE_USD_PER_CALL } from '../pricing.js';
+import type { AuthDecision, UsageGate } from './keys.js';
 
 export const ACCOUNT_HEADER = 'X-DQL-Account';
 
@@ -63,6 +67,77 @@ export async function authorizeAccount(opts: {
   const record = await opts.store.lookupByAccountToken(token);
   if (!record) return { kind: 'unauthorized' };
   return { kind: 'ok', token, record };
+}
+
+const ACCOUNT_UNAUTHORIZED: AuthDecision = {
+  kind: 'deny',
+  status: 401,
+  payload: {
+    error: 'Valid account token required (X-DQL-Account or Authorization: Bearer dqla_…).',
+    code: 'ACCOUNT_UNAUTHORIZED',
+  },
+};
+
+/**
+ * Authorize `POST /dql/verify` with the post-purchase account token.
+ * Resolves `dqla_…` → live key hash / credit ledger. Never returns `dqlk_…`.
+ * Missing/invalid/revoked → 401. Exhausted credits → existing 402.
+ */
+export async function authorizeVerifyWithAccount(opts: {
+  headers: HeaderMap;
+  store: KeyStore;
+  usage: UsageGate;
+}): Promise<AuthDecision> {
+  const token = extractAccountToken(opts.headers);
+  if (!token) return ACCOUNT_UNAUTHORIZED;
+
+  const stored = await opts.store.lookupByAccountToken(token);
+  if (!stored || stored.revoked === true) return ACCOUNT_UNAUTHORIZED;
+
+  const record = storedToAuthRecord(stored);
+  const withinCap = opts.usage.checkAndRecordFromHash
+    ? await opts.usage.checkAndRecordFromHash(stored.hash, stored.daily_cap)
+    : await opts.usage.checkAndRecord(stored.hash, stored.daily_cap);
+  if (!withinCap) {
+    return {
+      kind: 'deny',
+      status: 429,
+      payload: {
+        error: `Daily cap of ${stored.daily_cap} calls exceeded for this key.`,
+        code: 'QUOTA_EXCEEDED',
+        retry_after: 'next UTC day',
+      },
+    };
+  }
+
+  const spent = await opts.store.consumeCredit(stored.hash);
+  if (spent === 'consumed') {
+    return { kind: 'allow', key: stored.hash, record, billing: 'credit', via: 'account' };
+  }
+  if (spent === 'error') {
+    return {
+      kind: 'deny',
+      status: 503,
+      payload: {
+        error: 'Credit ledger unavailable.',
+        code: 'CREDITS_UNAVAILABLE',
+        no_freemium: true,
+      },
+    };
+  }
+  if (record.payg_opt_in === true) {
+    return { kind: 'allow', key: stored.hash, record, billing: 'payg', via: 'account' };
+  }
+  return {
+    kind: 'deny',
+    status: 402,
+    payload: {
+      error: 'Prepaid credits exhausted. Opt in to pay-as-you-go or buy a credit pack.',
+      code: 'CREDITS_EXHAUSTED',
+      price_usd_per_call: PRICE_USD_PER_CALL,
+      no_freemium: true,
+    },
+  };
 }
 
 export interface AccountSnapshot {

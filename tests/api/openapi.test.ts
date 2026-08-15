@@ -42,7 +42,7 @@ const headers: AnyObj = spec.components.headers;
 const verifyResponses: AnyObj = spec.paths['/dql/verify'].post.responses;
 
 /** Statuses the verify handler produces itself (diagnostics-capable). */
-const HANDLER_STATUSES = ['200', '400', '405', '413', '415', '500'] as const;
+const HANDLER_STATUSES = ['200', '400', '401', '405', '413', '415', '500'] as const;
 
 const FIVE_STREAMS = [
   'transitions',

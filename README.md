@@ -42,7 +42,7 @@ DQL runs a single tier: the nano → swift cascade validated by the Orthogonalit
 
 ## Status
 
-**Production (live):** `https://dql.thoughtproof.ai` — real cascade via **`pot-cli`** (`active_cascade: pot-cli` on `GET /dql/health`). Auth: `X-DQL-Key` (see `docs/ENV.md`). Sandbox (`sandbox: true`) remains free and keyless.
+**Production (live):** `https://dql.thoughtproof.ai` — real cascade via **`pot-cli`** (`active_cascade: pot-cli` on `GET /dql/health`). Auth: `X-DQL-Key` (`dqlk_…`) or `X-DQL-Account` (`dqla_…`) (see `docs/ENV.md`). Sandbox (`sandbox: true`) remains free and keyless.
 
 **Do not** treat older “cascade stubbed / Phase 0 scaffold” copy as current — that described the pre-wire scaffold and is **obsolete**.
 
@@ -71,6 +71,8 @@ DQL runs a single tier: the nano → swift cascade validated by the Orthogonalit
 - `context` — optional string with extra evidence
 - `axes` — optional array; defaults to all five
 - `sandbox` — optional boolean; when true, returns a deterministic mock without running the cascade (free, for integration testing)
+
+**Auth (non-sandbox):** `X-DQL-Key: dqlk_…` **or** `X-DQL-Account: dqla_…` (alias `Authorization: Bearer` with the same prefix). The account token bills the bound credit ledger and never returns the raw verify key. `dqla_…` is not accepted as `X-DQL-Key`. See `docs/ENV.md`.
 
 **Response:**
 

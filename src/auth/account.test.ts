@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { authorizeCall, type UsageGate } from './keys.js';
 import {
   authorizeAccount,
+  authorizeVerifyWithAccount,
   createBillingPortalSession,
   extractAccountToken,
   getAccountSnapshot,
@@ -173,6 +174,205 @@ describe('reveal + account surface', () => {
     const dump = JSON.stringify([...kv.dump().entries()]);
     expect(dump).not.toContain(minted.accountToken);
     expect(dump).not.toContain(minted.plaintext);
+  });
+
+  it('verify with dqla_ succeeds, decrements credits, never returns dqlk_', async () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((l: unknown) => {
+      logs.push(String(l));
+    });
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_vfy',
+      customerId: 'cus_vfy',
+      owner: selfServeOwner('cus_vfy'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+
+    const allowed = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+      usage: allowGate,
+    });
+    expect(allowed.kind).toBe('allow');
+    if (allowed.kind !== 'allow') return;
+    expect(allowed.via).toBe('account');
+    expect(allowed.billing).toBe('credit');
+    expect(allowed.record.stripe_customer_id).toBe('cus_vfy');
+    expect(allowed.key).toBe(sha256Hex(minted.plaintext));
+    expect(allowed.key).not.toBe(minted.plaintext);
+    expect(allowed.key).not.toBe(minted.accountToken);
+    expect(JSON.stringify(allowed)).not.toContain(minted.plaintext);
+    expect(JSON.stringify(allowed)).not.toContain(minted.accountToken);
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
+
+    const viaBearer = await authorizeVerifyWithAccount({
+      headers: { authorization: `Bearer ${minted.accountToken}` },
+      store,
+      usage: allowGate,
+    });
+    expect(viaBearer.kind).toBe('allow');
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 2);
+
+    expect(logs.join('\n')).not.toContain(minted.plaintext);
+    expect(logs.join('\n')).not.toContain(minted.accountToken);
+    spy.mockRestore();
+  });
+
+  it('verify with invalid/missing dqla_ is 401; dqla_ as X-DQL-Key stays 402', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_401',
+      customerId: 'cus_401',
+      owner: selfServeOwner('cus_401'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+
+    const missing = await authorizeVerifyWithAccount({
+      headers: {},
+      store,
+      usage: allowGate,
+    });
+    expect(missing.kind).toBe('deny');
+    if (missing.kind === 'deny') {
+      expect(missing.status).toBe(401);
+      expect(missing.payload.code).toBe('ACCOUNT_UNAUTHORIZED');
+    }
+
+    const bogus = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': 'dqla_not_a_real_token' },
+      store,
+      usage: allowGate,
+    });
+    expect(bogus.kind).toBe('deny');
+    if (bogus.kind === 'deny') expect(bogus.status).toBe(401);
+
+    const asKey = await authorizeCall({
+      headers: { 'x-dql-key': minted.accountToken },
+      sandbox: false,
+      keys: new Map(),
+      usage: allowGate,
+      store,
+    });
+    expect(asKey.kind).toBe('deny');
+    if (asKey.kind === 'deny') expect(asKey.status).toBe(402);
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+  });
+
+  it('verify via dqla_ exhausts credits with existing 402', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_exh',
+      customerId: 'cus_exh',
+      owner: selfServeOwner('cus_exh'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+    await store.setCreditBalance(sha256Hex(minted.plaintext), 1);
+
+    const ok = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+      usage: allowGate,
+    });
+    expect(ok.kind).toBe('allow');
+
+    const stop = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+      usage: allowGate,
+    });
+    expect(stop.kind).toBe('deny');
+    if (stop.kind !== 'deny') return;
+    expect(stop.status).toBe(402);
+    expect(stop.payload.code).toBe('CREDITS_EXHAUSTED');
+    expect(stop.payload.no_freemium).toBe(true);
+  });
+
+  it('rotate then revoke stop verify on the dead key; token follows the live hash', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_life',
+      customerId: 'cus_life',
+      owner: selfServeOwner('cus_life'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+
+    const auth = await authorizeAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(auth.kind).toBe('ok');
+    if (auth.kind !== 'ok') return;
+
+    const rotated = await rotateAccountKey({
+      record: auth.record,
+      store,
+      token: minted.accountToken,
+    });
+    expect(rotated.kind).toBe('ok');
+    if (rotated.kind !== 'ok') return;
+
+    const oldKey = await authorizeCall({
+      headers: { 'x-dql-key': minted.plaintext },
+      sandbox: false,
+      keys: new Map(),
+      usage: allowGate,
+      store,
+    });
+    expect(oldKey.kind).toBe('deny');
+
+    const afterRotate = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+      usage: allowGate,
+    });
+    expect(afterRotate.kind).toBe('allow');
+    if (afterRotate.kind === 'allow') {
+      expect(afterRotate.key).toBe(sha256Hex(rotated.api_key));
+      expect(afterRotate.billing).toBe('credit');
+    }
+    expect(await store.creditBalance(sha256Hex(rotated.api_key))).toBe(STARTER_CREDITS - 1);
+
+    const live = await authorizeAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(live.kind).toBe('ok');
+    if (live.kind !== 'ok') return;
+    const revoked = await revokeAccountKey({ record: live.record, store });
+    expect(revoked.kind).toBe('ok');
+
+    const afterRevoke = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+      usage: allowGate,
+    });
+    expect(afterRevoke.kind).toBe('deny');
+    if (afterRevoke.kind === 'deny') {
+      expect(afterRevoke.status).toBe(401);
+      expect(afterRevoke.payload.code).toBe('ACCOUNT_UNAUTHORIZED');
+    }
+
+    const newKeyDead = await authorizeCall({
+      headers: { 'x-dql-key': rotated.api_key },
+      sandbox: false,
+      keys: new Map(),
+      usage: allowGate,
+      store,
+    });
+    expect(newKeyDead.kind).toBe('deny');
   });
 
   it('account token is not a verify key', async () => {

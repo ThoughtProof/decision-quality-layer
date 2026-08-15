@@ -12,6 +12,8 @@
  *
  * Key delivery: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or
  * `Authorization: Bearer dqlk_...` (alias for OpenAI-style clients).
+ * Account tokens (`dqla_…`) are not accepted on `X-DQL-Key`. They authorize
+ * verify via `X-DQL-Account` / `Authorization: Bearer dqla_…` (see account.ts).
  *
  * Key registry is the union of:
  *   1. Env `DQL_API_KEYS` JSON — bootstrap (canary / guardian-pwa / manual
@@ -105,7 +107,13 @@ export function extractApiKey(headers: HeaderMap): string | null {
 
 export interface AuthErrorPayload {
   error: string;
-  code: 'PAYMENT_REQUIRED' | 'QUOTA_EXCEEDED' | 'CREDITS_EXHAUSTED' | 'CREDITS_UNAVAILABLE';
+  code:
+    | 'PAYMENT_REQUIRED'
+    | 'QUOTA_EXCEEDED'
+    | 'CREDITS_EXHAUSTED'
+    | 'CREDITS_UNAVAILABLE'
+    | 'ACCOUNT_UNAUTHORIZED'
+    | 'ACCOUNT_UNAVAILABLE';
   price_usd_per_call?: number;
   access?: string;
   retry_after?: string;
@@ -117,7 +125,14 @@ export type AllowBilling = 'dev-access' | 'credit' | 'payg' | 'env-metered';
 
 export type AuthDecision =
   | { kind: 'free_sandbox' }
-  | { kind: 'allow'; key: string; record: ApiKeyRecord; billing: AllowBilling }
+  | {
+      kind: 'allow';
+      key: string;
+      record: ApiKeyRecord;
+      billing: AllowBilling;
+      /** `account` = authorized via `dqla_…` (log `key` is the stored hash, never a secret). */
+      via?: 'key' | 'account';
+    }
   | { kind: 'deny'; status: number; payload: AuthErrorPayload };
 
 /** Usage accounting port — implemented by Upstash (src/auth/usage.ts) or a
@@ -125,6 +140,12 @@ export type AuthDecision =
  * daily cap is exceeded (call must be rejected with 429). */
 export interface UsageGate {
   checkAndRecord(key: string, cap: number): Promise<boolean>;
+  /**
+   * Same daily-cap counter as `checkAndRecord(plaintext)`, addressed by the
+   * stored key hash (sha256 of `dqlk_…`). Needed when the caller holds only
+   * `dqla_…` and the plaintext verify key is gone.
+   */
+  checkAndRecordFromHash?(keyHash: string, cap: number): Promise<boolean>;
 }
 
 export const DEV_ACCESS_CONTACT = 'dev-access keys: raul@thoughtproof.ai';

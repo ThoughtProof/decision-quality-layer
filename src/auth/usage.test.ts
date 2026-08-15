@@ -7,8 +7,10 @@ import {
   createUsageGate,
   emitUsageLine,
   usageCounterKey,
+  usageFingerprint,
   usageRedisKeyId,
 } from './usage.js';
+import { sha256Hex } from './key-hash.js';
 
 describe('NoopUsageGate', () => {
   it('always allows', async () => {
@@ -68,6 +70,16 @@ describe('UpstashUsageGate', () => {
     expect(await day1.checkAndRecord('dqlk_a', 1)).toBe(true);
     expect(await day1.checkAndRecord('dqlk_a', 1)).toBe(false);
     expect(await day2.checkAndRecord('dqlk_a', 1)).toBe(true); // fresh day
+  });
+
+  it('checkAndRecordFromHash shares the plaintext-key counter', async () => {
+    const redis = fakeRedis();
+    const gate = new UpstashUsageGate(redis, () => new Date('2026-07-20T12:00:00Z'));
+    const key = 'dqlk_shared_cap_key';
+    expect(await gate.checkAndRecord(key, 2)).toBe(true);
+    expect(await gate.checkAndRecordFromHash(sha256Hex(key), 2)).toBe(true);
+    expect(await gate.checkAndRecordFromHash(sha256Hex(key), 2)).toBe(false);
+    expect(redis.store.get(usageCounterKey(key, '2026-07-20'))).toBe(3);
   });
 
   it('Redis failure degrades the brake, never the gate', async () => {
@@ -139,6 +151,25 @@ describe('emitUsageLine', () => {
     const expectedHashPrefix = createHash('sha256').update(rawKey, 'utf8').digest('hex').slice(0, 12);
     expect(line.key_fingerprint).toContain(expectedHashPrefix);
     expect(line.key_fingerprint).toContain(rawKey.slice(-4));
+    spy.mockRestore();
+  });
+
+  it('never logs plaintext dqla_ (hash prefix only, no last-4)', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const token = 'dqla_super-secret-account-token-aaaa';
+    emitUsageLine({
+      requestId: 'dql_acct',
+      key: token,
+      owner: 'ss:cus_x',
+      devAccess: false,
+      priceUsd: 0,
+    });
+    const raw = spy.mock.calls[0]![0] as string;
+    expect(raw).not.toContain(token);
+    expect(raw).not.toContain(token.slice(-4));
+    expect(usageFingerprint(token)).toBe(
+      createHash('sha256').update(token, 'utf8').digest('hex').slice(0, 12),
+    );
     spy.mockRestore();
   });
 

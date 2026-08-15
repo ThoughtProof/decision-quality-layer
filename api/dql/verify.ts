@@ -34,6 +34,7 @@ import { StubCascade } from '../../src/engine/cascade.js';
 import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
 import { authorizeCall, extractApiKey, parseApiKeys } from '../../src/auth/keys.js';
+import { authorizeVerifyWithAccount, extractAccountToken } from '../../src/auth/account.js';
 import { createKeyStore } from '../../src/auth/key-store.js';
 import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
 import { emitStripeMeterEvent, loadStripeMeterConfig } from '../../src/auth/stripe-meter.js';
@@ -141,7 +142,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-DQL-Key, PAYMENT-SIGNATURE, Payment-Signature',
+      'Content-Type, Authorization, X-DQL-Key, X-DQL-Account, PAYMENT-SIGNATURE, Payment-Signature',
     );
     res.setHeader(
       'Access-Control-Expose-Headers',
@@ -186,6 +187,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           (req.body as { sandbox?: unknown } | undefined)?.sandbox === true;
         const headers = req.headers as Record<string, unknown>;
         const presentedKey = extractApiKey(headers);
+        const accountToken = extractAccountToken(headers);
+        const verifyKey = presentedKey && presentedKey.startsWith('dqlk_') ? presentedKey : null;
 
         type AuthPath =
           | { kind: 'free_sandbox' }
@@ -219,7 +222,48 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           };
         } else if (isSandbox) {
           authPath = { kind: 'free_sandbox' };
+        } else if (verifyKey) {
+          const auth = await authorizeCall({
+            headers,
+            sandbox: false,
+            keys: API_KEYS,
+            usage: USAGE_GATE,
+            store: KEY_STORE ?? undefined,
+          });
+          if (auth.kind === 'deny') {
+            authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
+          } else if (auth.kind === 'allow') {
+            authPath = { kind: 'allow', key: auth.key, record: auth.record, billing: auth.billing };
+          } else {
+            authPath = { kind: 'free_sandbox' };
+          }
+        } else if (accountToken) {
+          // App-credential path: `dqla_…` bills the bound ledger. Never returns `dqlk_…`.
+          if (!KEY_STORE) {
+            authPath = {
+              kind: 'deny',
+              status: 503,
+              payload: {
+                error: 'Account store unavailable',
+                code: 'ACCOUNT_UNAVAILABLE',
+              },
+            };
+          } else {
+            const auth = await authorizeVerifyWithAccount({
+              headers,
+              store: KEY_STORE,
+              usage: USAGE_GATE,
+            });
+            if (auth.kind === 'deny') {
+              authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
+            } else if (auth.kind === 'allow') {
+              authPath = { kind: 'allow', key: auth.key, record: auth.record, billing: auth.billing };
+            } else {
+              authPath = { kind: 'free_sandbox' };
+            }
+          }
         } else if (presentedKey) {
+          // `X-DQL-Key: dqla_…` (or other non-dqlk_ value) — not an account token.
           const auth = await authorizeCall({
             headers,
             sandbox: false,
