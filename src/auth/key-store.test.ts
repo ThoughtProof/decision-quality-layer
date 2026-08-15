@@ -78,6 +78,53 @@ describe('UpstashKeyStore (memory)', () => {
     expect(await store.claimTrial('e@f.co', 'fp_3')).toBe('ok');
   });
 
+  it('reserveVerify holds credit+cap; release restores; commit is sticky', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_rsv',
+      stripeCustomerId: 'cus_rsv',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 3);
+
+    const first = await store.reserveVerify({
+      requestId: 'dql_r1',
+      keyHash: rec.hash,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(first.kind).toBe('ok');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+
+    const replay = await store.reserveVerify({
+      requestId: 'dql_r1',
+      keyHash: rec.hash,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(replay.kind).toBe('ok');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+
+    await store.releaseVerifyReservation('dql_r1');
+    expect(await store.creditBalance(rec.hash)).toBe(3);
+    expect(await store.usageToday(rec.hash)).toBe(0);
+
+    const again = await store.reserveVerify({
+      requestId: 'dql_r2',
+      keyHash: rec.hash,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(again.kind).toBe('ok');
+    await store.commitVerifyReservation('dql_r2');
+    await store.releaseVerifyReservation('dql_r2');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+  });
+
   it('reveal is one-time (GETDEL)', async () => {
     const store = new UpstashKeyStore(createMemoryKv());
     const key = generateApiKey();

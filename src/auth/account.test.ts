@@ -1,15 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
-import { authorizeCall, type UsageGate } from './keys.js';
+import { authorizeCall, DEFAULT_DAILY_CAP, type UsageGate } from './keys.js';
 import {
   authorizeAccount,
   authorizeVerifyWithAccount,
+  commitVerifyReservation,
   createBillingPortalSession,
   extractAccountToken,
   getAccountSnapshot,
   maskEmail,
+  releaseVerifyReservation,
+  reserveVerifyWithAccount,
   revokeAccountKey,
   rotateAccountKey,
-  settleVerifyWithAccount,
 } from './account.js';
 import {
   finalizeCheckoutMint,
@@ -207,17 +209,19 @@ describe('reveal + account surface', () => {
     expect(allowed.key).not.toBe(minted.accountToken);
     expect(JSON.stringify(allowed)).not.toContain(minted.plaintext);
     expect(JSON.stringify(allowed)).not.toContain(minted.accountToken);
-    // Auth is identity-only — credits stay put until settle after success.
+    // Auth is identity-only — credits stay put until reserve (admission).
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
 
-    const settled = await settleVerifyWithAccount({
+    const reserved = await reserveVerifyWithAccount({
+      requestId: 'dql_vfy_1',
       keyHash: allowed.key,
       record: allowed.record,
       store,
-      usage: allowGate,
     });
-    expect(settled.kind).toBe('allow');
-    if (settled.kind === 'allow') expect(settled.billing).toBe('credit');
+    expect(reserved.kind).toBe('allow');
+    if (reserved.kind === 'allow') expect(reserved.billing).toBe('credit');
+    expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
+    await commitVerifyReservation({ requestId: 'dql_vfy_1', store });
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
 
     const viaBearer = await authorizeVerifyWithAccount({
@@ -227,12 +231,13 @@ describe('reveal + account surface', () => {
     expect(viaBearer.kind).toBe('allow');
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
     if (viaBearer.kind === 'allow') {
-      await settleVerifyWithAccount({
+      await reserveVerifyWithAccount({
+        requestId: 'dql_vfy_2',
         keyHash: viaBearer.key,
         record: viaBearer.record,
         store,
-        usage: allowGate,
       });
+      await commitVerifyReservation({ requestId: 'dql_vfy_2', store });
     }
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 2);
 
@@ -242,7 +247,8 @@ describe('reveal + account surface', () => {
   });
 
   it('authorizeVerifyWithAccount does not consume credits or daily-cap', async () => {
-    const store = new UpstashKeyStore(createMemoryKv());
+    const kv = createMemoryKv();
+    const store = new UpstashKeyStore(kv);
     const minted = await finalizeCheckoutMint({
       sessionId: 'cs_noident',
       customerId: 'cus_noident',
@@ -253,7 +259,6 @@ describe('reveal + account surface', () => {
     expect(minted.kind).toBe('minted');
     if (minted.kind !== 'minted') return;
 
-    const denyGate: UsageGate = { checkAndRecord: async () => false };
     const auth = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': minted.accountToken },
       store,
@@ -261,18 +266,119 @@ describe('reveal + account surface', () => {
     expect(auth.kind).toBe('allow');
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
 
-    // Daily-cap brake is settle-only; a deny gate must not have been consulted at auth.
+    const day = new Date().toISOString().slice(0, 10);
+    await kv.set(usageCounterKeyFromHash(sha256Hex(minted.plaintext), day), DEFAULT_DAILY_CAP);
     if (auth.kind === 'allow') {
-      const blocked = await settleVerifyWithAccount({
+      const blocked = await reserveVerifyWithAccount({
+        requestId: 'dql_cap_block',
         keyHash: auth.key,
         record: auth.record,
         store,
-        usage: denyGate,
       });
       expect(blocked.kind).toBe('deny');
       if (blocked.kind === 'deny') expect(blocked.status).toBe(429);
     }
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+    expect(await store.usageToday(sha256Hex(minted.plaintext))).toBe(DEFAULT_DAILY_CAP);
+  });
+
+  it('reserve is idempotent per requestId; release restores credit and cap', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_rsv',
+      customerId: 'cus_rsv',
+      owner: selfServeOwner('cus_rsv'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+    const hash = sha256Hex(minted.plaintext);
+    const auth = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(auth.kind).toBe('allow');
+    if (auth.kind !== 'allow') return;
+
+    const first = await reserveVerifyWithAccount({
+      requestId: 'dql_same',
+      keyHash: auth.key,
+      record: auth.record,
+      store,
+    });
+    const replay = await reserveVerifyWithAccount({
+      requestId: 'dql_same',
+      keyHash: auth.key,
+      record: auth.record,
+      store,
+    });
+    expect(first.kind).toBe('allow');
+    expect(replay.kind).toBe('allow');
+    expect(await store.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+    expect(await store.usageToday(hash)).toBe(1);
+
+    await releaseVerifyReservation({ requestId: 'dql_same', store });
+    expect(await store.creditBalance(hash)).toBe(STARTER_CREDITS);
+    expect(await store.usageToday(hash)).toBe(0);
+    await releaseVerifyReservation({ requestId: 'dql_same', store });
+    expect(await store.creditBalance(hash)).toBe(STARTER_CREDITS);
+
+    const again = await reserveVerifyWithAccount({
+      requestId: 'dql_same',
+      keyHash: auth.key,
+      record: auth.record,
+      store,
+    });
+    expect(again.kind).toBe('allow');
+    await commitVerifyReservation({ requestId: 'dql_same', store });
+    await commitVerifyReservation({ requestId: 'dql_same', store });
+    await releaseVerifyReservation({ requestId: 'dql_same', store });
+    expect(await store.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+  });
+
+  it('two concurrent reserves with 1 credit: one ok, one empty', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_race',
+      customerId: 'cus_race',
+      owner: selfServeOwner('cus_race'),
+      store,
+      pack: 'starter',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+    const hash = sha256Hex(minted.plaintext);
+    await store.setCreditBalance(hash, 1);
+    const auth = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(auth.kind).toBe('allow');
+    if (auth.kind !== 'allow') return;
+
+    const [a, b] = await Promise.all([
+      reserveVerifyWithAccount({
+        requestId: 'dql_race_a',
+        keyHash: auth.key,
+        record: auth.record,
+        store,
+      }),
+      reserveVerifyWithAccount({
+        requestId: 'dql_race_b',
+        keyHash: auth.key,
+        record: auth.record,
+        store,
+      }),
+    ]);
+    const kinds = [a.kind, b.kind].sort();
+    expect(kinds).toEqual(['allow', 'deny']);
+    const denied = a.kind === 'deny' ? a : b;
+    if (denied.kind === 'deny') {
+      expect(denied.status).toBe(402);
+      expect(denied.payload.code).toBe('CREDITS_EXHAUSTED');
+    }
+    expect(await store.creditBalance(hash)).toBe(0);
   });
 
   it('verify with invalid/missing dqla_ is 401; dqla_ as X-DQL-Key stays 402', async () => {
@@ -337,14 +443,15 @@ describe('reveal + account surface', () => {
     if (ok.kind !== 'allow') return;
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(1);
 
-    const first = await settleVerifyWithAccount({
+    const first = await reserveVerifyWithAccount({
+      requestId: 'dql_exh_1',
       keyHash: ok.key,
       record: ok.record,
       store,
-      usage: allowGate,
     });
     expect(first.kind).toBe('allow');
     if (first.kind === 'allow') expect(first.billing).toBe('credit');
+    await commitVerifyReservation({ requestId: 'dql_exh_1', store });
 
     const stillIdentified = await authorizeVerifyWithAccount({
       headers: { 'x-dql-account': minted.accountToken },
@@ -353,11 +460,11 @@ describe('reveal + account surface', () => {
     expect(stillIdentified.kind).toBe('allow');
     if (stillIdentified.kind !== 'allow') return;
 
-    const stop = await settleVerifyWithAccount({
+    const stop = await reserveVerifyWithAccount({
+      requestId: 'dql_exh_2',
       keyHash: stillIdentified.key,
       record: stillIdentified.record,
       store,
-      usage: allowGate,
     });
     expect(stop.kind).toBe('deny');
     if (stop.kind !== 'deny') return;
@@ -410,14 +517,15 @@ describe('reveal + account surface', () => {
     if (afterRotate.kind !== 'allow') return;
     expect(afterRotate.key).toBe(sha256Hex(rotated.api_key));
     expect(await store.creditBalance(sha256Hex(rotated.api_key))).toBe(STARTER_CREDITS);
-    const settledRotate = await settleVerifyWithAccount({
+    const reservedRotate = await reserveVerifyWithAccount({
+      requestId: 'dql_life_1',
       keyHash: afterRotate.key,
       record: afterRotate.record,
       store,
-      usage: allowGate,
     });
-    expect(settledRotate.kind).toBe('allow');
-    if (settledRotate.kind === 'allow') expect(settledRotate.billing).toBe('credit');
+    expect(reservedRotate.kind).toBe('allow');
+    if (reservedRotate.kind === 'allow') expect(reservedRotate.billing).toBe('credit');
+    await commitVerifyReservation({ requestId: 'dql_life_1', store });
     expect(await store.creditBalance(sha256Hex(rotated.api_key))).toBe(STARTER_CREDITS - 1);
 
     const live = await authorizeAccount({

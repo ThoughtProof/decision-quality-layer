@@ -36,8 +36,10 @@ import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
 import { authorizeCall, extractApiKey, parseApiKeys } from '../../src/auth/keys.js';
 import {
   authorizeVerifyWithAccount,
+  commitVerifyReservation,
   extractAccountToken,
-  settleVerifyWithAccount,
+  releaseVerifyReservation,
+  reserveVerifyWithAccount,
 } from '../../src/auth/account.js';
 import { createKeyStore } from '../../src/auth/key-store.js';
 import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
@@ -113,6 +115,7 @@ const KEY_STORE = createKeyStore(process.env);
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const requestId = `dql_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  let accountHold: { requestId: string } | null = null;
 
   // v0.4.3.1 §C+integration: per-request diagnostics collector, created ONLY
   // when the runtime is a valid production bundle AND diagnostics_on=true.
@@ -318,6 +321,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           }
         }
 
+        if (authPath.kind === 'allow' && authPath.via === 'account') {
+          // Admission: reserve credit + daily-cap BEFORE verify / CONFIG_INVALID.
+          if (!KEY_STORE) {
+            authPath = {
+              kind: 'deny',
+              status: 503,
+              payload: {
+                error: 'Account store unavailable',
+                code: 'ACCOUNT_UNAVAILABLE',
+              },
+            };
+          } else {
+            const reserved = await reserveVerifyWithAccount({
+              requestId,
+              keyHash: authPath.key,
+              record: authPath.record,
+              store: KEY_STORE,
+            });
+            if (reserved.kind === 'deny') {
+              authPath = { kind: 'deny', status: reserved.status, payload: reserved.payload as object };
+            } else if (reserved.kind === 'allow') {
+              authPath = {
+                kind: 'allow',
+                key: reserved.key,
+                record: reserved.record,
+                billing: reserved.billing,
+                via: 'account',
+              };
+              accountHold = { requestId };
+            }
+          }
+        }
+
         if (authPath.kind === 'deny') {
           status = authPath.status;
           payload = authPath.payload;
@@ -325,6 +361,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
           // resolver failed for a Live-configured deploy, EVERY POST
           // returns 503, including sandbox=true. Never settle on config fail.
+          if (accountHold && KEY_STORE) {
+            await releaseVerifyReservation({ requestId: accountHold.requestId, store: KEY_STORE });
+            accountHold = null;
+          }
           status = 503;
           payload = {
             error: 'Runtime not initialised',
@@ -349,38 +389,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               : {}),
           });
 
-          // 4) Payment settle / Stripe meter ONLY after successful DQL.
-          if (authPath.kind === 'allow') {
-            if (authPath.via === 'account') {
-              if (!KEY_STORE) {
-                status = 503;
-                payload = {
-                  error: 'Account store unavailable',
-                  code: 'ACCOUNT_UNAVAILABLE',
-                };
-              } else {
-                const settled = await settleVerifyWithAccount({
-                  keyHash: authPath.key,
-                  record: authPath.record,
-                  store: KEY_STORE,
-                  usage: USAGE_GATE,
-                });
-                if (settled.kind === 'deny') {
-                  status = settled.status;
-                  payload = settled.payload;
-                } else if (settled.kind === 'allow') {
-                  authPath = {
-                    kind: 'allow',
-                    key: settled.key,
-                    record: settled.record,
-                    billing: settled.billing,
-                    via: 'account',
-                  };
-                }
-              }
-            }
+          if (accountHold && KEY_STORE) {
+            await commitVerifyReservation({ requestId: accountHold.requestId, store: KEY_STORE });
+            accountHold = null;
           }
 
+          // 4) Payment settle / Stripe meter ONLY after successful DQL.
           if (authPath.kind === 'allow' && status === 200 && payload === null) {
             const price = priceForCall({
               sandbox: false,
@@ -477,11 +491,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             status = 200;
             payload = response;
           }
-          // Account settle deny (402/429/503) already set status+payload. Do not overwrite.
+          // Account reserve deny (402/429/503) already set status+payload before verify.
         }
       }
     }
   } catch (err) {
+    if (accountHold && KEY_STORE) {
+      try {
+        await releaseVerifyReservation({ requestId: accountHold.requestId, store: KEY_STORE });
+      } catch {
+        // Release must not mask the original failure.
+      }
+      accountHold = null;
+    }
     const message = err instanceof Error ? err.message : 'Unknown error';
     status = 500;
     payload = { error: 'Internal server error', code: 'INTERNAL_ERROR', details: message };

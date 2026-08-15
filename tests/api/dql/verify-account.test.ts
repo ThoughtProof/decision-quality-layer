@@ -9,11 +9,15 @@ import { authorizeAccount, revokeAccountKey, rotateAccountKey } from '../../../s
 import { finalizeCheckoutMint } from '../../../src/auth/checkout.js';
 import { sha256Hex } from '../../../src/auth/key-hash.js';
 import { UpstashKeyStore, createMemoryKv, selfServeOwner } from '../../../src/auth/key-store.js';
+import { DEFAULT_DAILY_CAP } from '../../../src/auth/keys.js';
 import { STARTER_CREDITS } from '../../../src/auth/packs.js';
+import { usageCounterKeyFromHash } from '../../../src/auth/usage.js';
 
 const harness = vi.hoisted(() => ({
   store: null as InstanceType<typeof UpstashKeyStore> | null,
+  kv: null as ReturnType<typeof createMemoryKv> | null,
   failVerify: false,
+  verifyCalls: 0,
 }));
 
 vi.mock('../../../src/auth/key-store.js', async (importOriginal) => {
@@ -29,6 +33,7 @@ vi.mock('../../../src/engine/index.js', async (importOriginal) => {
   return {
     ...actual,
     runVerification: async (opts: Parameters<typeof actual.runVerification>[0]) => {
+      harness.verifyCalls += 1;
       if (harness.failVerify) throw new Error('provider down');
       return actual.runVerification(opts);
     },
@@ -88,14 +93,18 @@ describe('POST /dql/verify — account token (dqla_)', () => {
         delete process.env[k];
       }
     }
-    harness.store = new UpstashKeyStore(createMemoryKv());
+    harness.kv = createMemoryKv();
+    harness.store = new UpstashKeyStore(harness.kv);
     harness.failVerify = false;
+    harness.verifyCalls = 0;
   });
 
   afterEach(() => {
     process.env = originalEnv;
     harness.store = null;
+    harness.kv = null;
     harness.failVerify = false;
+    harness.verifyCalls = 0;
   });
 
   async function mintStarter() {
@@ -136,7 +145,9 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
     expect(JSON.stringify(state.jsonBody)).not.toMatch(/dqlk_[0-9a-f]{16}/);
     expect(state.headers['X-DQL-Billing']).toBe('credit');
+    expect(harness.verifyCalls).toBe(1);
     expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
+    expect(await harness.store!.usageToday(sha256Hex(minted.plaintext))).toBe(1);
     expect(logs.join('\n')).not.toContain(minted.plaintext);
     expect(logs.join('\n')).not.toContain(minted.accountToken);
     spy.mockRestore();
@@ -255,7 +266,9 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     expect(state.jsonBody.code).toBe('CONFIG_INVALID');
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.plaintext);
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
+    expect(harness.verifyCalls).toBe(0);
     expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+    expect(await harness.store!.usageToday(sha256Hex(minted.plaintext))).toBe(0);
   });
 
   it('thrown verify after valid dqla_ leaves credits unchanged', async () => {
@@ -272,10 +285,12 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     expect(state.jsonBody.code).toBe('INTERNAL_ERROR');
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.plaintext);
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
+    expect(harness.verifyCalls).toBe(1);
     expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
+    expect(await harness.store!.usageToday(sha256Hex(minted.plaintext))).toBe(0);
   });
 
-  it('exhausted credits 402 when billing happens after success', async () => {
+  it('0 credits + valid dqla_ is 402 without calling runVerification', async () => {
     const minted = await mintStarter();
     await harness.store!.setCreditBalance(sha256Hex(minted.plaintext), 0);
     const mod = await import('../../../api/dql/verify.js');
@@ -288,7 +303,50 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     expect(state.statusCode).toBe(402);
     expect(state.jsonBody.code).toBe('CREDITS_EXHAUSTED');
     expect(state.jsonBody.axes).toBeUndefined();
+    expect(harness.verifyCalls).toBe(0);
     expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(0);
+    expect(await harness.store!.usageToday(sha256Hex(minted.plaintext))).toBe(0);
+  });
+
+  it('daily-cap exhausted is 429 without running verify; credits unchanged', async () => {
+    const minted = await mintStarter();
+    const hash = sha256Hex(minted.plaintext);
+    const day = new Date().toISOString().slice(0, 10);
+    await harness.kv!.set(usageCounterKeyFromHash(hash, day), DEFAULT_DAILY_CAP);
+    const mod = await import('../../../api/dql/verify.js');
+    const { req, res, state } = makeReqRes(
+      { ...validVerifyBody, sandbox: false },
+      'POST',
+      { 'x-dql-account': minted.accountToken },
+    );
+    await mod.default(req, res);
+    expect(state.statusCode).toBe(429);
+    expect(state.jsonBody.code).toBe('QUOTA_EXCEEDED');
+    expect(harness.verifyCalls).toBe(0);
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS);
+    expect(await harness.store!.usageToday(hash)).toBe(DEFAULT_DAILY_CAP);
+  });
+
+  it('two concurrent verifies with 1 credit: one 200, one 402; engine once', async () => {
+    const minted = await mintStarter();
+    const hash = sha256Hex(minted.plaintext);
+    await harness.store!.setCreditBalance(hash, 1);
+    const mod = await import('../../../api/dql/verify.js');
+    const a = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', {
+      'x-dql-account': minted.accountToken,
+    });
+    const b = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', {
+      'x-dql-account': minted.accountToken,
+    });
+    await Promise.all([mod.default(a.req, a.res), mod.default(b.req, b.res)]);
+    const codes = [a.state.statusCode, b.state.statusCode].sort();
+    expect(codes).toEqual([200, 402]);
+    const failed = a.state.statusCode === 402 ? a.state : b.state;
+    expect(failed.jsonBody.code).toBe('CREDITS_EXHAUSTED');
+    expect(harness.verifyCalls).toBe(1);
+    expect(await harness.store!.creditBalance(hash)).toBe(0);
+    expect(JSON.stringify(a.state.jsonBody)).not.toContain(minted.plaintext);
+    expect(JSON.stringify(b.state.jsonBody)).not.toContain(minted.accountToken);
   });
 
   it('CORS allows X-DQL-Account', async () => {

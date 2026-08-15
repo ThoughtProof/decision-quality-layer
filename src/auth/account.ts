@@ -20,7 +20,7 @@ import {
 import { generateApiKey } from './checkout.js';
 import { stripeFormRequest } from './stripe-http.js';
 import { PRICE_USD_PER_CALL } from '../pricing.js';
-import type { AuthDecision, UsageGate } from './keys.js';
+import type { AuthDecision } from './keys.js';
 
 export const ACCOUNT_HEADER = 'X-DQL-Account';
 
@@ -82,7 +82,7 @@ const ACCOUNT_UNAUTHORIZED: AuthDecision = {
  * Authorize `POST /dql/verify` with the post-purchase account token.
  * Identity only: valid `dqla_…` + live (non-revoked) key hash.
  * Does not consume credits or increment daily-cap — that is
- * `settleVerifyWithAccount` after a successful `runVerification()`.
+ * `reserveVerifyWithAccount` (admission) before `runVerification()`.
  * Missing/invalid/revoked → 401. Never returns `dqlk_…`.
  */
 export async function authorizeVerifyWithAccount(opts: {
@@ -104,20 +104,34 @@ export async function authorizeVerifyWithAccount(opts: {
 }
 
 /**
- * Book daily-cap + prepaid credit after a successful verify.
- * Same 429 / 402 / 503 outcomes as the previous in-auth booking.
- * Call only after `runVerification()` returns; never on CONFIG_INVALID / throw.
+ * Atomic pre-execution reservation of prepaid credit (or confirmed PAYG)
+ * and daily-cap. Call before `runVerification()`. Idempotent per requestId.
+ * Failure → 402 / 429 / 503 and the engine must not run.
  */
-export async function settleVerifyWithAccount(opts: {
+export async function reserveVerifyWithAccount(opts: {
+  requestId: string;
   keyHash: string;
   record: import('./keys.js').ApiKeyRecord;
   store: KeyStore;
-  usage: UsageGate;
+  now?: Date;
 }): Promise<AuthDecision> {
-  const withinCap = opts.usage.checkAndRecordFromHash
-    ? await opts.usage.checkAndRecordFromHash(opts.keyHash, opts.record.daily_cap)
-    : await opts.usage.checkAndRecord(opts.keyHash, opts.record.daily_cap);
-  if (!withinCap) {
+  const result = await opts.store.reserveVerify({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    dailyCap: opts.record.daily_cap,
+    paygOptIn: opts.record.payg_opt_in === true,
+    now: opts.now,
+  });
+  if (result.kind === 'ok') {
+    return {
+      kind: 'allow',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: result.reservation.billing,
+      via: 'account',
+    };
+  }
+  if (result.kind === 'quota') {
     return {
       kind: 'deny',
       status: 429,
@@ -128,18 +142,7 @@ export async function settleVerifyWithAccount(opts: {
       },
     };
   }
-
-  const spent = await opts.store.consumeCredit(opts.keyHash);
-  if (spent === 'consumed') {
-    return {
-      kind: 'allow',
-      key: opts.keyHash,
-      record: opts.record,
-      billing: 'credit',
-      via: 'account',
-    };
-  }
-  if (spent === 'error') {
+  if (result.kind === 'error') {
     return {
       kind: 'deny',
       status: 503,
@@ -148,15 +151,6 @@ export async function settleVerifyWithAccount(opts: {
         code: 'CREDITS_UNAVAILABLE',
         no_freemium: true,
       },
-    };
-  }
-  if (opts.record.payg_opt_in === true) {
-    return {
-      kind: 'allow',
-      key: opts.keyHash,
-      record: opts.record,
-      billing: 'payg',
-      via: 'account',
     };
   }
   return {
@@ -169,6 +163,20 @@ export async function settleVerifyWithAccount(opts: {
       no_freemium: true,
     },
   };
+}
+
+export async function commitVerifyReservation(opts: {
+  requestId: string;
+  store: KeyStore;
+}): Promise<void> {
+  await opts.store.commitVerifyReservation(opts.requestId);
+}
+
+export async function releaseVerifyReservation(opts: {
+  requestId: string;
+  store: KeyStore;
+}): Promise<void> {
+  await opts.store.releaseVerifyReservation(opts.requestId);
 }
 
 export interface AccountSnapshot {
