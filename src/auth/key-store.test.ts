@@ -14,6 +14,15 @@ const allowGate: UsageGate = { checkAndRecord: async () => true };
 const DIGEST_A = 'digest-aaaaaaaaaaaaaaaa';
 const DIGEST_B = 'digest-bbbbbbbbbbbbbbbb';
 
+function holdOf(result: Awaited<ReturnType<UpstashKeyStore['reserveVerify']>>) {
+  if (result.kind !== 'ok') throw new Error(`expected ok, got ${result.kind}`);
+  return {
+    requestId: result.reservation.requestId,
+    keyHash: result.reservation.keyHash,
+    fence: result.reservation.fence,
+  };
+}
+
 describe('createKeyStore', () => {
   it('returns null without Upstash env', () => {
     expect(createKeyStore({} as NodeJS.ProcessEnv)).toBeNull();
@@ -112,7 +121,7 @@ describe('UpstashKeyStore (memory)', () => {
     expect(replay.kind).toBe('in_progress');
     expect(await store.creditBalance(rec.hash)).toBe(2);
 
-    await store.releaseVerifyReservation('dql_r1');
+    await store.releaseVerifyReservation(holdOf(first));
     expect(await store.creditBalance(rec.hash)).toBe(3);
     expect(await store.usageToday(rec.hash)).toBe(0);
 
@@ -124,8 +133,8 @@ describe('UpstashKeyStore (memory)', () => {
       paygOptIn: false,
     });
     expect(again.kind).toBe('ok');
-    await store.commitVerifyReservation('dql_r2');
-    await store.releaseVerifyReservation('dql_r2');
+    await store.commitVerifyReservation(holdOf(again));
+    await store.releaseVerifyReservation(holdOf(again));
     expect(await store.creditBalance(rec.hash)).toBe(2);
     expect(await store.usageToday(rec.hash)).toBe(1);
   });
@@ -184,8 +193,8 @@ describe('UpstashKeyStore (memory)', () => {
     expect(await store.creditBalance(rec.hash)).toBe(1);
 
     await Promise.all([
-      store.releaseVerifyReservation('dql_dbl_rel'),
-      store.releaseVerifyReservation('dql_dbl_rel'),
+      store.releaseVerifyReservation(holdOf(held)),
+      store.releaseVerifyReservation(holdOf(held)),
     ]);
     expect(await store.creditBalance(rec.hash)).toBe(2);
     expect(await store.usageToday(rec.hash)).toBe(0);
@@ -210,8 +219,8 @@ describe('UpstashKeyStore (memory)', () => {
       paygOptIn: false,
     });
     expect(c.kind).toBe('ok');
-    await store.commitVerifyReservation('dql_commit_first');
-    await store.releaseVerifyReservation('dql_commit_first');
+    await store.commitVerifyReservation(holdOf(c));
+    await store.releaseVerifyReservation(holdOf(c));
     expect(await store.creditBalance(rec.hash)).toBe(2);
     expect(await store.usageToday(rec.hash)).toBe(1);
 
@@ -224,10 +233,10 @@ describe('UpstashKeyStore (memory)', () => {
     });
     expect(r.kind).toBe('ok');
     expect(await store.creditBalance(rec.hash)).toBe(1);
-    await store.releaseVerifyReservation('dql_release_first');
+    await store.releaseVerifyReservation(holdOf(r));
     expect(await store.creditBalance(rec.hash)).toBe(2);
     expect(await store.usageToday(rec.hash)).toBe(1);
-    await store.commitVerifyReservation('dql_release_first');
+    await store.commitVerifyReservation(holdOf(r));
     expect(await store.creditBalance(rec.hash)).toBe(2);
     expect(await store.usageToday(rec.hash)).toBe(1);
   });
@@ -253,8 +262,8 @@ describe('UpstashKeyStore (memory)', () => {
     expect(await store.creditBalance(rec.hash)).toBe(1);
 
     await Promise.all([
-      store.commitVerifyReservation('dql_c_or_r'),
-      store.releaseVerifyReservation('dql_c_or_r'),
+      store.commitVerifyReservation(holdOf(held)),
+      store.releaseVerifyReservation(holdOf(held)),
     ]);
     const credits = await store.creditBalance(rec.hash);
     const usage = await store.usageToday(rec.hash);
@@ -263,7 +272,7 @@ describe('UpstashKeyStore (memory)', () => {
     else expect(usage).toBe(0);
   });
 
-  it('cross-account reuse of the same requestId is conflict; victim hold unchanged', async () => {
+  it('two accounts with the same requestId reserve independently', async () => {
     const store = new UpstashKeyStore(createMemoryKv());
     const aKey = generateApiKey();
     const bKey = generateApiKey();
@@ -280,30 +289,28 @@ describe('UpstashKeyStore (memory)', () => {
     await store.putKey(a);
     await store.putKey(b);
     await store.addCredits(a.hash, 2);
-    await store.setCreditBalance(b.hash, 0);
+    await store.addCredits(b.hash, 2);
 
-    const held = await store.reserveVerify({
-      requestId: 'dql_shared',
+    const heldA = await store.reserveVerify({
+      requestId: 'client-1',
       keyHash: a.hash,
       payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
-    expect(held.kind).toBe('ok');
-
-    const thief = await store.reserveVerify({
-      requestId: 'dql_shared',
+    const heldB = await store.reserveVerify({
+      requestId: 'client-1',
       keyHash: b.hash,
-      payloadDigest: DIGEST_A,
+      payloadDigest: DIGEST_B,
       dailyCap: 10,
       paygOptIn: false,
     });
-    expect(thief.kind).toBe('conflict');
-    if (thief.kind === 'conflict') expect(thief.reason).toBe('account');
+    expect(heldA.kind).toBe('ok');
+    expect(heldB.kind).toBe('ok');
     expect(await store.creditBalance(a.hash)).toBe(1);
     expect(await store.usageToday(a.hash)).toBe(1);
-    expect(await store.creditBalance(b.hash)).toBe(0);
-    expect(await store.usageToday(b.hash)).toBe(0);
+    expect(await store.creditBalance(b.hash)).toBe(1);
+    expect(await store.usageToday(b.hash)).toBe(1);
   });
 
   it('same id different payload is conflict; no extra debit', async () => {
@@ -355,7 +362,7 @@ describe('UpstashKeyStore (memory)', () => {
       paygOptIn: false,
     });
     expect(first.kind).toBe('ok');
-    await store.commitVerifyReservation('dql_replay', { result: { id: 'stored' }, meter: 'n/a' });
+    await store.commitVerifyReservation({ ...holdOf(first), result: { id: 'stored' }, meter: 'n/a' });
     const replay = await store.reserveVerify({
       requestId: 'dql_replay',
       keyHash: rec.hash,
@@ -393,12 +400,189 @@ describe('UpstashKeyStore (memory)', () => {
     expect(await store.usageToday(rec.hash, t0)).toBe(1);
 
     const later = new Date(t0.getTime() + 16 * 60 * 1000);
-    expect(await store.recoverExpiredVerifyReservation('dql_ttl', later)).toBe('released');
+    expect(
+      await store.recoverExpiredVerifyReservation({
+        requestId: 'dql_ttl',
+        keyHash: rec.hash,
+        now: later,
+      }),
+    ).toBe('released');
     expect(await store.creditBalance(rec.hash)).toBe(2);
     expect(await store.usageToday(rec.hash, t0)).toBe(0);
 
     const swept = await store.recoverExpiredHeldReservations(later);
     expect(swept).toBe(0);
+  });
+
+  it('sweep refunds an expired hold without a client retry of that id', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_sweep',
+      stripeCustomerId: 'cus_sweep',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+    const t0 = new Date('2026-08-15T00:00:00.000Z');
+    const held = await store.reserveVerify({
+      requestId: 'unique-crash-id',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+      now: t0,
+    });
+    expect(held.kind).toBe('ok');
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+    const later = new Date(t0.getTime() + 16 * 60 * 1000);
+    expect(await store.recoverExpiredHeldReservations(later)).toBe(1);
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash, t0)).toBe(0);
+  });
+
+  it('stale fence commit is a no-op after a newer hold', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_fence',
+      stripeCustomerId: 'cus_fence',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 3);
+    const t0 = new Date('2026-08-15T00:00:00.000Z');
+    const first = await store.reserveVerify({
+      requestId: 'dql_fence',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+      now: t0,
+    });
+    expect(first.kind).toBe('ok');
+    const stale = holdOf(first);
+    const later = new Date(t0.getTime() + 16 * 60 * 1000);
+    const next = await store.reserveVerify({
+      requestId: 'dql_fence',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+      now: later,
+    });
+    expect(next.kind).toBe('ok');
+    if (next.kind !== 'ok') return;
+    expect(next.reservation.fence).not.toBe(stale.fence);
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+
+    expect(
+      await store.commitVerifyReservation({
+        ...stale,
+        result: { stale: true },
+        meter: 'n/a',
+      }),
+    ).toBe('noop');
+    expect(await store.releaseVerifyReservation(stale)).toBe('noop');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+
+    expect(
+      await store.commitVerifyReservation({
+        ...holdOf(next),
+        result: { fresh: true },
+        meter: 'n/a',
+      }),
+    ).toBe('committed');
+    const replay = await store.reserveVerify({
+      requestId: 'dql_fence',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+      now: later,
+    });
+    expect(replay.kind).toBe('replay');
+    if (replay.kind === 'replay') expect(replay.reservation.result).toEqual({ fresh: true });
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+  });
+
+  it('commit EVAL failure is acknowledged as error; hold stays releasable', async () => {
+    const kv = createMemoryKv();
+    const orig = kv.eval.bind(kv);
+    kv.eval = (script, keys, args) => {
+      if (String(script).includes('DQL_COMMIT_V3')) return Promise.reject(new Error('EVAL failed'));
+      return orig(script, keys, args);
+    };
+    const store = new UpstashKeyStore(kv);
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_commit_fail',
+      stripeCustomerId: 'cus_commit_fail',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+    const held = await store.reserveVerify({
+      requestId: 'dql_commit_fail',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(held.kind).toBe('ok');
+    expect(await store.commitVerifyReservation({ ...holdOf(held), result: { id: 'x' } })).toBe(
+      'error',
+    );
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+    const again = await store.reserveVerify({
+      requestId: 'dql_commit_fail',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(again.kind).toBe('in_progress');
+    expect(await store.releaseVerifyReservation(holdOf(held))).toBe('released');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+  });
+
+  it('sweep does not refund meter_pending', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_pending',
+      stripeCustomerId: 'cus_pending',
+      paygOptIn: true,
+    });
+    await store.putKey(rec);
+    await store.setCreditBalance(rec.hash, 0);
+    const t0 = new Date('2026-08-15T00:00:00.000Z');
+    const held = await store.reserveVerify({
+      requestId: 'dql_pending',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: true,
+      now: t0,
+    });
+    expect(held.kind).toBe('ok');
+    expect(await store.persistMeterPending({ ...holdOf(held), result: { id: 'pending' } })).toBe(
+      'pending',
+    );
+    const later = new Date(t0.getTime() + 16 * 60 * 1000);
+    expect(await store.recoverExpiredHeldReservations(later)).toBe(0);
+    expect(await store.usageToday(rec.hash, t0)).toBe(1);
+    const again = await store.reserveVerify({
+      requestId: 'dql_pending',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: true,
+      now: later,
+    });
+    expect(again.kind).toBe('meter_pending');
+    if (again.kind === 'meter_pending') expect(again.reservation.result).toEqual({ id: 'pending' });
   });
 
   it('reveal is one-time (GETDEL)', async () => {

@@ -2,15 +2,29 @@
  * Atomic verify reservation (account-token admission).
  *
  * Bound to stored key hash + idempotency id + payload digest.
- * Production: one Redis EVAL per reserve / commit / release / recover.
+ * Production: one Redis EVAL per reserve / commit / release / recover / pending.
  * Tests: the same state machine on a synchronous Kv.
+ *
+ * Keys:
+ *   dql:reserve:{keyHash}:{requestId}  — per-account namespace
+ *   dql:reserve-held                   — ZSET score=leaseExpiresAt, member={keyHash}:{requestId}
+ *   dql:reserve-fence                  — INCR fencing token
+ *
+ * Status:
+ *   held           — debit reserved, engine in flight (or commit not yet acked)
+ *   meter_pending  — engine done, Stripe meter not yet acked; debit stays
+ *   committed      — durable success; replay stored result
+ *   released       — refunded / abandoned
+ *
+ * Commit and release require the fencing token from the hold that started
+ * this worker. A stale worker cannot overwrite a newer lease.
  *
  * Invariant: a `held` debit is never left unrecoverable. The reservation
  * record outlives the 15-minute execution lease (7-day TTL) so a later
- * reserve/recover/sweep can refund credit + cap after a crash. Key expiry
- * is not used as the refund mechanism.
+ * reserve/recover/sweep can refund credit + cap after a crash. Sweep does
+ * not refund `meter_pending`. Key expiry is not used as the refund mechanism.
  *
- * Script ids: DQL_RESERVE_V2 / COMMIT / RELEASE / RECOVER / SWEEP.
+ * Script ids: DQL_RESERVE_V3 / COMMIT / RELEASE / RECOVER / SWEEP / PENDING.
  */
 
 import type { ReserveVerifyResult, VerifyReservation } from './key-store.js';
@@ -19,10 +33,20 @@ import { usageCounterKeyFromHash } from './usage.js';
 export const RESERVE_LEASE_SEC = 15 * 60;
 export const RESERVE_RECORD_TTL_SEC = 7 * 24 * 3600;
 export const HELD_INDEX_KEY = 'dql:reserve-held';
+export const FENCE_KEY = 'dql:reserve-fence';
+export const RESERVE_PREFIX = 'dql:reserve:';
+
+export function reservationRedisKey(keyHash: string, requestId: string): string {
+  return `${RESERVE_PREFIX}${keyHash}:${requestId}`;
+}
+
+export function heldIndexMember(keyHash: string, requestId: string): string {
+  return `${keyHash}:${requestId}`;
+}
 
 export const LUA_RESERVE = `
--- DQL_RESERVE_V2
--- KEYS[1]=reserve KEYS[2]=credits KEYS[3]=usage KEYS[4]=heldIndex
+-- DQL_RESERVE_V3
+-- KEYS[1]=reserve KEYS[2]=credits KEYS[3]=usage KEYS[4]=heldIndex KEYS[5]=fenceKey
 -- ARGV: requestId keyHash payloadDigest dayUtc dailyCap payg recordTtl leaseSec nowMs
 local function decode(raw)
   if not raw then return nil end
@@ -54,6 +78,7 @@ local payg = ARGV[6] == '1'
 local recordTtl = tonumber(ARGV[7])
 local leaseSec = tonumber(ARGV[8])
 local nowMs = tonumber(ARGV[9])
+local member = keyHash .. ':' .. requestId
 local existing = decode(redis.call('GET', KEYS[1]))
 
 if existing and existing.status == 'held' then
@@ -62,11 +87,11 @@ if existing and existing.status == 'held' then
     refund(existing)
     existing.status = 'released'
     redis.call('SET', KEYS[1], cjson.encode(existing), 'EX', recordTtl)
-    redis.call('ZREM', KEYS[4], existing.requestId or requestId)
+    redis.call('ZREM', KEYS[4], member)
   end
 end
 
-if existing and (existing.status == 'held' or existing.status == 'committed' or existing.status == 'released') then
+if existing and (existing.status == 'held' or existing.status == 'committed' or existing.status == 'released' or existing.status == 'meter_pending') then
   if existing.keyHash ~= keyHash then
     return cjson.encode({kind='conflict', reason='account'})
   end
@@ -78,6 +103,9 @@ if existing and (existing.status == 'held' or existing.status == 'committed' or 
   end
   if existing.status == 'committed' then
     return cjson.encode({kind='replay', reservation=existing})
+  end
+  if existing.status == 'meter_pending' then
+    return cjson.encode({kind='meter_pending', reservation=existing})
   end
 end
 
@@ -99,6 +127,7 @@ if not dailyCap or count > dailyCap then
   return cjson.encode({kind='quota'})
 end
 
+local fence = tonumber(redis.call('INCR', KEYS[5]))
 local leaseExpiresAt = nowMs + (leaseSec * 1000)
 local reservation = {
   requestId = requestId,
@@ -109,37 +138,65 @@ local reservation = {
   capHeld = true,
   billing = creditHeld and 'credit' or 'payg',
   status = 'held',
+  fence = fence,
   leaseExpiresAt = leaseExpiresAt
 }
 redis.call('SET', KEYS[1], cjson.encode(reservation), 'EX', recordTtl)
-redis.call('ZADD', KEYS[4], leaseExpiresAt, requestId)
+redis.call('ZADD', KEYS[4], leaseExpiresAt, member)
 return cjson.encode({kind='ok', reservation=reservation})
 `;
 
 export const LUA_COMMIT = `
--- DQL_COMMIT_V2
+-- DQL_COMMIT_V3
 -- KEYS[1]=reserve KEYS[2]=heldIndex
--- ARGV[1]=recordTtl ARGV[2]=resultJson ARGV[3]=meter
+-- ARGV[1]=recordTtl ARGV[2]=resultJson ARGV[3]=meter ARGV[4]=fence
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 'noop' end
 local ok, res = pcall(cjson.decode, raw)
-if not ok or type(res) ~= 'table' or res.status ~= 'held' then return 'noop' end
+if not ok or type(res) ~= 'table' then return 'noop' end
+if tonumber(res.fence) ~= tonumber(ARGV[4]) then return 'noop' end
+if res.status ~= 'held' and res.status ~= 'meter_pending' then return 'noop' end
 res.status = 'committed'
 local rok, parsed = pcall(cjson.decode, ARGV[2])
 if rok then res.result = parsed else res.result = ARGV[2] end
 res.meter = ARGV[3]
 redis.call('SET', KEYS[1], cjson.encode(res), 'EX', tonumber(ARGV[1]))
-redis.call('ZREM', KEYS[2], res.requestId)
+if type(res.keyHash) == 'string' and type(res.requestId) == 'string' then
+  redis.call('ZREM', KEYS[2], res.keyHash .. ':' .. res.requestId)
+end
 return 'committed'
 `;
 
-export const LUA_RELEASE = `
--- DQL_RELEASE_V2
--- KEYS[1]=reserve KEYS[2]=heldIndex ARGV[1]=recordTtl
+export const LUA_PENDING = `
+-- DQL_PENDING_V3
+-- KEYS[1]=reserve KEYS[2]=heldIndex
+-- ARGV[1]=recordTtl ARGV[2]=resultJson ARGV[3]=fence
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 'noop' end
 local ok, res = pcall(cjson.decode, raw)
-if not ok or type(res) ~= 'table' or res.status ~= 'held' then return 'noop' end
+if not ok or type(res) ~= 'table' then return 'noop' end
+if tonumber(res.fence) ~= tonumber(ARGV[3]) then return 'noop' end
+if res.status == 'meter_pending' and res.result ~= nil then return 'pending' end
+if res.status ~= 'held' then return 'noop' end
+local rok, parsed = pcall(cjson.decode, ARGV[2])
+if rok then res.result = parsed else res.result = ARGV[2] end
+res.status = 'meter_pending'
+redis.call('SET', KEYS[1], cjson.encode(res), 'EX', tonumber(ARGV[1]))
+if type(res.keyHash) == 'string' and type(res.requestId) == 'string' then
+  redis.call('ZREM', KEYS[2], res.keyHash .. ':' .. res.requestId)
+end
+return 'pending'
+`;
+
+export const LUA_RELEASE = `
+-- DQL_RELEASE_V3
+-- KEYS[1]=reserve KEYS[2]=heldIndex ARGV[1]=recordTtl ARGV[2]=fence
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 'noop' end
+local ok, res = pcall(cjson.decode, raw)
+if not ok or type(res) ~= 'table' then return 'noop' end
+if tonumber(res.fence) ~= tonumber(ARGV[2]) then return 'noop' end
+if res.status ~= 'held' then return 'noop' end
 if res.creditHeld and type(res.keyHash) == 'string' and res.keyHash ~= '' then
   redis.call('INCR', 'dql:credits:' .. res.keyHash)
 end
@@ -153,12 +210,14 @@ res.creditHeld = false
 res.capHeld = false
 res.result = nil
 redis.call('SET', KEYS[1], cjson.encode(res), 'EX', tonumber(ARGV[1]))
-redis.call('ZREM', KEYS[2], res.requestId)
+if type(res.keyHash) == 'string' and type(res.requestId) == 'string' then
+  redis.call('ZREM', KEYS[2], res.keyHash .. ':' .. res.requestId)
+end
 return 'released'
 `;
 
 export const LUA_RECOVER = `
--- DQL_RECOVER_V2
+-- DQL_RECOVER_V3
 -- KEYS[1]=reserve KEYS[2]=heldIndex ARGV[1]=recordTtl ARGV[2]=nowMs
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 'noop' end
@@ -180,12 +239,14 @@ res.creditHeld = false
 res.capHeld = false
 res.result = nil
 redis.call('SET', KEYS[1], cjson.encode(res), 'EX', tonumber(ARGV[1]))
-redis.call('ZREM', KEYS[2], res.requestId)
+if type(res.keyHash) == 'string' and type(res.requestId) == 'string' then
+  redis.call('ZREM', KEYS[2], res.keyHash .. ':' .. res.requestId)
+end
 return 'released'
 `;
 
 export const LUA_SWEEP = `
--- DQL_SWEEP_V2
+-- DQL_SWEEP_V3
 -- KEYS[1]=heldIndex ARGV[1]=recordTtl ARGV[2]=nowMs
 local nowMs = tonumber(ARGV[2])
 local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', nowMs)
@@ -250,7 +311,14 @@ export function parseReservation(v: unknown): VerifyReservation | null {
   if (typeof r.requestId !== 'string' || typeof r.keyHash !== 'string') return null;
   if (typeof r.dayUtc !== 'string') return null;
   const status = r.status;
-  if (status !== 'held' && status !== 'committed' && status !== 'released') return null;
+  if (
+    status !== 'held' &&
+    status !== 'committed' &&
+    status !== 'released' &&
+    status !== 'meter_pending'
+  ) {
+    return null;
+  }
   const billing = r.billing === 'payg' ? 'payg' : r.billing === 'credit' ? 'credit' : null;
   if (!billing) return null;
   const payloadDigest = typeof r.payloadDigest === 'string' ? r.payloadDigest : '';
@@ -271,6 +339,7 @@ export function parseReservation(v: unknown): VerifyReservation | null {
     capHeld: r.capHeld === true,
     billing,
     status,
+    fence: asInt(r.fence),
     leaseExpiresAt,
     result: r.result,
     meter,
@@ -293,7 +362,7 @@ export function parseReserveEval(raw: unknown): ReserveVerifyResult {
     const reason = (obj as { reason?: unknown }).reason;
     return { kind: 'conflict', reason: reason === 'payload' ? 'payload' : 'account' };
   }
-  if (kind === 'ok' || kind === 'in_progress' || kind === 'replay') {
+  if (kind === 'ok' || kind === 'in_progress' || kind === 'replay' || kind === 'meter_pending') {
     const reservation = parseReservation((obj as { reservation?: unknown }).reservation);
     if (!reservation) return { kind: 'error' };
     return { kind, reservation };
@@ -330,24 +399,33 @@ export function reserveVerifySync(
     creditsKey: string;
     usageKey: string;
     heldIndexKey: string;
+    fenceKey: string;
   },
 ): ReserveVerifyResult {
+  const member = heldIndexMember(opts.keyHash, opts.requestId);
   let existing = parseReservation(kv.get(opts.reserveKey));
   if (existing && existing.status === 'held' && opts.nowMs >= existing.leaseExpiresAt) {
     refundSync(kv, existing);
     existing.status = 'released';
     existing.result = undefined;
     kv.set(opts.reserveKey, existing, opts.recordTtlSec);
-    kv.zrem(opts.heldIndexKey, existing.requestId);
+    kv.zrem(opts.heldIndexKey, member);
   }
 
-  if (existing && (existing.status === 'held' || existing.status === 'committed' || existing.status === 'released')) {
+  if (
+    existing &&
+    (existing.status === 'held' ||
+      existing.status === 'committed' ||
+      existing.status === 'released' ||
+      existing.status === 'meter_pending')
+  ) {
     if (existing.keyHash !== opts.keyHash) return { kind: 'conflict', reason: 'account' };
     if (existing.status !== 'released' && existing.payloadDigest !== opts.payloadDigest) {
       return { kind: 'conflict', reason: 'payload' };
     }
     if (existing.status === 'held') return { kind: 'in_progress', reservation: existing };
     if (existing.status === 'committed') return { kind: 'replay', reservation: existing };
+    if (existing.status === 'meter_pending') return { kind: 'meter_pending', reservation: existing };
   }
 
   const n = kv.incrby(opts.creditsKey, -1);
@@ -375,10 +453,11 @@ export function reserveVerifySync(
     capHeld: true,
     billing: creditHeld ? 'credit' : 'payg',
     status: 'held',
+    fence: kv.incrby(opts.fenceKey, 1),
     leaseExpiresAt: opts.nowMs + opts.leaseSec * 1000,
   };
   kv.set(opts.reserveKey, reservation, opts.recordTtlSec);
-  kv.zadd(opts.heldIndexKey, reservation.leaseExpiresAt, opts.requestId);
+  kv.zadd(opts.heldIndexKey, reservation.leaseExpiresAt, member);
   return { kind: 'ok', reservation };
 }
 
@@ -389,16 +468,37 @@ export function commitVerifySync(
   recordTtlSec: number,
   result: unknown,
   meter: string,
+  fence: number,
 ): string {
   const existing = parseReservation(kv.get(reserveKey));
-  if (!existing || existing.status !== 'held') return 'noop';
+  if (!existing || existing.fence !== fence) return 'noop';
+  if (existing.status !== 'held' && existing.status !== 'meter_pending') return 'noop';
   existing.status = 'committed';
   existing.result = result;
   existing.meter =
     meter === 'ok' || meter === 'error' || meter === 'skipped' || meter === 'n/a' ? meter : 'n/a';
   kv.set(reserveKey, existing, recordTtlSec);
-  kv.zrem(heldIndexKey, existing.requestId);
+  kv.zrem(heldIndexKey, heldIndexMember(existing.keyHash, existing.requestId));
   return 'committed';
+}
+
+export function persistMeterPendingSync(
+  kv: SyncKv,
+  reserveKey: string,
+  heldIndexKey: string,
+  recordTtlSec: number,
+  result: unknown,
+  fence: number,
+): string {
+  const existing = parseReservation(kv.get(reserveKey));
+  if (!existing || existing.fence !== fence) return 'noop';
+  if (existing.status === 'meter_pending' && existing.result != null) return 'pending';
+  if (existing.status !== 'held') return 'noop';
+  existing.status = 'meter_pending';
+  existing.result = result;
+  kv.set(reserveKey, existing, recordTtlSec);
+  kv.zrem(heldIndexKey, heldIndexMember(existing.keyHash, existing.requestId));
+  return 'pending';
 }
 
 export function releaseVerifySync(
@@ -406,14 +506,15 @@ export function releaseVerifySync(
   reserveKey: string,
   heldIndexKey: string,
   recordTtlSec: number,
+  fence: number,
 ): string {
   const existing = parseReservation(kv.get(reserveKey));
-  if (!existing || existing.status !== 'held') return 'noop';
+  if (!existing || existing.fence !== fence || existing.status !== 'held') return 'noop';
   refundSync(kv, existing);
   existing.status = 'released';
   existing.result = undefined;
   kv.set(reserveKey, existing, recordTtlSec);
-  kv.zrem(heldIndexKey, existing.requestId);
+  kv.zrem(heldIndexKey, heldIndexMember(existing.keyHash, existing.requestId));
   return 'released';
 }
 
@@ -431,7 +532,7 @@ export function recoverVerifySync(
   existing.status = 'released';
   existing.result = undefined;
   kv.set(reserveKey, existing, recordTtlSec);
-  kv.zrem(heldIndexKey, existing.requestId);
+  kv.zrem(heldIndexKey, heldIndexMember(existing.keyHash, existing.requestId));
   return 'released';
 }
 
@@ -439,7 +540,7 @@ export function sweepExpiredSync(kv: SyncKv, heldIndexKey: string, recordTtlSec:
   const ids = kv.zrangebyscore(heldIndexKey, Number.NEGATIVE_INFINITY, nowMs);
   let n = 0;
   for (const id of ids) {
-    const reserveKey = `dql:reserve:${id}`;
+    const reserveKey = `${RESERVE_PREFIX}${id}`;
     if (recoverVerifySync(kv, reserveKey, heldIndexKey, recordTtlSec, nowMs) === 'released') n += 1;
     else kv.zrem(heldIndexKey, id);
   }
@@ -452,12 +553,13 @@ export function dispatchMemoryEval(
   keys: string[],
   args: string[],
 ): unknown {
-  if (script.includes('DQL_RESERVE_V2')) {
+  if (script.includes('DQL_RESERVE_V3')) {
     const result = reserveVerifySync(kv, {
       reserveKey: keys[0] ?? '',
       creditsKey: keys[1] ?? '',
       usageKey: keys[2] ?? '',
       heldIndexKey: keys[3] ?? HELD_INDEX_KEY,
+      fenceKey: keys[4] ?? FENCE_KEY,
       requestId: args[0] ?? '',
       keyHash: args[1] ?? '',
       payloadDigest: args[2] ?? '',
@@ -470,7 +572,7 @@ export function dispatchMemoryEval(
     });
     return JSON.stringify(result);
   }
-  if (script.includes('DQL_COMMIT_V2')) {
+  if (script.includes('DQL_COMMIT_V3')) {
     let parsed: unknown = args[1] ?? null;
     if (typeof args[1] === 'string') {
       try {
@@ -479,12 +581,44 @@ export function dispatchMemoryEval(
         parsed = args[1];
       }
     }
-    return commitVerifySync(kv, keys[0] ?? '', keys[1] ?? HELD_INDEX_KEY, asInt(args[0]), parsed, args[2] ?? 'n/a');
+    return commitVerifySync(
+      kv,
+      keys[0] ?? '',
+      keys[1] ?? HELD_INDEX_KEY,
+      asInt(args[0]),
+      parsed,
+      args[2] ?? 'n/a',
+      asInt(args[3]),
+    );
   }
-  if (script.includes('DQL_RELEASE_V2')) {
-    return releaseVerifySync(kv, keys[0] ?? '', keys[1] ?? HELD_INDEX_KEY, asInt(args[0]));
+  if (script.includes('DQL_PENDING_V3')) {
+    let parsed: unknown = args[1] ?? null;
+    if (typeof args[1] === 'string') {
+      try {
+        parsed = JSON.parse(args[1]);
+      } catch {
+        parsed = args[1];
+      }
+    }
+    return persistMeterPendingSync(
+      kv,
+      keys[0] ?? '',
+      keys[1] ?? HELD_INDEX_KEY,
+      asInt(args[0]),
+      parsed,
+      asInt(args[2]),
+    );
   }
-  if (script.includes('DQL_RECOVER_V2')) {
+  if (script.includes('DQL_RELEASE_V3')) {
+    return releaseVerifySync(
+      kv,
+      keys[0] ?? '',
+      keys[1] ?? HELD_INDEX_KEY,
+      asInt(args[0]),
+      asInt(args[1]),
+    );
+  }
+  if (script.includes('DQL_RECOVER_V3')) {
     return recoverVerifySync(
       kv,
       keys[0] ?? '',
@@ -493,7 +627,7 @@ export function dispatchMemoryEval(
       asInt(args[1]),
     );
   }
-  if (script.includes('DQL_SWEEP_V2')) {
+  if (script.includes('DQL_SWEEP_V3')) {
     return sweepExpiredSync(kv, keys[0] ?? HELD_INDEX_KEY, asInt(args[0]), asInt(args[1]));
   }
   throw new Error('unknown reservation script');

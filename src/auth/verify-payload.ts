@@ -1,8 +1,10 @@
 /**
- * Canonical digest of the billable verify payload.
- * Binds an idempotency key to mandate / proposed_action / reasoning / axes / sandbox.
- * Does not include secrets. Context is omitted (not part of the admission contract).
+ * Canonical digest of every request field that can change the verify verdict.
+ * Same Idempotency-Key + different digest → 409, no replay, no second debit.
+ * Does not include secrets.
  */
+
+import canonicalize from 'canonicalize';
 
 import { sha256Hex } from './key-hash.js';
 
@@ -12,7 +14,14 @@ export function verifyPayloadDigest(req: {
   reasoning: string;
   axes: readonly string[];
   sandbox?: boolean;
+  context?: string;
+  structured_context?: unknown;
+  gate_mode?: 'shadow' | 'enforce';
 }): string {
+  const structured =
+    req.structured_context === undefined
+      ? ''
+      : (canonicalize(req.structured_context) ?? JSON.stringify(req.structured_context));
   return sha256Hex(
     JSON.stringify({
       mandate: req.mandate,
@@ -20,6 +29,9 @@ export function verifyPayloadDigest(req: {
       reasoning: req.reasoning,
       axes: [...req.axes],
       sandbox: req.sandbox === true,
+      context: req.context ?? '',
+      structured_context: structured,
+      gate_mode: req.gate_mode ?? 'shadow',
     }),
   );
 }

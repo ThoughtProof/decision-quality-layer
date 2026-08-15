@@ -18,8 +18,9 @@
  *   dql:trial-email:<sha256(email)> → claim marker
  *   dql:trial-fp:<card_fingerprint> → claim marker
  *   dql:account:<sha256(dqla_…)>    → live key hash (account session; hash only)
- *   dql:reserve:<requestId>         → VerifyReservation bound to key hash + payload digest
- *   dql:reserve-held                → ZSET score=leaseExpiresAt member=requestId (stale-hold sweep)
+ *   dql:reserve:<keyHash>:<requestId> → VerifyReservation (per-account idempotency namespace)
+ *   dql:reserve-held                  → ZSET score=leaseExpiresAt member=<keyHash>:<requestId>
+ *   dql:reserve-fence                 → INCR fencing token (commit/release must match)
  *
  * Usage counters stay on `dql:usage:<sha256[:24]>:<day>` (src/auth/usage.ts).
  * Credits and daily-cap are both enforced; namespaces do not collide.
@@ -33,8 +34,10 @@ import { keyDisplayPrefix, sha256Hex } from './key-hash.js';
 import type { CheckoutPack } from './packs.js';
 import { usageCounterKeyFromHash } from './usage.js';
 import {
+  FENCE_KEY,
   HELD_INDEX_KEY,
   LUA_COMMIT,
+  LUA_PENDING,
   LUA_RECOVER,
   LUA_RELEASE,
   LUA_RESERVE,
@@ -43,6 +46,7 @@ import {
   RESERVE_RECORD_TTL_SEC,
   dispatchMemoryEval,
   parseReserveEval,
+  reservationRedisKey,
 } from './verify-reservation-atomic.js';
 
 export const KEY_RECORD_PREFIX = 'dql:key:';
@@ -142,7 +146,7 @@ export interface KvStore {
 export type ConsumeCreditResult = 'consumed' | 'empty' | 'error';
 export type TrialClaimResult = 'ok' | 'already_used';
 
-export type VerifyReservationStatus = 'held' | 'committed' | 'released';
+export type VerifyReservationStatus = 'held' | 'committed' | 'released' | 'meter_pending';
 
 export interface VerifyReservation {
   requestId: string;
@@ -153,9 +157,11 @@ export interface VerifyReservation {
   capHeld: boolean;
   billing: 'credit' | 'payg';
   status: VerifyReservationStatus;
+  /** Monotonic token for this hold. Commit/release no-op if it does not match. */
+  fence: number;
   /** Unix ms. After this, a held reservation is stale and must be refunded. */
   leaseExpiresAt: number;
-  /** Stored verify result after commit (replay). Never contains dqlk_/dqla_. */
+  /** Stored verify result after commit or meter_pending. Never contains dqlk_/dqla_. */
   result?: unknown;
   meter?: 'ok' | 'error' | 'skipped' | 'n/a';
 }
@@ -164,10 +170,15 @@ export type ReserveVerifyResult =
   | { kind: 'ok'; reservation: VerifyReservation }
   | { kind: 'in_progress'; reservation: VerifyReservation }
   | { kind: 'replay'; reservation: VerifyReservation }
+  | { kind: 'meter_pending'; reservation: VerifyReservation }
   | { kind: 'conflict'; reason: 'account' | 'payload' }
   | { kind: 'empty' }
   | { kind: 'quota' }
   | { kind: 'error' };
+
+export type CommitReservationAck = 'committed' | 'noop' | 'error';
+export type PersistPendingAck = 'pending' | 'noop' | 'error';
+export type ReleaseReservationAck = 'released' | 'noop';
 
 export interface KeyStore {
   lookup(plaintextKey: string): Promise<ApiKeyRecord | undefined>;
@@ -207,12 +218,29 @@ export interface KeyStore {
     paygOptIn: boolean;
     now?: Date;
   }): Promise<ReserveVerifyResult>;
-  commitVerifyReservation(
-    requestId: string,
-    opts?: { result?: unknown; meter?: VerifyReservation['meter'] },
-  ): Promise<void>;
-  releaseVerifyReservation(requestId: string): Promise<void>;
-  recoverExpiredVerifyReservation(requestId: string, now?: Date): Promise<'released' | 'noop'>;
+  commitVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result?: unknown;
+    meter?: VerifyReservation['meter'];
+  }): Promise<CommitReservationAck>;
+  persistMeterPending(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result: unknown;
+  }): Promise<PersistPendingAck>;
+  releaseVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+  }): Promise<ReleaseReservationAck>;
+  recoverExpiredVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    now?: Date;
+  }): Promise<'released' | 'noop'>;
   recoverExpiredHeldReservations(now?: Date): Promise<number>;
 }
 
@@ -566,10 +594,11 @@ export class UpstashKeyStore implements KeyStore {
       const raw = await this.kv.eval(
         LUA_RESERVE,
         [
-          `${RESERVE_PREFIX}${opts.requestId}`,
+          reservationRedisKey(opts.keyHash, opts.requestId),
           `${CREDITS_PREFIX}${opts.keyHash}`,
           usageCounterKeyFromHash(opts.keyHash, dayUtc),
           HELD_INDEX_KEY,
+          FENCE_KEY,
         ],
         [
           opts.requestId,
@@ -589,44 +618,79 @@ export class UpstashKeyStore implements KeyStore {
     }
   }
 
-  async commitVerifyReservation(
-    requestId: string,
-    opts?: { result?: unknown; meter?: VerifyReservation['meter'] },
-  ): Promise<void> {
-    if (!requestId) return;
+  async commitVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result?: unknown;
+    meter?: VerifyReservation['meter'];
+  }): Promise<CommitReservationAck> {
+    if (!opts.requestId || !opts.keyHash) return 'error';
     try {
-      await this.kv.eval(
+      const raw = await this.kv.eval(
         LUA_COMMIT,
-        [`${RESERVE_PREFIX}${requestId}`, HELD_INDEX_KEY],
-        [String(RESERVE_RECORD_TTL_SEC), JSON.stringify(opts?.result ?? null), opts?.meter ?? 'n/a'],
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
+        [
+          String(RESERVE_RECORD_TTL_SEC),
+          JSON.stringify(opts.result ?? null),
+          opts.meter ?? 'n/a',
+          String(opts.fence),
+        ],
       );
+      return raw === 'committed' ? 'committed' : 'noop';
     } catch {
-      // Commit is best-effort after a successful verify; debit already held.
+      return 'error';
     }
   }
 
-  async releaseVerifyReservation(requestId: string): Promise<void> {
-    if (!requestId) return;
+  async persistMeterPending(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result: unknown;
+  }): Promise<PersistPendingAck> {
+    if (!opts.requestId || !opts.keyHash) return 'error';
     try {
-      await this.kv.eval(
-        LUA_RELEASE,
-        [`${RESERVE_PREFIX}${requestId}`, HELD_INDEX_KEY],
-        [String(RESERVE_RECORD_TTL_SEC)],
+      const raw = await this.kv.eval(
+        LUA_PENDING,
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC), JSON.stringify(opts.result ?? null), String(opts.fence)],
       );
+      return raw === 'pending' ? 'pending' : 'noop';
     } catch {
-      // Caller already failed; do not throw over a release error.
+      return 'error';
     }
   }
 
-  async recoverExpiredVerifyReservation(
-    requestId: string,
-    now: Date = new Date(),
-  ): Promise<'released' | 'noop'> {
-    if (!requestId) return 'noop';
+  async releaseVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+  }): Promise<ReleaseReservationAck> {
+    if (!opts.requestId || !opts.keyHash) return 'noop';
+    try {
+      const raw = await this.kv.eval(
+        LUA_RELEASE,
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC), String(opts.fence)],
+      );
+      return raw === 'released' ? 'released' : 'noop';
+    } catch {
+      return 'noop';
+    }
+  }
+
+  async recoverExpiredVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    now?: Date;
+  }): Promise<'released' | 'noop'> {
+    if (!opts.requestId || !opts.keyHash) return 'noop';
+    const now = opts.now ?? new Date();
     try {
       const raw = await this.kv.eval(
         LUA_RECOVER,
-        [`${RESERVE_PREFIX}${requestId}`, HELD_INDEX_KEY],
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
         [String(RESERVE_RECORD_TTL_SEC), String(now.getTime())],
       );
       return raw === 'released' ? 'released' : 'noop';

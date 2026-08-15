@@ -119,16 +119,25 @@ export type AccountReserveDecision =
       reservation: import('./key-store.js').VerifyReservation;
       result: unknown;
     }
+  | {
+      kind: 'meter_pending';
+      key: string;
+      record: import('./keys.js').ApiKeyRecord;
+      billing: import('./keys.js').AllowBilling;
+      reservation: import('./key-store.js').VerifyReservation;
+      result: unknown;
+    }
   | { kind: 'deny'; status: number; payload: Record<string, unknown> };
 
 /**
  * Atomic pre-execution reservation of prepaid credit (or confirmed PAYG)
- * and daily-cap (one Redis EVAL). Bound to key hash + requestId + payload digest.
- * Call before `runVerification()`.
- *   execute      — new hold; caller may run the engine
- *   replay       — committed; return stored result; do not run
- *   deny 409     — in-progress (same account+payload) or payload mismatch
- *   deny 403     — idempotency key bound to another account
+ * and daily-cap (one Redis EVAL). Namespaced per account key hash + requestId
+ * + payload digest. Call before `runVerification()`.
+ *   execute        — new hold; caller may run the engine
+ *   replay         — committed; return stored result; do not run
+ *   meter_pending  — engine already done; retry meter only
+ *   deny 409       — in-progress (same account+payload) or payload mismatch
+ *   deny 403       — same namespaced key bound to another hash (defense in depth)
  *   deny 402/429/503 — empty / quota / store error
  */
 export async function reserveVerifyWithAccount(opts: {
@@ -159,6 +168,16 @@ export async function reserveVerifyWithAccount(opts: {
   if (result.kind === 'replay') {
     return {
       kind: 'replay',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: result.reservation.billing,
+      reservation: result.reservation,
+      result: result.reservation.result,
+    };
+  }
+  if (result.kind === 'meter_pending') {
+    return {
+      kind: 'meter_pending',
       key: opts.keyHash,
       record: opts.record,
       billing: result.reservation.billing,
@@ -232,21 +251,47 @@ export async function reserveVerifyWithAccount(opts: {
 
 export async function commitVerifyReservation(opts: {
   requestId: string;
+  keyHash: string;
+  fence: number;
   store: KeyStore;
   result?: unknown;
   meter?: import('./key-store.js').VerifyReservation['meter'];
-}): Promise<void> {
-  await opts.store.commitVerifyReservation(opts.requestId, {
+}): Promise<import('./key-store.js').CommitReservationAck> {
+  return opts.store.commitVerifyReservation({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    fence: opts.fence,
     result: opts.result,
     meter: opts.meter,
   });
 }
 
+export async function persistMeterPending(opts: {
+  requestId: string;
+  keyHash: string;
+  fence: number;
+  store: KeyStore;
+  result: unknown;
+}): Promise<import('./key-store.js').PersistPendingAck> {
+  return opts.store.persistMeterPending({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    fence: opts.fence,
+    result: opts.result,
+  });
+}
+
 export async function releaseVerifyReservation(opts: {
   requestId: string;
+  keyHash: string;
+  fence: number;
   store: KeyStore;
-}): Promise<void> {
-  await opts.store.releaseVerifyReservation(opts.requestId);
+}): Promise<import('./key-store.js').ReleaseReservationAck> {
+  return opts.store.releaseVerifyReservation({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    fence: opts.fence,
+  });
 }
 
 export interface AccountSnapshot {

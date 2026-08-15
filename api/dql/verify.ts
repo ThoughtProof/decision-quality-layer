@@ -38,6 +38,7 @@ import {
   authorizeVerifyWithAccount,
   commitVerifyReservation,
   extractAccountToken,
+  persistMeterPending,
   releaseVerifyReservation,
   reserveVerifyWithAccount,
 } from '../../src/auth/account.js';
@@ -118,10 +119,16 @@ const KEY_STORE = createKeyStore(process.env);
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const resolvedId = resolveVerifyRequestId(req.headers as Record<string, unknown>);
   const requestId = resolvedId.kind === 'ok' ? resolvedId.id : generateVerifyRequestId();
-  let accountHold: { requestId: string; billing?: import('../../src/auth/keys.js').AllowBilling } | null =
-    null;
+  type AccountHold = {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    billing?: import('../../src/auth/keys.js').AllowBilling;
+  };
+  let accountHold: AccountHold | null = null;
   let accountReplay: { result: unknown; billing?: import('../../src/auth/keys.js').AllowBilling } | null =
     null;
+  let accountMeterPending: { result: unknown; hold: AccountHold } | null = null;
 
   // v0.4.3.1 §C+integration: per-request diagnostics collector, created ONLY
   // when the runtime is a valid production bundle AND diagnostics_on=true.
@@ -363,6 +370,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 via: 'account',
               };
               accountReplay = { result: reserved.result, billing: reserved.billing };
+            } else if (reserved.kind === 'meter_pending') {
+              authPath = {
+                kind: 'allow',
+                key: reserved.key,
+                record: reserved.record,
+                billing: reserved.billing,
+                via: 'account',
+              };
+              accountMeterPending = {
+                result: reserved.result,
+                hold: {
+                  requestId,
+                  keyHash: reserved.reservation.keyHash,
+                  fence: reserved.reservation.fence,
+                  billing: reserved.billing,
+                },
+              };
             } else if (reserved.kind === 'execute') {
               authPath = {
                 kind: 'allow',
@@ -371,7 +395,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 billing: reserved.billing,
                 via: 'account',
               };
-              accountHold = { requestId, billing: reserved.billing };
+              accountHold = {
+                requestId,
+                keyHash: reserved.reservation.keyHash,
+                fence: reserved.reservation.fence,
+                billing: reserved.billing,
+              };
             }
           }
         }
@@ -391,12 +420,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             status = 200;
             payload = accountReplay.result;
           }
+        } else if (accountMeterPending && KEY_STORE && authPath.kind === 'allow') {
+          if (accountMeterPending.result == null) {
+            status = 503;
+            payload = {
+              error: 'Stored verify result is missing; meter cannot be retried.',
+              code: 'IDEMPOTENCY_RESULT_MISSING',
+            };
+          } else {
+            const metered = await meterAccountPayg({
+              requestId,
+              record: authPath.record,
+              store: KEY_STORE,
+            });
+            if (metered !== 'ok') {
+              status = 503;
+              payload = meterUnavailablePayload();
+            } else {
+              const acked = await acknowledgeCommit({
+                hold: accountMeterPending.hold,
+                store: KEY_STORE,
+                result: accountMeterPending.result,
+                meter: 'ok',
+              });
+              if (!acked) {
+                status = 503;
+                payload = commitUnavailablePayload();
+              } else {
+                applyAccountBillingHeaders(res, accountMeterPending.hold.billing);
+                res.setHeader('X-DQL-Meter', 'ok');
+                status = 200;
+                payload = accountMeterPending.result;
+              }
+            }
+          }
         } else if (RUNTIME.kind === 'error') {
           // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
           // resolver failed for a Live-configured deploy, EVERY POST
           // returns 503, including sandbox=true. Never settle on config fail.
           if (accountHold && KEY_STORE) {
-            await releaseVerifyReservation({ requestId: accountHold.requestId, store: KEY_STORE });
+            await releaseVerifyReservation({
+              requestId: accountHold.requestId,
+              keyHash: accountHold.keyHash,
+              fence: accountHold.fence,
+              store: KEY_STORE,
+            });
             accountHold = null;
           }
           status = 503;
@@ -423,49 +491,58 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               : {}),
           });
 
-          // Account PAYG: meter must succeed before commit. A failed/skipped
-          // meter must not become a replayable 200 (no free second execution).
+          // Account PAYG: persist result as meter_pending, then meter, then
+          // commit. A failed meter must not discard the engine result or
+          // release the debit — retry remeters only.
           if (accountHold && KEY_STORE && accountHold.billing === 'payg' && authPath.kind === 'allow') {
-            const price = priceForCall({ sandbox: false, dev_access: authPath.record.dev_access });
-            const meterCfg = loadStripeMeterConfig();
-            const customerId =
-              authPath.record.stripe_customer_id ??
-              meterCfg.customerByOwner.get(authPath.record.owner) ??
-              (await KEY_STORE.getCustomerByOwner(authPath.record.owner));
-            const meter = await emitStripeMeterEvent({
-              requestId,
-              owner: authPath.record.owner,
-              customerId,
-              priceUsd: price,
-              config: meterCfg,
+            const pending = await persistMeterPending({
+              requestId: accountHold.requestId,
+              keyHash: accountHold.keyHash,
+              fence: accountHold.fence,
+              store: KEY_STORE,
+              result: response,
             });
-            if (meter.kind !== 'ok') {
-              await releaseVerifyReservation({ requestId: accountHold.requestId, store: KEY_STORE });
-              accountHold = null;
+            if (pending !== 'pending') {
               status = 503;
-              payload = {
-                error: 'Pay-as-you-go meter unavailable. Verify was not billed and was not stored for replay.',
-                code: 'METER_UNAVAILABLE',
-                no_freemium: true,
-              };
+              payload = commitUnavailablePayload();
             } else {
-              await commitVerifyReservation({
-                requestId: accountHold.requestId,
+              const metered = await meterAccountPayg({
+                requestId,
+                record: authPath.record,
                 store: KEY_STORE,
-                result: response,
-                meter: 'ok',
               });
-              accountHold = null;
-              res.setHeader('X-DQL-Meter', 'ok');
+              if (metered !== 'ok') {
+                status = 503;
+                payload = meterUnavailablePayload();
+              } else {
+                const acked = await acknowledgeCommit({
+                  hold: accountHold,
+                  store: KEY_STORE,
+                  result: response,
+                  meter: 'ok',
+                });
+                if (!acked) {
+                  status = 503;
+                  payload = commitUnavailablePayload();
+                } else {
+                  accountHold = null;
+                  res.setHeader('X-DQL-Meter', 'ok');
+                }
+              }
             }
           } else if (accountHold && KEY_STORE) {
-            await commitVerifyReservation({
-              requestId: accountHold.requestId,
+            const acked = await acknowledgeCommit({
+              hold: accountHold,
               store: KEY_STORE,
               result: response,
               meter: 'n/a',
             });
-            accountHold = null;
+            if (!acked) {
+              status = 503;
+              payload = commitUnavailablePayload();
+            } else {
+              accountHold = null;
+            }
           }
 
           // 4) Payment settle / Stripe meter ONLY after successful DQL.
@@ -578,7 +655,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } catch (err) {
     if (accountHold && KEY_STORE) {
       try {
-        await releaseVerifyReservation({ requestId: accountHold.requestId, store: KEY_STORE });
+        await releaseVerifyReservation({
+          requestId: accountHold.requestId,
+          keyHash: accountHold.keyHash,
+          fence: accountHold.fence,
+          store: KEY_STORE,
+        });
       } catch {
         // Release must not mask the original failure.
       }
@@ -590,6 +672,60 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   return sendJsonWithDiagnostics(res, collector, status, payload);
+}
+
+function meterUnavailablePayload(): Record<string, unknown> {
+  return {
+    error: 'Pay-as-you-go meter unavailable. The verify result is stored; retry remeters only.',
+    code: 'METER_UNAVAILABLE',
+    no_freemium: true,
+  };
+}
+
+function commitUnavailablePayload(): Record<string, unknown> {
+  return {
+    error: 'Verify result could not be durably committed. Retry the same Idempotency-Key.',
+    code: 'COMMIT_UNAVAILABLE',
+    no_freemium: true,
+  };
+}
+
+async function meterAccountPayg(opts: {
+  requestId: string;
+  record: import('../../src/auth/keys.js').ApiKeyRecord;
+  store: NonNullable<typeof KEY_STORE>;
+}): Promise<'ok' | 'unavailable'> {
+  const price = priceForCall({ sandbox: false, dev_access: opts.record.dev_access });
+  const meterCfg = loadStripeMeterConfig();
+  const customerId =
+    opts.record.stripe_customer_id ??
+    meterCfg.customerByOwner.get(opts.record.owner) ??
+    (await opts.store.getCustomerByOwner(opts.record.owner));
+  const meter = await emitStripeMeterEvent({
+    requestId: opts.requestId,
+    owner: opts.record.owner,
+    customerId,
+    priceUsd: price,
+    config: meterCfg,
+  });
+  return meter.kind === 'ok' ? 'ok' : 'unavailable';
+}
+
+async function acknowledgeCommit(opts: {
+  hold: { requestId: string; keyHash: string; fence: number };
+  store: NonNullable<typeof KEY_STORE>;
+  result: unknown;
+  meter: import('../../src/auth/key-store.js').VerifyReservation['meter'];
+}): Promise<boolean> {
+  const acked = await commitVerifyReservation({
+    requestId: opts.hold.requestId,
+    keyHash: opts.hold.keyHash,
+    fence: opts.hold.fence,
+    store: opts.store,
+    result: opts.result,
+    meter: opts.meter,
+  });
+  return acked === 'committed';
 }
 
 function applyAccountBillingHeaders(

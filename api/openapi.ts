@@ -59,14 +59,14 @@ const spec = {
         operationId: 'dqlVerify',
         summary: 'Verify a proposed agent action across five axes',
         description:
-          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md. Auth: `X-DQL-Key: dqlk_…` (unchanged) or `X-DQL-Account: dqla_…` / `Authorization: Bearer dqla_…` (bills the bound credit ledger; response never includes the raw verify key). `dqla_…` is not accepted as `X-DQL-Key`. Invalid/missing account token → 401. Exhausted credits → 402 before the engine. Account path: reserve bound to account + idempotency id + payload digest; in-progress → 409; cross-account reuse → 403; payload mismatch → 409; committed replay returns the stored result. Optional `Idempotency-Key` / validated `X-Request-Id` is the reservation id. Not a self-serve product claim.',
+          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md. Auth: `X-DQL-Key: dqlk_…` (unchanged) or `X-DQL-Account: dqla_…` / `Authorization: Bearer dqla_…` (bills the bound credit ledger; response never includes the raw verify key). `dqla_…` is not accepted as `X-DQL-Key`. Invalid/missing account token → 401. Exhausted credits → 402 before the engine. Account path: per-account reserve + fencing token + full request digest; in-progress → 409; payload mismatch → 409; committed replay returns the stored result; PAYG meter failure stores meter_pending and remeters on retry. Optional `Idempotency-Key` / validated `X-Request-Id` is the reservation id. Not a self-serve product claim.',
         parameters: [
           {
             name: 'Idempotency-Key',
             in: 'header',
             required: false,
             description:
-              'Optional client idempotency key for account-token verify admission. Charset [A-Za-z0-9._:-], length 8–128. Bound to the account and payload digest. Echoed as X-Request-Id. In-progress → 409; other account → 403; different payload → 409; committed replay returns the stored result. Values that look like secrets (`dqlk_`, `dqla_`, `sk_…`) are rejected (400 INVALID_IDEMPOTENCY_KEY).',
+              'Optional client idempotency key for account-token verify admission. Charset [A-Za-z0-9._:-], length 8–128. Namespaced per account and bound to the full request digest. Echoed as X-Request-Id. In-progress → 409; different payload → 409; committed replay returns the stored result. Two accounts may reuse the same ordinary key. Values that look like secrets (`dqlk_`, `dqla_`, `sk_…`) are rejected (400 INVALID_IDEMPOTENCY_KEY).',
             schema: { type: 'string', minLength: 8, maxLength: 128 },
           },
           {
