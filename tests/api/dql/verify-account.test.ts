@@ -12,6 +12,8 @@ import { UpstashKeyStore, createMemoryKv, selfServeOwner } from '../../../src/au
 import { DEFAULT_DAILY_CAP } from '../../../src/auth/keys.js';
 import { STARTER_CREDITS } from '../../../src/auth/packs.js';
 import { usageCounterKeyFromHash } from '../../../src/auth/usage.js';
+import { verifyPayloadDigest } from '../../../src/auth/verify-payload.js';
+import { AXES } from '../../../src/types.js';
 
 const harness = vi.hoisted(() => ({
   store: null as InstanceType<typeof UpstashKeyStore> | null,
@@ -107,18 +109,26 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     harness.verifyCalls = 0;
   });
 
-  async function mintStarter() {
+  async function mintAccount(
+    sessionId = 'cs_handler',
+    customerId = 'cus_handler',
+    pack: 'starter' | 'payg' = 'starter',
+  ) {
     const store = harness.store!;
     const minted = await finalizeCheckoutMint({
-      sessionId: 'cs_handler',
-      customerId: 'cus_handler',
-      owner: selfServeOwner('cus_handler'),
+      sessionId,
+      customerId,
+      owner: selfServeOwner(customerId),
       store,
-      pack: 'starter',
+      pack,
     });
     expect(minted.kind).toBe('minted');
     if (minted.kind !== 'minted') throw new Error('mint failed');
     return minted;
+  }
+
+  async function mintStarter() {
+    return mintAccount();
   }
 
   it('valid dqla_ completes a live-shaped verify and decrements credits', async () => {
@@ -378,6 +388,8 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     expect(retry.state.headers['X-Request-Id']).toBe('client-retry-key-01');
     expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
     expect(await harness.store!.usageToday(hash)).toBe(1);
+    expect(harness.verifyCalls).toBe(1);
+    expect(retry.state.jsonBody.id).toBe(first.state.jsonBody.id);
   });
 
   it('client X-Request-Id is the reservation id when Idempotency-Key is absent', async () => {
@@ -397,6 +409,7 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     await mod.default(retry.req, retry.res);
     expect(retry.state.statusCode).toBe(200);
     expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+    expect(harness.verifyCalls).toBe(1);
   });
 
   it('invalid Idempotency-Key is 400 and does not run verify', async () => {
@@ -413,5 +426,129 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     expect(await harness.store!.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS);
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.plaintext);
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
+  });
+
+  it('cross-account reuse of Idempotency-Key is 403; engine does not run for the thief', async () => {
+    const funded = await mintAccount('cs_fund', 'cus_fund');
+    const other = await mintAccount('cs_thief', 'cus_thief');
+    await harness.store!.setCreditBalance(sha256Hex(other.plaintext), 0);
+    const mod = await import('../../../api/dql/verify.js');
+    const first = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', {
+      'x-dql-account': funded.accountToken,
+      'idempotency-key': 'shared-idem-key-01',
+    });
+    await mod.default(first.req, first.res);
+    expect(first.state.statusCode).toBe(200);
+    expect(harness.verifyCalls).toBe(1);
+
+    const thief = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', {
+      'x-dql-account': other.accountToken,
+      'idempotency-key': 'shared-idem-key-01',
+    });
+    await mod.default(thief.req, thief.res);
+    expect(thief.state.statusCode).toBe(403);
+    expect(thief.state.jsonBody.code).toBe('IDEMPOTENCY_KEY_BOUND');
+    expect(thief.state.jsonBody.axes).toBeUndefined();
+    expect(harness.verifyCalls).toBe(1);
+    expect(await harness.store!.creditBalance(sha256Hex(funded.plaintext))).toBe(STARTER_CREDITS - 1);
+    expect(await harness.store!.creditBalance(sha256Hex(other.plaintext))).toBe(0);
+    expect(JSON.stringify(thief.state.jsonBody)).not.toContain(funded.plaintext);
+    expect(JSON.stringify(thief.state.jsonBody)).not.toContain(other.accountToken);
+  });
+
+  it('parallel retries same id+payload: engine once; second is 409; credits -1', async () => {
+    const minted = await mintStarter();
+    const hash = sha256Hex(minted.plaintext);
+    const mod = await import('../../../api/dql/verify.js');
+    const headers = {
+      'x-dql-account': minted.accountToken,
+      'idempotency-key': 'parallel-same-id-01',
+    };
+    const a = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    const b = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await Promise.all([mod.default(a.req, a.res), mod.default(b.req, b.res)]);
+    const codes = [a.state.statusCode, b.state.statusCode].sort();
+    expect(codes).toEqual([200, 409]);
+    const conflict = a.state.statusCode === 409 ? a.state : b.state;
+    expect(conflict.jsonBody.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+    expect(harness.verifyCalls).toBe(1);
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+    expect(await harness.store!.usageToday(hash)).toBe(1);
+  });
+
+  it('same id different payload is 409; no second engine; no extra debit', async () => {
+    const minted = await mintStarter();
+    const hash = sha256Hex(minted.plaintext);
+    const mod = await import('../../../api/dql/verify.js');
+    const headers = {
+      'x-dql-account': minted.accountToken,
+      'idempotency-key': 'payload-mismatch-01',
+    };
+    const first = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(first.req, first.res);
+    expect(first.state.statusCode).toBe(200);
+    const mismatch = makeReqRes(
+      { ...validVerifyBody, mandate: 'A completely different mandate', sandbox: false },
+      'POST',
+      headers,
+    );
+    await mod.default(mismatch.req, mismatch.res);
+    expect(mismatch.state.statusCode).toBe(409);
+    expect(mismatch.state.jsonBody.code).toBe('IDEMPOTENCY_PAYLOAD_MISMATCH');
+    expect(harness.verifyCalls).toBe(1);
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+  });
+
+  it('expired held reservation is recovered and restores credit + cap', async () => {
+    const minted = await mintStarter();
+    const hash = sha256Hex(minted.plaintext);
+    const t0 = new Date('2026-08-15T00:00:00.000Z');
+    const digest = verifyPayloadDigest({
+      ...validVerifyBody,
+      axes: [...AXES],
+      sandbox: false,
+    });
+    const held = await harness.store!.reserveVerify({
+      requestId: 'ttl-recover-key-01',
+      keyHash: hash,
+      payloadDigest: digest,
+      dailyCap: DEFAULT_DAILY_CAP,
+      paygOptIn: false,
+      now: t0,
+    });
+    expect(held.kind).toBe('ok');
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
+    const later = new Date(t0.getTime() + 16 * 60 * 1000);
+    expect(await harness.store!.recoverExpiredVerifyReservation('ttl-recover-key-01', later)).toBe(
+      'released',
+    );
+    expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS);
+    expect(await harness.store!.usageToday(hash, t0)).toBe(0);
+    expect(harness.verifyCalls).toBe(0);
+  });
+
+  it('PAYG meter error is 503 and is not a free replayable result', async () => {
+    const minted = await mintAccount('cs_payg', 'cus_payg', 'payg');
+    const hash = sha256Hex(minted.plaintext);
+    const mod = await import('../../../api/dql/verify.js');
+    const headers = {
+      'x-dql-account': minted.accountToken,
+      'idempotency-key': 'payg-meter-fail-01',
+    };
+    const first = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(first.req, first.res);
+    expect(first.state.statusCode).toBe(503);
+    expect(first.state.jsonBody.code).toBe('METER_UNAVAILABLE');
+    expect(first.state.jsonBody.axes).toBeUndefined();
+    expect(harness.verifyCalls).toBe(1);
+    expect(await harness.store!.usageToday(hash)).toBe(0);
+
+    const retry = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(retry.req, retry.res);
+    expect(retry.state.statusCode).toBe(503);
+    expect(retry.state.jsonBody.code).toBe('METER_UNAVAILABLE');
+    expect(retry.state.jsonBody.axes).toBeUndefined();
+    expect(harness.verifyCalls).toBe(2);
+    expect(await harness.store!.usageToday(hash)).toBe(0);
   });
 });

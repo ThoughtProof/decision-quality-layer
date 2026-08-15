@@ -103,33 +103,97 @@ export async function authorizeVerifyWithAccount(opts: {
   };
 }
 
+export type AccountReserveDecision =
+  | {
+      kind: 'execute';
+      key: string;
+      record: import('./keys.js').ApiKeyRecord;
+      billing: import('./keys.js').AllowBilling;
+      reservation: import('./key-store.js').VerifyReservation;
+    }
+  | {
+      kind: 'replay';
+      key: string;
+      record: import('./keys.js').ApiKeyRecord;
+      billing: import('./keys.js').AllowBilling;
+      reservation: import('./key-store.js').VerifyReservation;
+      result: unknown;
+    }
+  | { kind: 'deny'; status: number; payload: Record<string, unknown> };
+
 /**
  * Atomic pre-execution reservation of prepaid credit (or confirmed PAYG)
- * and daily-cap (one Redis EVAL). Call before `runVerification()`.
- * Idempotent per requestId (client Idempotency-Key / X-Request-Id).
- * Failure → 402 / 429 / 503 and the engine must not run.
+ * and daily-cap (one Redis EVAL). Bound to key hash + requestId + payload digest.
+ * Call before `runVerification()`.
+ *   execute      — new hold; caller may run the engine
+ *   replay       — committed; return stored result; do not run
+ *   deny 409     — in-progress (same account+payload) or payload mismatch
+ *   deny 403     — idempotency key bound to another account
+ *   deny 402/429/503 — empty / quota / store error
  */
 export async function reserveVerifyWithAccount(opts: {
   requestId: string;
   keyHash: string;
+  payloadDigest: string;
   record: import('./keys.js').ApiKeyRecord;
   store: KeyStore;
   now?: Date;
-}): Promise<AuthDecision> {
+}): Promise<AccountReserveDecision> {
   const result = await opts.store.reserveVerify({
     requestId: opts.requestId,
     keyHash: opts.keyHash,
+    payloadDigest: opts.payloadDigest,
     dailyCap: opts.record.daily_cap,
     paygOptIn: opts.record.payg_opt_in === true,
     now: opts.now,
   });
   if (result.kind === 'ok') {
     return {
-      kind: 'allow',
+      kind: 'execute',
       key: opts.keyHash,
       record: opts.record,
       billing: result.reservation.billing,
-      via: 'account',
+      reservation: result.reservation,
+    };
+  }
+  if (result.kind === 'replay') {
+    return {
+      kind: 'replay',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: result.reservation.billing,
+      reservation: result.reservation,
+      result: result.reservation.result,
+    };
+  }
+  if (result.kind === 'in_progress') {
+    return {
+      kind: 'deny',
+      status: 409,
+      payload: {
+        error: 'A verify with this Idempotency-Key is already in progress.',
+        code: 'IDEMPOTENCY_IN_PROGRESS',
+      },
+    };
+  }
+  if (result.kind === 'conflict') {
+    if (result.reason === 'account') {
+      return {
+        kind: 'deny',
+        status: 403,
+        payload: {
+          error: 'This Idempotency-Key is bound to another account.',
+          code: 'IDEMPOTENCY_KEY_BOUND',
+        },
+      };
+    }
+    return {
+      kind: 'deny',
+      status: 409,
+      payload: {
+        error: 'Idempotency-Key was used with a different verify payload.',
+        code: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+      },
     };
   }
   if (result.kind === 'quota') {
@@ -169,8 +233,13 @@ export async function reserveVerifyWithAccount(opts: {
 export async function commitVerifyReservation(opts: {
   requestId: string;
   store: KeyStore;
+  result?: unknown;
+  meter?: import('./key-store.js').VerifyReservation['meter'];
 }): Promise<void> {
-  await opts.store.commitVerifyReservation(opts.requestId);
+  await opts.store.commitVerifyReservation(opts.requestId, {
+    result: opts.result,
+    meter: opts.meter,
+  });
 }
 
 export async function releaseVerifyReservation(opts: {

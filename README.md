@@ -72,7 +72,7 @@ DQL runs a single tier: the nano → swift cascade validated by the Orthogonalit
 - `axes` — optional array; defaults to all five
 - `sandbox` — optional boolean; when true, returns a deterministic mock without running the cascade (free, for integration testing)
 
-**Auth (non-sandbox):** `X-DQL-Key: dqlk_…` **or** `X-DQL-Account: dqla_…` (alias `Authorization: Bearer` with the same prefix). The account token bills the bound credit ledger and never returns the raw verify key. `dqla_…` is not accepted as `X-DQL-Key`. Account path: atomic reserve → verify → commit/release; optional `Idempotency-Key` / `X-Request-Id`. See `docs/ENV.md`.
+**Auth (non-sandbox):** `X-DQL-Key: dqlk_…` **or** `X-DQL-Account: dqla_…` (alias `Authorization: Bearer` with the same prefix). The account token bills the bound credit ledger and never returns the raw verify key. `dqla_…` is not accepted as `X-DQL-Key`. Account path: reserve bound to account + idempotency key + payload; commit stores the result for replay; optional `Idempotency-Key` / `X-Request-Id`. See `docs/ENV.md`.
 
 **Response:**
 

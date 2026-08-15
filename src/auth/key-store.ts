@@ -18,7 +18,8 @@
  *   dql:trial-email:<sha256(email)> → claim marker
  *   dql:trial-fp:<card_fingerprint> → claim marker
  *   dql:account:<sha256(dqla_…)>    → live key hash (account session; hash only)
- *   dql:reserve:<requestId>         → VerifyReservation (held/committed/released; hash only)
+ *   dql:reserve:<requestId>         → VerifyReservation bound to key hash + payload digest
+ *   dql:reserve-held                → ZSET score=leaseExpiresAt member=requestId (stale-hold sweep)
  *
  * Usage counters stay on `dql:usage:<sha256[:24]>:<day>` (src/auth/usage.ts).
  * Credits and daily-cap are both enforced; namespaces do not collide.
@@ -32,9 +33,14 @@ import { keyDisplayPrefix, sha256Hex } from './key-hash.js';
 import type { CheckoutPack } from './packs.js';
 import { usageCounterKeyFromHash } from './usage.js';
 import {
+  HELD_INDEX_KEY,
   LUA_COMMIT,
+  LUA_RECOVER,
   LUA_RELEASE,
   LUA_RESERVE,
+  LUA_SWEEP,
+  RESERVE_LEASE_SEC,
+  RESERVE_RECORD_TTL_SEC,
   dispatchMemoryEval,
   parseReserveEval,
 } from './verify-reservation-atomic.js';
@@ -55,7 +61,7 @@ export const RESERVE_PREFIX = 'dql:reserve:';
 
 export const REVEAL_TTL_SEC = 15 * 60;
 export const MINT_LOCK_TTL_SEC = 60;
-export const RESERVE_TTL_SEC = 15 * 60;
+export const RESERVE_TTL_SEC = RESERVE_LEASE_SEC;
 
 export interface StoredKeyRecord {
   hash: string;
@@ -141,15 +147,24 @@ export type VerifyReservationStatus = 'held' | 'committed' | 'released';
 export interface VerifyReservation {
   requestId: string;
   keyHash: string;
+  payloadDigest: string;
   dayUtc: string;
   creditHeld: boolean;
   capHeld: boolean;
   billing: 'credit' | 'payg';
   status: VerifyReservationStatus;
+  /** Unix ms. After this, a held reservation is stale and must be refunded. */
+  leaseExpiresAt: number;
+  /** Stored verify result after commit (replay). Never contains dqlk_/dqla_. */
+  result?: unknown;
+  meter?: 'ok' | 'error' | 'skipped' | 'n/a';
 }
 
 export type ReserveVerifyResult =
   | { kind: 'ok'; reservation: VerifyReservation }
+  | { kind: 'in_progress'; reservation: VerifyReservation }
+  | { kind: 'replay'; reservation: VerifyReservation }
+  | { kind: 'conflict'; reason: 'account' | 'payload' }
   | { kind: 'empty' }
   | { kind: 'quota' }
   | { kind: 'error' };
@@ -187,12 +202,18 @@ export interface KeyStore {
   reserveVerify(opts: {
     requestId: string;
     keyHash: string;
+    payloadDigest: string;
     dailyCap: number;
     paygOptIn: boolean;
     now?: Date;
   }): Promise<ReserveVerifyResult>;
-  commitVerifyReservation(requestId: string): Promise<void>;
+  commitVerifyReservation(
+    requestId: string,
+    opts?: { result?: unknown; meter?: VerifyReservation['meter'] },
+  ): Promise<void>;
   releaseVerifyReservation(requestId: string): Promise<void>;
+  recoverExpiredVerifyReservation(requestId: string, now?: Date): Promise<'released' | 'noop'>;
+  recoverExpiredHeldReservations(now?: Date): Promise<number>;
 }
 
 function asRecord(v: unknown): StoredKeyRecord | null {
@@ -533,12 +554,14 @@ export class UpstashKeyStore implements KeyStore {
   async reserveVerify(opts: {
     requestId: string;
     keyHash: string;
+    payloadDigest: string;
     dailyCap: number;
     paygOptIn: boolean;
     now?: Date;
   }): Promise<ReserveVerifyResult> {
-    if (!opts.requestId || !opts.keyHash) return { kind: 'error' };
-    const dayUtc = (opts.now ?? new Date()).toISOString().slice(0, 10);
+    if (!opts.requestId || !opts.keyHash || !opts.payloadDigest) return { kind: 'error' };
+    const now = opts.now ?? new Date();
+    const dayUtc = now.toISOString().slice(0, 10);
     try {
       const raw = await this.kv.eval(
         LUA_RESERVE,
@@ -546,14 +569,18 @@ export class UpstashKeyStore implements KeyStore {
           `${RESERVE_PREFIX}${opts.requestId}`,
           `${CREDITS_PREFIX}${opts.keyHash}`,
           usageCounterKeyFromHash(opts.keyHash, dayUtc),
+          HELD_INDEX_KEY,
         ],
         [
           opts.requestId,
           opts.keyHash,
+          opts.payloadDigest,
           dayUtc,
           String(opts.dailyCap),
           opts.paygOptIn ? '1' : '0',
-          String(RESERVE_TTL_SEC),
+          String(RESERVE_RECORD_TTL_SEC),
+          String(RESERVE_LEASE_SEC),
+          String(now.getTime()),
         ],
       );
       return parseReserveEval(raw);
@@ -562,10 +589,17 @@ export class UpstashKeyStore implements KeyStore {
     }
   }
 
-  async commitVerifyReservation(requestId: string): Promise<void> {
+  async commitVerifyReservation(
+    requestId: string,
+    opts?: { result?: unknown; meter?: VerifyReservation['meter'] },
+  ): Promise<void> {
     if (!requestId) return;
     try {
-      await this.kv.eval(LUA_COMMIT, [`${RESERVE_PREFIX}${requestId}`], [String(RESERVE_TTL_SEC)]);
+      await this.kv.eval(
+        LUA_COMMIT,
+        [`${RESERVE_PREFIX}${requestId}`, HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC), JSON.stringify(opts?.result ?? null), opts?.meter ?? 'n/a'],
+      );
     } catch {
       // Commit is best-effort after a successful verify; debit already held.
     }
@@ -574,9 +608,44 @@ export class UpstashKeyStore implements KeyStore {
   async releaseVerifyReservation(requestId: string): Promise<void> {
     if (!requestId) return;
     try {
-      await this.kv.eval(LUA_RELEASE, [`${RESERVE_PREFIX}${requestId}`], [String(RESERVE_TTL_SEC)]);
+      await this.kv.eval(
+        LUA_RELEASE,
+        [`${RESERVE_PREFIX}${requestId}`, HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC)],
+      );
     } catch {
       // Caller already failed; do not throw over a release error.
+    }
+  }
+
+  async recoverExpiredVerifyReservation(
+    requestId: string,
+    now: Date = new Date(),
+  ): Promise<'released' | 'noop'> {
+    if (!requestId) return 'noop';
+    try {
+      const raw = await this.kv.eval(
+        LUA_RECOVER,
+        [`${RESERVE_PREFIX}${requestId}`, HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC), String(now.getTime())],
+      );
+      return raw === 'released' ? 'released' : 'noop';
+    } catch {
+      return 'noop';
+    }
+  }
+
+  async recoverExpiredHeldReservations(now: Date = new Date()): Promise<number> {
+    try {
+      const raw = await this.kv.eval(LUA_SWEEP, [HELD_INDEX_KEY], [
+        String(RESERVE_RECORD_TTL_SEC),
+        String(now.getTime()),
+      ]);
+      if (typeof raw === 'number' && Number.isFinite(raw)) return Math.max(0, Math.floor(raw));
+      if (typeof raw === 'string' && /^-?\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+      return 0;
+    } catch {
+      return 0;
     }
   }
 
@@ -689,6 +758,7 @@ export function createKeyStore(env: NodeJS.ProcessEnv = process.env): KeyStore |
 /** In-memory KvStore for unit tests. */
 export function createMemoryKv(): KvStore & { dump(): Map<string, unknown> } {
   const data = new Map<string, { value: unknown; exp?: number }>();
+  const zsets = new Map<string, Map<string, number>>();
   const now = () => Date.now();
   const alive = (k: string): { value: unknown; exp?: number } | undefined => {
     const row = data.get(k);
@@ -755,6 +825,22 @@ export function createMemoryKv(): KvStore & { dump(): Map<string, unknown> } {
           const next = asInt(row?.value) + n;
           data.set(key, { value: next, exp: row?.exp });
           return next;
+        },
+        zadd(key: string, score: number, member: string) {
+          const z = zsets.get(key) ?? new Map<string, number>();
+          z.set(member, score);
+          zsets.set(key, z);
+        },
+        zrem(key: string, member: string) {
+          zsets.get(key)?.delete(member);
+        },
+        zrangebyscore(key: string, min: number, max: number) {
+          const z = zsets.get(key);
+          if (!z) return [];
+          return [...z.entries()]
+            .filter(([, score]) => score >= min && score <= max)
+            .sort((a, b) => a[1] - b[1])
+            .map(([member]) => member);
         },
       };
       return Promise.resolve(dispatchMemoryEval(sync, script, keys, args));

@@ -11,6 +11,8 @@ import { generateApiKey } from './checkout.js';
 import { sha256Hex } from './key-hash.js';
 
 const allowGate: UsageGate = { checkAndRecord: async () => true };
+const DIGEST_A = 'digest-aaaaaaaaaaaaaaaa';
+const DIGEST_B = 'digest-bbbbbbbbbbbbbbbb';
 
 describe('createKeyStore', () => {
   it('returns null without Upstash env', () => {
@@ -92,6 +94,7 @@ describe('UpstashKeyStore (memory)', () => {
     const first = await store.reserveVerify({
       requestId: 'dql_r1',
       keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
@@ -102,10 +105,11 @@ describe('UpstashKeyStore (memory)', () => {
     const replay = await store.reserveVerify({
       requestId: 'dql_r1',
       keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
-    expect(replay.kind).toBe('ok');
+    expect(replay.kind).toBe('in_progress');
     expect(await store.creditBalance(rec.hash)).toBe(2);
 
     await store.releaseVerifyReservation('dql_r1');
@@ -115,6 +119,7 @@ describe('UpstashKeyStore (memory)', () => {
     const again = await store.reserveVerify({
       requestId: 'dql_r2',
       keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
@@ -140,23 +145,20 @@ describe('UpstashKeyStore (memory)', () => {
       store.reserveVerify({
         requestId: 'dql_same_id',
         keyHash: rec.hash,
+        payloadDigest: DIGEST_A,
         dailyCap: 10,
         paygOptIn: false,
       }),
       store.reserveVerify({
         requestId: 'dql_same_id',
         keyHash: rec.hash,
+        payloadDigest: DIGEST_A,
         dailyCap: 10,
         paygOptIn: false,
       }),
     ]);
-    expect(a.kind).toBe('ok');
-    expect(b.kind).toBe('ok');
-    if (a.kind === 'ok' && b.kind === 'ok') {
-      expect(a.reservation.requestId).toBe('dql_same_id');
-      expect(b.reservation.requestId).toBe('dql_same_id');
-      expect(a.reservation.status).toBe(b.reservation.status);
-    }
+    const kinds = [a.kind, b.kind].sort();
+    expect(kinds).toEqual(['in_progress', 'ok']);
     expect(await store.creditBalance(rec.hash)).toBe(1);
     expect(await store.usageToday(rec.hash)).toBe(1);
   });
@@ -174,6 +176,7 @@ describe('UpstashKeyStore (memory)', () => {
     const held = await store.reserveVerify({
       requestId: 'dql_dbl_rel',
       keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
@@ -202,6 +205,7 @@ describe('UpstashKeyStore (memory)', () => {
     const c = await store.reserveVerify({
       requestId: 'dql_commit_first',
       keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
@@ -214,6 +218,7 @@ describe('UpstashKeyStore (memory)', () => {
     const r = await store.reserveVerify({
       requestId: 'dql_release_first',
       keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
@@ -240,6 +245,7 @@ describe('UpstashKeyStore (memory)', () => {
     const held = await store.reserveVerify({
       requestId: 'dql_c_or_r',
       keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
       dailyCap: 10,
       paygOptIn: false,
     });
@@ -255,6 +261,144 @@ describe('UpstashKeyStore (memory)', () => {
     expect(credits === 1 || credits === 2).toBe(true);
     if (credits === 1) expect(usage).toBe(1);
     else expect(usage).toBe(0);
+  });
+
+  it('cross-account reuse of the same requestId is conflict; victim hold unchanged', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const aKey = generateApiKey();
+    const bKey = generateApiKey();
+    const a = newStoredKeyRecord({
+      plaintextKey: aKey,
+      owner: 'ss:cus_a',
+      stripeCustomerId: 'cus_a',
+    });
+    const b = newStoredKeyRecord({
+      plaintextKey: bKey,
+      owner: 'ss:cus_b',
+      stripeCustomerId: 'cus_b',
+    });
+    await store.putKey(a);
+    await store.putKey(b);
+    await store.addCredits(a.hash, 2);
+    await store.setCreditBalance(b.hash, 0);
+
+    const held = await store.reserveVerify({
+      requestId: 'dql_shared',
+      keyHash: a.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(held.kind).toBe('ok');
+
+    const thief = await store.reserveVerify({
+      requestId: 'dql_shared',
+      keyHash: b.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(thief.kind).toBe('conflict');
+    if (thief.kind === 'conflict') expect(thief.reason).toBe('account');
+    expect(await store.creditBalance(a.hash)).toBe(1);
+    expect(await store.usageToday(a.hash)).toBe(1);
+    expect(await store.creditBalance(b.hash)).toBe(0);
+    expect(await store.usageToday(b.hash)).toBe(0);
+  });
+
+  it('same id different payload is conflict; no extra debit', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_pay',
+      stripeCustomerId: 'cus_pay',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+    const first = await store.reserveVerify({
+      requestId: 'dql_payload',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(first.kind).toBe('ok');
+    const mismatch = await store.reserveVerify({
+      requestId: 'dql_payload',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_B,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(mismatch.kind).toBe('conflict');
+    if (mismatch.kind === 'conflict') expect(mismatch.reason).toBe('payload');
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+  });
+
+  it('committed replay returns stored result without a new debit', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_rep',
+      stripeCustomerId: 'cus_rep',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+    const first = await store.reserveVerify({
+      requestId: 'dql_replay',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(first.kind).toBe('ok');
+    await store.commitVerifyReservation('dql_replay', { result: { id: 'stored' }, meter: 'n/a' });
+    const replay = await store.reserveVerify({
+      requestId: 'dql_replay',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+    });
+    expect(replay.kind).toBe('replay');
+    if (replay.kind === 'replay') expect(replay.reservation.result).toEqual({ id: 'stored' });
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+    expect(await store.usageToday(rec.hash)).toBe(1);
+  });
+
+  it('expired held is recovered and restores credit + cap', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const key = generateApiKey();
+    const rec = newStoredKeyRecord({
+      plaintextKey: key,
+      owner: 'ss:cus_ttl',
+      stripeCustomerId: 'cus_ttl',
+    });
+    await store.putKey(rec);
+    await store.addCredits(rec.hash, 2);
+    const t0 = new Date('2026-08-15T00:00:00.000Z');
+    const held = await store.reserveVerify({
+      requestId: 'dql_ttl',
+      keyHash: rec.hash,
+      payloadDigest: DIGEST_A,
+      dailyCap: 10,
+      paygOptIn: false,
+      now: t0,
+    });
+    expect(held.kind).toBe('ok');
+    expect(await store.creditBalance(rec.hash)).toBe(1);
+    expect(await store.usageToday(rec.hash, t0)).toBe(1);
+
+    const later = new Date(t0.getTime() + 16 * 60 * 1000);
+    expect(await store.recoverExpiredVerifyReservation('dql_ttl', later)).toBe('released');
+    expect(await store.creditBalance(rec.hash)).toBe(2);
+    expect(await store.usageToday(rec.hash, t0)).toBe(0);
+
+    const swept = await store.recoverExpiredHeldReservations(later);
+    expect(swept).toBe(0);
   });
 
   it('reveal is one-time (GETDEL)', async () => {

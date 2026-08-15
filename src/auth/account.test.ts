@@ -26,6 +26,8 @@ import { STARTER_CREDITS } from './packs.js';
 import { usageCounterKeyFromHash } from './usage.js';
 
 const allowGate: UsageGate = { checkAndRecord: async () => true };
+const DIGEST_A = 'digest-aaaaaaaaaaaaaaaa';
+const DIGEST_B = 'digest-bbbbbbbbbbbbbbbb';
 
 function stripeSessionFetch(sessionId: string, customerId: string, pack: string): typeof fetch {
   return vi.fn(async (url: string) => {
@@ -215,11 +217,12 @@ describe('reveal + account surface', () => {
     const reserved = await reserveVerifyWithAccount({
       requestId: 'dql_vfy_1',
       keyHash: allowed.key,
+      payloadDigest: DIGEST_A,
       record: allowed.record,
       store,
     });
-    expect(reserved.kind).toBe('allow');
-    if (reserved.kind === 'allow') expect(reserved.billing).toBe('credit');
+    expect(reserved.kind).toBe('execute');
+    if (reserved.kind === 'execute') expect(reserved.billing).toBe('credit');
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
     await commitVerifyReservation({ requestId: 'dql_vfy_1', store });
     expect(await store.creditBalance(sha256Hex(minted.plaintext))).toBe(STARTER_CREDITS - 1);
@@ -234,6 +237,7 @@ describe('reveal + account surface', () => {
       await reserveVerifyWithAccount({
         requestId: 'dql_vfy_2',
         keyHash: viaBearer.key,
+        payloadDigest: DIGEST_A,
         record: viaBearer.record,
         store,
       });
@@ -272,6 +276,7 @@ describe('reveal + account surface', () => {
       const blocked = await reserveVerifyWithAccount({
         requestId: 'dql_cap_block',
         keyHash: auth.key,
+        payloadDigest: DIGEST_A,
         record: auth.record,
         store,
       });
@@ -304,17 +309,23 @@ describe('reveal + account surface', () => {
     const first = await reserveVerifyWithAccount({
       requestId: 'dql_same',
       keyHash: auth.key,
+      payloadDigest: DIGEST_A,
       record: auth.record,
       store,
     });
     const replay = await reserveVerifyWithAccount({
       requestId: 'dql_same',
       keyHash: auth.key,
+      payloadDigest: DIGEST_A,
       record: auth.record,
       store,
     });
-    expect(first.kind).toBe('allow');
-    expect(replay.kind).toBe('allow');
+    expect(first.kind).toBe('execute');
+    expect(replay.kind).toBe('deny');
+    if (replay.kind === 'deny') {
+      expect(replay.status).toBe(409);
+      expect(replay.payload.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+    }
     expect(await store.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
     expect(await store.usageToday(hash)).toBe(1);
 
@@ -327,10 +338,11 @@ describe('reveal + account surface', () => {
     const again = await reserveVerifyWithAccount({
       requestId: 'dql_same',
       keyHash: auth.key,
+      payloadDigest: DIGEST_A,
       record: auth.record,
       store,
     });
-    expect(again.kind).toBe('allow');
+    expect(again.kind).toBe('execute');
     await commitVerifyReservation({ requestId: 'dql_same', store });
     await commitVerifyReservation({ requestId: 'dql_same', store });
     await releaseVerifyReservation({ requestId: 'dql_same', store });
@@ -361,18 +373,20 @@ describe('reveal + account surface', () => {
       reserveVerifyWithAccount({
         requestId: 'dql_race_a',
         keyHash: auth.key,
+        payloadDigest: DIGEST_A,
         record: auth.record,
         store,
       }),
       reserveVerifyWithAccount({
         requestId: 'dql_race_b',
         keyHash: auth.key,
+        payloadDigest: DIGEST_A,
         record: auth.record,
         store,
       }),
     ]);
     const kinds = [a.kind, b.kind].sort();
-    expect(kinds).toEqual(['allow', 'deny']);
+    expect(kinds).toEqual(['deny', 'execute']);
     const denied = a.kind === 'deny' ? a : b;
     if (denied.kind === 'deny') {
       expect(denied.status).toBe(402);
@@ -405,20 +419,99 @@ describe('reveal + account surface', () => {
       reserveVerifyWithAccount({
         requestId: 'dql_same_parallel',
         keyHash: auth.key,
+        payloadDigest: DIGEST_A,
         record: auth.record,
         store,
       }),
       reserveVerifyWithAccount({
         requestId: 'dql_same_parallel',
         keyHash: auth.key,
+        payloadDigest: DIGEST_A,
         record: auth.record,
         store,
       }),
     ]);
-    expect(a.kind).toBe('allow');
-    expect(b.kind).toBe('allow');
+    const kinds = [a.kind, b.kind].sort();
+    expect(kinds).toEqual(['deny', 'execute']);
+    const denied = a.kind === 'deny' ? a : b;
+    if (denied.kind === 'deny') {
+      expect(denied.status).toBe(409);
+      expect(denied.payload.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+    }
     expect(await store.creditBalance(hash)).toBe(1);
     expect(await store.usageToday(hash)).toBe(1);
+  });
+
+  it('cross-account same requestId is 403; payload mismatch is 409', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const funded = await finalizeCheckoutMint({
+      sessionId: 'cs_bound_a',
+      customerId: 'cus_bound_a',
+      owner: selfServeOwner('cus_bound_a'),
+      store,
+      pack: 'starter',
+    });
+    const other = await finalizeCheckoutMint({
+      sessionId: 'cs_bound_b',
+      customerId: 'cus_bound_b',
+      owner: selfServeOwner('cus_bound_b'),
+      store,
+      pack: 'starter',
+    });
+    expect(funded.kind).toBe('minted');
+    expect(other.kind).toBe('minted');
+    if (funded.kind !== 'minted' || other.kind !== 'minted') return;
+    await store.setCreditBalance(sha256Hex(other.plaintext), 0);
+
+    const a = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': funded.accountToken },
+      store,
+    });
+    const b = await authorizeVerifyWithAccount({
+      headers: { 'x-dql-account': other.accountToken },
+      store,
+    });
+    expect(a.kind).toBe('allow');
+    expect(b.kind).toBe('allow');
+    if (a.kind !== 'allow' || b.kind !== 'allow') return;
+
+    const held = await reserveVerifyWithAccount({
+      requestId: 'dql_bound',
+      keyHash: a.key,
+      payloadDigest: DIGEST_A,
+      record: a.record,
+      store,
+    });
+    expect(held.kind).toBe('execute');
+
+    const thief = await reserveVerifyWithAccount({
+      requestId: 'dql_bound',
+      keyHash: b.key,
+      payloadDigest: DIGEST_A,
+      record: b.record,
+      store,
+    });
+    expect(thief.kind).toBe('deny');
+    if (thief.kind === 'deny') {
+      expect(thief.status).toBe(403);
+      expect(thief.payload.code).toBe('IDEMPOTENCY_KEY_BOUND');
+    }
+    expect(await store.creditBalance(sha256Hex(funded.plaintext))).toBe(STARTER_CREDITS - 1);
+    expect(await store.creditBalance(sha256Hex(other.plaintext))).toBe(0);
+
+    const mismatch = await reserveVerifyWithAccount({
+      requestId: 'dql_bound',
+      keyHash: a.key,
+      payloadDigest: DIGEST_B,
+      record: a.record,
+      store,
+    });
+    expect(mismatch.kind).toBe('deny');
+    if (mismatch.kind === 'deny') {
+      expect(mismatch.status).toBe(409);
+      expect(mismatch.payload.code).toBe('IDEMPOTENCY_PAYLOAD_MISMATCH');
+    }
+    expect(await store.creditBalance(sha256Hex(funded.plaintext))).toBe(STARTER_CREDITS - 1);
   });
 
   it('verify with invalid/missing dqla_ is 401; dqla_ as X-DQL-Key stays 402', async () => {
@@ -486,11 +579,12 @@ describe('reveal + account surface', () => {
     const first = await reserveVerifyWithAccount({
       requestId: 'dql_exh_1',
       keyHash: ok.key,
+      payloadDigest: DIGEST_A,
       record: ok.record,
       store,
     });
-    expect(first.kind).toBe('allow');
-    if (first.kind === 'allow') expect(first.billing).toBe('credit');
+    expect(first.kind).toBe('execute');
+    if (first.kind === 'execute') expect(first.billing).toBe('credit');
     await commitVerifyReservation({ requestId: 'dql_exh_1', store });
 
     const stillIdentified = await authorizeVerifyWithAccount({
@@ -503,6 +597,7 @@ describe('reveal + account surface', () => {
     const stop = await reserveVerifyWithAccount({
       requestId: 'dql_exh_2',
       keyHash: stillIdentified.key,
+      payloadDigest: DIGEST_A,
       record: stillIdentified.record,
       store,
     });
@@ -560,11 +655,12 @@ describe('reveal + account surface', () => {
     const reservedRotate = await reserveVerifyWithAccount({
       requestId: 'dql_life_1',
       keyHash: afterRotate.key,
+      payloadDigest: DIGEST_A,
       record: afterRotate.record,
       store,
     });
-    expect(reservedRotate.kind).toBe('allow');
-    if (reservedRotate.kind === 'allow') expect(reservedRotate.billing).toBe('credit');
+    expect(reservedRotate.kind).toBe('execute');
+    if (reservedRotate.kind === 'execute') expect(reservedRotate.billing).toBe('credit');
     await commitVerifyReservation({ requestId: 'dql_life_1', store });
     expect(await store.creditBalance(sha256Hex(rotated.api_key))).toBe(STARTER_CREDITS - 1);
 
