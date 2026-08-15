@@ -16,7 +16,7 @@
   "crons": [
     {
       "path": "/dql/internal/sweep-reservations",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 6 * * *"
     }
   ],
   "headers": [

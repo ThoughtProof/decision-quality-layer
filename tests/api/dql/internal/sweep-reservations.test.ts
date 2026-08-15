@@ -56,13 +56,13 @@ describe('GET|POST /dql/internal/sweep-reservations', () => {
     harness.store = null;
   });
 
-  it('is registered as a Vercel cron every 5 minutes', () => {
+  it('is registered as a Hobby-legal once-daily Vercel cron', () => {
     const vercel = JSON.parse(readFileSync(resolve(process.cwd(), 'vercel.json'), 'utf8')) as {
       crons?: { path: string; schedule: string }[];
     };
     expect(vercel.crons).toEqual(
       expect.arrayContaining([
-        { path: '/dql/internal/sweep-reservations', schedule: '*/5 * * * *' },
+        { path: '/dql/internal/sweep-reservations', schedule: '0 6 * * *' },
       ]),
     );
   });
