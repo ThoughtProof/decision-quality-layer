@@ -8,7 +8,7 @@ export default function handler(_req: VercelRequest, res: VercelResponse) {
     description:
       '5-axis reasoning verification for AI agents (intent, scope, risk, consistency, reversibility).',
     endpoints: {
-      verify: 'POST /dql/verify',
+      verify: 'POST /dql/verify (X-DQL-Key dqlk_… or X-DQL-Account / Bearer dqla_…)',
       axes: 'GET /dql/axes',
       health: 'GET /dql/health',
       structural_metrics: 'GET /dql/structural-metrics',

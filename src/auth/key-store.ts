@@ -18,6 +18,9 @@
  *   dql:trial-email:<sha256(email)> → claim marker
  *   dql:trial-fp:<card_fingerprint> → claim marker
  *   dql:account:<sha256(dqla_…)>    → live key hash (account session; hash only)
+ *   dql:reserve:<keyHash>:<requestId> → VerifyReservation (per-account idempotency namespace)
+ *   dql:reserve-held                  → ZSET score=leaseExpiresAt member=<keyHash>:<requestId>
+ *   dql:reserve-fence                 → INCR fencing token (commit/release must match)
  *
  * Usage counters stay on `dql:usage:<sha256[:24]>:<day>` (src/auth/usage.ts).
  * Credits and daily-cap are both enforced; namespaces do not collide.
@@ -30,6 +33,21 @@ import { DEFAULT_DAILY_CAP, type ApiKeyRecord } from './keys.js';
 import { keyDisplayPrefix, sha256Hex } from './key-hash.js';
 import type { CheckoutPack } from './packs.js';
 import { usageCounterKeyFromHash } from './usage.js';
+import {
+  FENCE_KEY,
+  HELD_INDEX_KEY,
+  LUA_COMMIT,
+  LUA_PENDING,
+  LUA_RECOVER,
+  LUA_RELEASE,
+  LUA_RESERVE,
+  LUA_SWEEP,
+  RESERVE_LEASE_SEC,
+  RESERVE_RECORD_TTL_SEC,
+  dispatchMemoryEval,
+  parseReserveEval,
+  reservationRedisKey,
+} from './verify-reservation-atomic.js';
 
 export const KEY_RECORD_PREFIX = 'dql:key:';
 export const OWNER_CUS_PREFIX = 'dql:owner-cus:';
@@ -43,9 +61,11 @@ export const CREDIT_LEDGER_PREFIX = 'dql:credit-ledger:';
 export const TRIAL_EMAIL_PREFIX = 'dql:trial-email:';
 export const TRIAL_FP_PREFIX = 'dql:trial-fp:';
 export const ACCOUNT_PREFIX = 'dql:account:';
+export const RESERVE_PREFIX = 'dql:reserve:';
 
 export const REVEAL_TTL_SEC = 15 * 60;
 export const MINT_LOCK_TTL_SEC = 60;
+export const RESERVE_TTL_SEC = RESERVE_LEASE_SEC;
 
 export interface StoredKeyRecord {
   hash: string;
@@ -119,10 +139,47 @@ export interface KvStore {
   getdel?<T = unknown>(key: string): Promise<T | null>;
   incrby(key: string, n: number): Promise<number>;
   decr(key: string): Promise<number>;
+  /** Atomic script. Memory store runs the JS equivalent synchronously. */
+  eval(script: string, keys: string[], args: string[]): Promise<unknown>;
 }
 
 export type ConsumeCreditResult = 'consumed' | 'empty' | 'error';
 export type TrialClaimResult = 'ok' | 'already_used';
+
+export type VerifyReservationStatus = 'held' | 'committed' | 'released' | 'meter_pending';
+
+export interface VerifyReservation {
+  requestId: string;
+  keyHash: string;
+  payloadDigest: string;
+  dayUtc: string;
+  creditHeld: boolean;
+  capHeld: boolean;
+  billing: 'credit' | 'payg';
+  status: VerifyReservationStatus;
+  /** Monotonic token for this hold. Commit/release no-op if it does not match. */
+  fence: number;
+  /** Unix ms. After this, a held reservation is stale and must be refunded. */
+  leaseExpiresAt: number;
+  /** Stored verify result after commit or meter_pending. Never contains dqlk_/dqla_. */
+  result?: unknown;
+  meter?: 'ok' | 'error' | 'skipped' | 'n/a';
+}
+
+export type ReserveVerifyResult =
+  | { kind: 'ok'; reservation: VerifyReservation }
+  | { kind: 'in_progress'; reservation: VerifyReservation }
+  | { kind: 'replay'; reservation: VerifyReservation }
+  | { kind: 'meter_pending'; reservation: VerifyReservation }
+  | { kind: 'conflict'; reason: 'account' | 'payload' }
+  | { kind: 'empty' }
+  | { kind: 'quota' }
+  | { kind: 'error' };
+
+export type CommitReservationAck = 'committed' | 'noop' | 'error';
+export type PersistPendingAck = 'pending' | 'noop' | 'error';
+export type ReleaseReservationAck = 'released' | 'noop';
+export type SweepHeldResult = { kind: 'ok'; refunded: number } | { kind: 'error' };
 
 export interface KeyStore {
   lookup(plaintextKey: string): Promise<ApiKeyRecord | undefined>;
@@ -154,6 +211,38 @@ export interface KeyStore {
   putAccountIndex(accountTokenHash: string, keyHash: string): Promise<void>;
   lookupByAccountToken(plaintextToken: string): Promise<StoredKeyRecord | null>;
   usageToday(keyHash: string, now?: Date): Promise<number>;
+  reserveVerify(opts: {
+    requestId: string;
+    keyHash: string;
+    payloadDigest: string;
+    dailyCap: number;
+    paygOptIn: boolean;
+    now?: Date;
+  }): Promise<ReserveVerifyResult>;
+  commitVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result?: unknown;
+    meter?: VerifyReservation['meter'];
+  }): Promise<CommitReservationAck>;
+  persistMeterPending(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result: unknown;
+  }): Promise<PersistPendingAck>;
+  releaseVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+  }): Promise<ReleaseReservationAck>;
+  recoverExpiredVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    now?: Date;
+  }): Promise<'released' | 'noop'>;
+  recoverExpiredHeldReservations(now?: Date): Promise<SweepHeldResult>;
 }
 
 function asRecord(v: unknown): StoredKeyRecord | null {
@@ -491,6 +580,144 @@ export class UpstashKeyStore implements KeyStore {
     }
   }
 
+  async reserveVerify(opts: {
+    requestId: string;
+    keyHash: string;
+    payloadDigest: string;
+    dailyCap: number;
+    paygOptIn: boolean;
+    now?: Date;
+  }): Promise<ReserveVerifyResult> {
+    if (!opts.requestId || !opts.keyHash || !opts.payloadDigest) return { kind: 'error' };
+    const now = opts.now ?? new Date();
+    const dayUtc = now.toISOString().slice(0, 10);
+    try {
+      const raw = await this.kv.eval(
+        LUA_RESERVE,
+        [
+          reservationRedisKey(opts.keyHash, opts.requestId),
+          `${CREDITS_PREFIX}${opts.keyHash}`,
+          usageCounterKeyFromHash(opts.keyHash, dayUtc),
+          HELD_INDEX_KEY,
+          FENCE_KEY,
+        ],
+        [
+          opts.requestId,
+          opts.keyHash,
+          opts.payloadDigest,
+          dayUtc,
+          String(opts.dailyCap),
+          opts.paygOptIn ? '1' : '0',
+          String(RESERVE_RECORD_TTL_SEC),
+          String(RESERVE_LEASE_SEC),
+          String(now.getTime()),
+        ],
+      );
+      return parseReserveEval(raw);
+    } catch {
+      return { kind: 'error' };
+    }
+  }
+
+  async commitVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result?: unknown;
+    meter?: VerifyReservation['meter'];
+  }): Promise<CommitReservationAck> {
+    if (!opts.requestId || !opts.keyHash) return 'error';
+    try {
+      const raw = await this.kv.eval(
+        LUA_COMMIT,
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
+        [
+          String(RESERVE_RECORD_TTL_SEC),
+          JSON.stringify(opts.result ?? null),
+          opts.meter ?? 'n/a',
+          String(opts.fence),
+        ],
+      );
+      return raw === 'committed' ? 'committed' : 'noop';
+    } catch {
+      return 'error';
+    }
+  }
+
+  async persistMeterPending(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    result: unknown;
+  }): Promise<PersistPendingAck> {
+    if (!opts.requestId || !opts.keyHash) return 'error';
+    try {
+      const raw = await this.kv.eval(
+        LUA_PENDING,
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC), JSON.stringify(opts.result ?? null), String(opts.fence)],
+      );
+      return raw === 'pending' ? 'pending' : 'noop';
+    } catch {
+      return 'error';
+    }
+  }
+
+  async releaseVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+  }): Promise<ReleaseReservationAck> {
+    if (!opts.requestId || !opts.keyHash) return 'noop';
+    try {
+      const raw = await this.kv.eval(
+        LUA_RELEASE,
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC), String(opts.fence)],
+      );
+      return raw === 'released' ? 'released' : 'noop';
+    } catch {
+      return 'noop';
+    }
+  }
+
+  async recoverExpiredVerifyReservation(opts: {
+    requestId: string;
+    keyHash: string;
+    now?: Date;
+  }): Promise<'released' | 'noop'> {
+    if (!opts.requestId || !opts.keyHash) return 'noop';
+    const now = opts.now ?? new Date();
+    try {
+      const raw = await this.kv.eval(
+        LUA_RECOVER,
+        [reservationRedisKey(opts.keyHash, opts.requestId), HELD_INDEX_KEY],
+        [String(RESERVE_RECORD_TTL_SEC), String(now.getTime())],
+      );
+      return raw === 'released' ? 'released' : 'noop';
+    } catch {
+      return 'noop';
+    }
+  }
+
+  async recoverExpiredHeldReservations(now: Date = new Date()): Promise<SweepHeldResult> {
+    try {
+      const raw = await this.kv.eval(LUA_SWEEP, [HELD_INDEX_KEY], [
+        String(RESERVE_RECORD_TTL_SEC),
+        String(now.getTime()),
+      ]);
+      if (typeof raw === 'number' && Number.isFinite(raw)) {
+        return { kind: 'ok', refunded: Math.max(0, Math.floor(raw)) };
+      }
+      if (typeof raw === 'string' && /^-?\d+$/.test(raw)) {
+        return { kind: 'ok', refunded: Math.max(0, parseInt(raw, 10)) };
+      }
+      return { kind: 'error' };
+    } catch {
+      return { kind: 'error' };
+    }
+  }
+
   async recordCreditGrant(keyHash: string, grant: CreditGrant): Promise<void> {
     const redisKey = `${CREDIT_LEDGER_PREFIX}${keyHash}`;
     const existing = asLedger(await this.kv.get(redisKey)) ?? { grants: [] };
@@ -592,6 +819,7 @@ export function createKeyStore(env: NodeJS.ProcessEnv = process.env): KeyStore |
     getdel: (key) => redis.getdel(key),
     incrby: (key, n) => redis.incrby(key, n),
     decr: (key) => redis.decr(key),
+    eval: (script, keys, args) => redis.eval(script, keys, args),
   };
   return new UpstashKeyStore(kv);
 }
@@ -599,6 +827,7 @@ export function createKeyStore(env: NodeJS.ProcessEnv = process.env): KeyStore |
 /** In-memory KvStore for unit tests. */
 export function createMemoryKv(): KvStore & { dump(): Map<string, unknown> } {
   const data = new Map<string, { value: unknown; exp?: number }>();
+  const zsets = new Map<string, Map<string, number>>();
   const now = () => Date.now();
   const alive = (k: string): { value: unknown; exp?: number } | undefined => {
     const row = data.get(k);
@@ -646,6 +875,44 @@ export function createMemoryKv(): KvStore & { dump(): Map<string, unknown> } {
       const next = asInt(row?.value) - 1;
       data.set(key, { value: next, exp: row?.exp });
       return next;
+    },
+    eval(script, keys, args) {
+      // Fully synchronous: equivalent to Redis EVAL (no interleaving).
+      const sync = {
+        get(key: string): unknown {
+          const row = alive(key);
+          return row ? row.value : null;
+        },
+        set(key: string, value: unknown, exSec?: number) {
+          data.set(key, {
+            value,
+            exp: exSec != null ? now() + exSec * 1000 : undefined,
+          });
+        },
+        incrby(key: string, n: number) {
+          const row = alive(key);
+          const next = asInt(row?.value) + n;
+          data.set(key, { value: next, exp: row?.exp });
+          return next;
+        },
+        zadd(key: string, score: number, member: string) {
+          const z = zsets.get(key) ?? new Map<string, number>();
+          z.set(member, score);
+          zsets.set(key, z);
+        },
+        zrem(key: string, member: string) {
+          zsets.get(key)?.delete(member);
+        },
+        zrangebyscore(key: string, min: number, max: number) {
+          const z = zsets.get(key);
+          if (!z) return [];
+          return [...z.entries()]
+            .filter(([, score]) => score >= min && score <= max)
+            .sort((a, b) => a[1] - b[1])
+            .map(([member]) => member);
+        },
+      };
+      return Promise.resolve(dispatchMemoryEval(sync, script, keys, args));
     },
     dump() {
       const out = new Map<string, unknown>();

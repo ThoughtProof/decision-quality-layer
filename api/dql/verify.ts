@@ -34,7 +34,17 @@ import { StubCascade } from '../../src/engine/cascade.js';
 import type { Cascade } from '../../src/engine/cascade.js';
 import { SandboxCascade } from '../../src/engine/sandbox-cascade.js';
 import { authorizeCall, extractApiKey, parseApiKeys } from '../../src/auth/keys.js';
+import {
+  authorizeVerifyWithAccount,
+  commitVerifyReservation,
+  extractAccountToken,
+  persistMeterPending,
+  releaseVerifyReservation,
+  reserveVerifyWithAccount,
+} from '../../src/auth/account.js';
 import { createKeyStore } from '../../src/auth/key-store.js';
+import { generateVerifyRequestId, resolveVerifyRequestId } from '../../src/auth/request-id.js';
+import { verifyPayloadDigest } from '../../src/auth/verify-payload.js';
 import { createUsageGate, emitUsageLine } from '../../src/auth/usage.js';
 import { emitStripeMeterEvent, loadStripeMeterConfig } from '../../src/auth/stripe-meter.js';
 import {
@@ -107,7 +117,21 @@ const USAGE_GATE = createUsageGate(process.env);
 const KEY_STORE = createKeyStore(process.env);
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const requestId = `dql_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const resolvedId = resolveVerifyRequestId(req.headers as Record<string, unknown>);
+  const requestId = resolvedId.kind === 'ok' ? resolvedId.id : generateVerifyRequestId();
+  type AccountHold = {
+    requestId: string;
+    keyHash: string;
+    fence: number;
+    billing?: import('../../src/auth/keys.js').AllowBilling;
+  };
+  let accountHold: AccountHold | null = null;
+  let accountReplay: {
+    result: unknown;
+    billing?: import('../../src/auth/keys.js').AllowBilling;
+    meter?: import('../../src/auth/key-store.js').VerifyReservation['meter'];
+  } | null = null;
+  let accountMeterPending: { result: unknown; hold: AccountHold } | null = null;
 
   // v0.4.3.1 §C+integration: per-request diagnostics collector, created ONLY
   // when the runtime is a valid production bundle AND diagnostics_on=true.
@@ -141,7 +165,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-DQL-Key, PAYMENT-SIGNATURE, Payment-Signature',
+      'Content-Type, Authorization, X-DQL-Key, X-DQL-Account, Idempotency-Key, X-Request-Id, PAYMENT-SIGNATURE, Payment-Signature',
     );
     res.setHeader(
       'Access-Control-Expose-Headers',
@@ -166,7 +190,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).end();
     }
 
-    if (req.method !== 'POST') {
+    if (resolvedId.kind === 'invalid') {
+      status = 400;
+      payload = {
+        error: 'Idempotency-Key must be 8–128 characters of [A-Za-z0-9._:-] and must not look like a secret.',
+        code: 'INVALID_IDEMPOTENCY_KEY',
+      };
+    } else if (req.method !== 'POST') {
       status = 405;
       payload = { error: 'Method not allowed', code: 'METHOD_NOT_ALLOWED', allowed: ['POST'] };
     } else {
@@ -186,6 +216,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           (req.body as { sandbox?: unknown } | undefined)?.sandbox === true;
         const headers = req.headers as Record<string, unknown>;
         const presentedKey = extractApiKey(headers);
+        const accountToken = extractAccountToken(headers);
+        const verifyKey = presentedKey && presentedKey.startsWith('dqlk_') ? presentedKey : null;
 
         type AuthPath =
           | { kind: 'free_sandbox' }
@@ -193,7 +225,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               kind: 'allow';
               key: string;
               record: import('../../src/auth/keys.js').ApiKeyRecord;
-              billing: import('../../src/auth/keys.js').AllowBilling;
+              billing?: import('../../src/auth/keys.js').AllowBilling;
+              via?: 'key' | 'account';
             }
           | { kind: 'x402_verified'; ctx: X402PaymentContext }
           | { kind: 'deny'; status: number; payload: object };
@@ -219,7 +252,52 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           };
         } else if (isSandbox) {
           authPath = { kind: 'free_sandbox' };
+        } else if (verifyKey) {
+          const auth = await authorizeCall({
+            headers,
+            sandbox: false,
+            keys: API_KEYS,
+            usage: USAGE_GATE,
+            store: KEY_STORE ?? undefined,
+          });
+          if (auth.kind === 'deny') {
+            authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
+          } else if (auth.kind === 'allow') {
+            authPath = { kind: 'allow', key: auth.key, record: auth.record, billing: auth.billing };
+          } else {
+            authPath = { kind: 'free_sandbox' };
+          }
+        } else if (accountToken) {
+          // App-credential path: `dqla_…` bills the bound ledger. Never returns `dqlk_…`.
+          if (!KEY_STORE) {
+            authPath = {
+              kind: 'deny',
+              status: 503,
+              payload: {
+                error: 'Account store unavailable',
+                code: 'ACCOUNT_UNAVAILABLE',
+              },
+            };
+          } else {
+            const auth = await authorizeVerifyWithAccount({
+              headers,
+              store: KEY_STORE,
+            });
+            if (auth.kind === 'deny') {
+              authPath = { kind: 'deny', status: auth.status, payload: auth.payload as object };
+            } else if (auth.kind === 'allow') {
+              authPath = {
+                kind: 'allow',
+                key: auth.key,
+                record: auth.record,
+                via: 'account',
+              };
+            } else {
+              authPath = { kind: 'free_sandbox' };
+            }
+          }
         } else if (presentedKey) {
+          // `X-DQL-Key: dqla_…` (or other non-dqlk_ value) — not an account token.
           const auth = await authorizeCall({
             headers,
             sandbox: false,
@@ -265,13 +343,140 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           }
         }
 
+        if (authPath.kind === 'allow' && authPath.via === 'account') {
+          // Admission: reserve credit + daily-cap BEFORE verify / CONFIG_INVALID.
+          if (!KEY_STORE) {
+            authPath = {
+              kind: 'deny',
+              status: 503,
+              payload: {
+                error: 'Account store unavailable',
+                code: 'ACCOUNT_UNAVAILABLE',
+              },
+            };
+          } else {
+            const reserved = await reserveVerifyWithAccount({
+              requestId,
+              keyHash: authPath.key,
+              payloadDigest: verifyPayloadDigest(validatedRequest!),
+              record: authPath.record,
+              store: KEY_STORE,
+            });
+            if (reserved.kind === 'deny') {
+              authPath = { kind: 'deny', status: reserved.status, payload: reserved.payload as object };
+            } else if (reserved.kind === 'replay') {
+              authPath = {
+                kind: 'allow',
+                key: reserved.key,
+                record: reserved.record,
+                billing: reserved.billing,
+                via: 'account',
+              };
+              accountReplay = {
+                result: reserved.result,
+                billing: reserved.billing,
+                meter: reserved.reservation.meter,
+              };
+            } else if (reserved.kind === 'meter_pending') {
+              authPath = {
+                kind: 'allow',
+                key: reserved.key,
+                record: reserved.record,
+                billing: reserved.billing,
+                via: 'account',
+              };
+              accountMeterPending = {
+                result: reserved.result,
+                hold: {
+                  requestId,
+                  keyHash: reserved.reservation.keyHash,
+                  fence: reserved.reservation.fence,
+                  billing: reserved.billing,
+                },
+              };
+            } else if (reserved.kind === 'execute') {
+              authPath = {
+                kind: 'allow',
+                key: reserved.key,
+                record: reserved.record,
+                billing: reserved.billing,
+                via: 'account',
+              };
+              accountHold = {
+                requestId,
+                keyHash: reserved.reservation.keyHash,
+                fence: reserved.reservation.fence,
+                billing: reserved.billing,
+              };
+            }
+          }
+        }
+
         if (authPath.kind === 'deny') {
           status = authPath.status;
           payload = authPath.payload;
+        } else if (accountReplay) {
+          if (accountReplay.result == null) {
+            status = 503;
+            payload = {
+              error: 'Idempotent replay is missing a stored result.',
+              code: 'IDEMPOTENCY_RESULT_MISSING',
+            };
+          } else {
+            applyAccountBillingHeaders(res, accountReplay.billing);
+            if (accountReplay.billing === 'payg' || accountReplay.meter === 'ok') {
+              res.setHeader('X-DQL-Meter', 'ok');
+            }
+            status = 200;
+            payload = accountReplay.result;
+          }
+        } else if (accountMeterPending && KEY_STORE && authPath.kind === 'allow') {
+          if (accountMeterPending.result == null) {
+            status = 503;
+            payload = {
+              error: 'Stored verify result is missing; meter cannot be retried.',
+              code: 'IDEMPOTENCY_RESULT_MISSING',
+            };
+          } else {
+            const metered = await meterAccountPayg({
+              requestId,
+              record: authPath.record,
+              store: KEY_STORE,
+            });
+            if (metered !== 'ok') {
+              status = 503;
+              payload = meterUnavailablePayload();
+            } else {
+              const acked = await acknowledgeCommit({
+                hold: accountMeterPending.hold,
+                store: KEY_STORE,
+                result: accountMeterPending.result,
+                meter: 'ok',
+              });
+              if (!acked) {
+                status = 503;
+                payload = commitUnavailablePayload();
+              } else {
+                applyAccountBillingHeaders(res, accountMeterPending.hold.billing);
+                res.setHeader('X-DQL-Meter', 'ok');
+                status = 200;
+                payload = accountMeterPending.result;
+              }
+            }
+          }
         } else if (RUNTIME.kind === 'error') {
           // v0.4.3.1 hardening (Hermes Blocker 1): if the cold-start
           // resolver failed for a Live-configured deploy, EVERY POST
           // returns 503, including sandbox=true. Never settle on config fail.
+          if (accountHold && KEY_STORE) {
+            await releaseVerifyReservation({
+              requestId: accountHold.requestId,
+              keyHash: accountHold.keyHash,
+              fence: accountHold.fence,
+              store: KEY_STORE,
+            });
+            accountHold = null;
+          }
           status = 503;
           payload = {
             error: 'Runtime not initialised',
@@ -296,8 +501,62 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               : {}),
           });
 
+          // Account PAYG: persist result as meter_pending, then meter, then
+          // commit. A failed meter must not discard the engine result or
+          // release the debit — retry remeters only.
+          if (accountHold && KEY_STORE && accountHold.billing === 'payg' && authPath.kind === 'allow') {
+            const pending = await persistMeterPending({
+              requestId: accountHold.requestId,
+              keyHash: accountHold.keyHash,
+              fence: accountHold.fence,
+              store: KEY_STORE,
+              result: response,
+            });
+            if (pending !== 'pending') {
+              status = 503;
+              payload = commitUnavailablePayload();
+            } else {
+              const metered = await meterAccountPayg({
+                requestId,
+                record: authPath.record,
+                store: KEY_STORE,
+              });
+              if (metered !== 'ok') {
+                status = 503;
+                payload = meterUnavailablePayload();
+              } else {
+                const acked = await acknowledgeCommit({
+                  hold: accountHold,
+                  store: KEY_STORE,
+                  result: response,
+                  meter: 'ok',
+                });
+                if (!acked) {
+                  status = 503;
+                  payload = commitUnavailablePayload();
+                } else {
+                  accountHold = null;
+                  res.setHeader('X-DQL-Meter', 'ok');
+                }
+              }
+            }
+          } else if (accountHold && KEY_STORE) {
+            const acked = await acknowledgeCommit({
+              hold: accountHold,
+              store: KEY_STORE,
+              result: response,
+              meter: 'n/a',
+            });
+            if (!acked) {
+              status = 503;
+              payload = commitUnavailablePayload();
+            } else {
+              accountHold = null;
+            }
+          }
+
           // 4) Payment settle / Stripe meter ONLY after successful DQL.
-          if (authPath.kind === 'allow') {
+          if (authPath.kind === 'allow' && status === 200 && payload === null) {
             const price = priceForCall({
               sandbox: false,
               dev_access: authPath.record.dev_access,
@@ -323,7 +582,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             // already delivered — do not convert 200 → 5xx. Idempotency-Key
             // = requestId allows safe retry of failed meter posts.
             // Prepaid credit calls must not also emit a meter event.
-            if (!authPath.record.dev_access && !usedCredit && price > 0) {
+            // Account PAYG already metered (and fail-closed) before commit.
+            if (
+              !authPath.record.dev_access &&
+              !usedCredit &&
+              price > 0 &&
+              !(authPath.via === 'account' && authPath.billing === 'payg')
+            ) {
               const meterCfg = loadStripeMeterConfig();
               const customerId =
                 authPath.record.stripe_customer_id ??
@@ -387,23 +652,98 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               status = 200;
               payload = response;
             }
-          } else {
-            // sandbox
+          } else if (authPath.kind === 'free_sandbox') {
             res.setHeader('X-DQL-Billing', 'sandbox');
             res.setHeader('X-DQL-Price-Usd', '0.00');
             status = 200;
             payload = response;
           }
+          // Account reserve deny (402/429/503) already set status+payload before verify.
         }
       }
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
+    if (accountHold && KEY_STORE) {
+      try {
+        await releaseVerifyReservation({
+          requestId: accountHold.requestId,
+          keyHash: accountHold.keyHash,
+          fence: accountHold.fence,
+          store: KEY_STORE,
+        });
+      } catch {
+        // Release must not mask the original failure.
+      }
+      accountHold = null;
+    }
     status = 500;
-    payload = { error: 'Internal server error', code: 'INTERNAL_ERROR', details: message };
+    payload = { error: 'Internal server error', code: 'INTERNAL_ERROR' };
   }
 
   return sendJsonWithDiagnostics(res, collector, status, payload);
+}
+
+function meterUnavailablePayload(): Record<string, unknown> {
+  return {
+    error: 'Pay-as-you-go meter unavailable. The verify result is stored; retry remeters only.',
+    code: 'METER_UNAVAILABLE',
+    no_freemium: true,
+  };
+}
+
+function commitUnavailablePayload(): Record<string, unknown> {
+  return {
+    error: 'Verify result could not be durably committed. Retry the same Idempotency-Key.',
+    code: 'COMMIT_UNAVAILABLE',
+    no_freemium: true,
+  };
+}
+
+async function meterAccountPayg(opts: {
+  requestId: string;
+  record: import('../../src/auth/keys.js').ApiKeyRecord;
+  store: NonNullable<typeof KEY_STORE>;
+}): Promise<'ok' | 'unavailable'> {
+  const price = priceForCall({ sandbox: false, dev_access: opts.record.dev_access });
+  const meterCfg = loadStripeMeterConfig();
+  const customerId =
+    opts.record.stripe_customer_id ??
+    meterCfg.customerByOwner.get(opts.record.owner) ??
+    (await opts.store.getCustomerByOwner(opts.record.owner));
+  const meter = await emitStripeMeterEvent({
+    requestId: opts.requestId,
+    owner: opts.record.owner,
+    customerId,
+    priceUsd: price,
+    config: meterCfg,
+  });
+  return meter.kind === 'ok' ? 'ok' : 'unavailable';
+}
+
+async function acknowledgeCommit(opts: {
+  hold: { requestId: string; keyHash: string; fence: number };
+  store: NonNullable<typeof KEY_STORE>;
+  result: unknown;
+  meter: import('../../src/auth/key-store.js').VerifyReservation['meter'];
+}): Promise<boolean> {
+  const acked = await commitVerifyReservation({
+    requestId: opts.hold.requestId,
+    keyHash: opts.hold.keyHash,
+    fence: opts.hold.fence,
+    store: opts.store,
+    result: opts.result,
+    meter: opts.meter,
+  });
+  return acked === 'committed';
+}
+
+function applyAccountBillingHeaders(
+  res: VercelResponse,
+  billing: import('../../src/auth/keys.js').AllowBilling | undefined,
+): void {
+  const usedCredit = billing === 'credit';
+  res.setHeader('X-DQL-Billing', usedCredit ? 'credit' : 'metered');
+  res.setHeader('X-DQL-Price-Usd', usedCredit ? '0.00' : PRICE_USD_PER_CALL.toFixed(2));
 }
 
 /**

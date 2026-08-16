@@ -73,6 +73,8 @@ Enforced on every non-sandbox `POST /dql/verify` (see `docs/PAYMENT.md`).
 | `DQL_API_KEYS` | **yes in prod** for bootstrap keys | JSON object of API keys (canary / guardian-pwa / manual `dev_access`). Auth is **env ∪ Upstash store** — self-serve minted keys do **not** need to be pasted here. Empty env + empty store → every non-sandbox call returns **402 PAYMENT_REQUIRED**. Format: `{"dqlk_<hex>":{"owner":"name","dev_access":true,"daily_cap":500}}`. `dev_access:true` → free (manual grant). `dev_access:false` → billable. |
 | `UPSTASH_REDIS_REST_URL` | prod (caps + store) | Daily-cap brake (`dql:usage:…`) **and** persisted self-serve key records (`dql:key:<sha256>`). Absent → cap disabled; store-minted keys cannot be validated (env keys still work). |
 | `UPSTASH_REDIS_REST_TOKEN` | pair with URL | Pair with URL above. |
+| `DQL_CRON_SECRET` or `CRON_SECRET` | prod (reservation sweep) | Bearer token for `GET|POST /dql/internal/sweep-reservations`. Vercel Cron sends `Authorization: Bearer $CRON_SECRET` when `CRON_SECRET` is set. Fail closed if neither secret is configured. Also a **GitHub Actions repo secret** for the 15-minute sweep workflow. |
+| `DQL_SWEEP_URL` | GitHub Actions | Repo secret: absolute URL of the sweep route. Documented default (set the secret; the workflow does not hardcode it): `https://dql.thoughtproof.ai/dql/internal/sweep-reservations`. Missing secret fails the job. |
 
 ### Stripe meter (P2 Rail A — default OFF)
 
@@ -113,9 +115,17 @@ Self-serve keys are always `dev_access: false`. PAYG is **opt-in** (`payg_opt_in
 
 Post-purchase account routes (`GET /dql/account`, `POST /dql/account/portal|rotate|revoke`) authenticate with `X-DQL-Account: dqla_…` or `Authorization: Bearer dqla_…`. They do **not** turn on Checkout. The account token is not accepted as `X-DQL-Key`.
 
+`POST /dql/verify` also accepts that same account header: `X-DQL-Account: dqla_…` or `Authorization: Bearer dqla_…`. Admission **atomically reserves** prepaid credit (or confirmed PAYG) and daily-cap **before** the engine runs (one Redis Lua EVAL). Redis keys are namespaced per account (`dql:reserve:<keyHash>:<requestId>`), so two customers may reuse an ordinary Idempotency-Key such as `client-1` independently. The reservation is bound to **payload digest** of every field the engine reads (`mandate`, `proposed_action`, `reasoning`, `axes`, `sandbox`, `context`, `structured_context`, `gate_mode`). Same account, different digest → **409** `IDEMPOTENCY_PAYLOAD_MISMATCH`. In-flight same id+payload → **409** `IDEMPOTENCY_IN_PROGRESS` (engine does not run again). `committed` replay returns the **stored result** (no second engine, no second debit). Each hold issues a fencing token; stale `commit`/`release` no-op if the fence does not match.
+
+**Lease / crash recovery:** credit + cap are taken at reserve. The execution lease is 15 minutes; the reservation record is kept 7 days so a stale `held` can be refunded. **Primary production recovery** is GitHub Actions (`.github/workflows/sweep-reservations.yml`) on `*/15 * * * *` plus `workflow_dispatch`, POSTing `/dql/internal/sweep-reservations` with `Authorization: Bearer` from repo secrets `CRON_SECRET` or `DQL_CRON_SECRET`, and `DQL_SWEEP_URL` (documented default `https://dql.thoughtproof.ai/dql/internal/sweep-reservations` — set the secret; do not hardcode it). Missing secrets or a non-2xx sweep response fail the job. **Backup:** Vercel Cron `0 6 * * *` (06:00 UTC) in `vercel.json`. Hobby accounts allow **once-daily** crons only; do not put `*/5` (or any more-than-daily schedule) in `vercel.json` — that needs Vercel Pro and breaks this project's deploy. Sweep EVAL/Redis failure is **503** `SWEEP_UNAVAILABLE` (not `200 { ok: true, refunded: 0 }`). Sweep refunds expired `held` rows without the client retrying that id. It does not refund `meter_pending`. CONFIG_INVALID / thrown verify still **release** immediately (matching fence only). Commit EVAL failure is **503** `COMMIT_UNAVAILABLE` — not a 200 and not a durable fake commit.
+
+**PAYG:** after a successful engine run the result is stored as `meter_pending` (debit stays). Meter off/failed/skipped → **503** `METER_UNAVAILABLE`; retry with the same id + digest remeters only (engine stays at 1). Meter ok → commit. Prepaid `credit` path: debit at reserve, commit after success (commit must be acknowledged).
+
+Optional `Idempotency-Key` or a validated `X-Request-Id` is the reservation id (echoed on `X-Request-Id`); omit it and the server generates one. The verify response never includes the raw `dqlk_…`. Invalid/missing token → **401**. Exhausted credits → existing **402** (engine is not invoked). `dqla_…` pasted as `X-DQL-Key` is still rejected. This is an app-credential path for bots/MCP clients — not a self-serve product claim and it does not flip `DQL_CHECKOUT_ENABLED`.
+
 See `docs/PAYMENT.md` § Checkout / webhook, § Post-purchase account API, and § Prepaid packs. Do not claim `SELF_SERVE_LIVE=true` and do not claim a live self-serve product until the flag is on and smoked.
 
-Header: `X-DQL-Key: dqlk_...` (verify) or `X-DQL-Account: dqla_...` (account). Alias for either: `Authorization: Bearer`.
+Header: `X-DQL-Key: dqlk_...` (verify) or `X-DQL-Account: dqla_...` (account **and** verify). Alias for either: `Authorization: Bearer` (prefix selects the path: `dqlk_` vs `dqla_`).
 
 ### x402 (P2 Rail B — default OFF)
 
@@ -132,7 +142,7 @@ When enabled but **not ready** (flag on, no CDP, no facilitator URL): `503 PAYME
 
 Payment sequence: validate → verify authorization → DQL → settle → respond. Settlement timeouts return `PAYMENT_STATUS_UNKNOWN` (do not claim "not charged").
 
-Header: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or `Authorization: Bearer dqlk_...`.
+Header: `X-DQL-Key: dqlk_...` (primary, CORS-allowed) or `Authorization: Bearer dqlk_...`. Account token: `X-DQL-Account: dqla_...` (CORS-allowed) or `Authorization: Bearer dqla_...`. Optional `Idempotency-Key` / `X-Request-Id` (CORS-allowed) is the account-path reservation id.
 
 Sandbox (`{"sandbox":true}`) stays free and keyless.
 

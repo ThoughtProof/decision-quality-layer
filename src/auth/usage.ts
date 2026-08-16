@@ -20,12 +20,15 @@
 
 import { Redis } from '@upstash/redis';
 import type { UsageGate } from './keys.js';
-import { fingerprintKey, usageRedisKeyId } from './key-hash.js';
+import { fingerprintAccountToken, fingerprintKey, sha256Hex, usageRedisKeyId } from './key-hash.js';
 
 export { fingerprintKey, usageRedisKeyId } from './key-hash.js';
 
 export class NoopUsageGate implements UsageGate {
   async checkAndRecord(_key: string, _cap: number): Promise<boolean> {
+    return true;
+  }
+  async checkAndRecordFromHash(_keyHash: string, _cap: number): Promise<boolean> {
     return true;
   }
 }
@@ -49,8 +52,12 @@ export class UpstashUsageGate implements UsageGate {
   ) {}
 
   async checkAndRecord(key: string, cap: number): Promise<boolean> {
+    return this.checkAndRecordFromHash(sha256Hex(key), cap);
+  }
+
+  async checkAndRecordFromHash(keyHash: string, cap: number): Promise<boolean> {
     const day = this.now().toISOString().slice(0, 10); // UTC day
-    const redisKey = usageCounterKey(key, day);
+    const redisKey = usageCounterKeyFromHash(keyHash, day);
     try {
       const count = await this.redis.incr(redisKey);
       if (count === 1) {
@@ -90,6 +97,13 @@ export function createUsageGate(env: NodeJS.ProcessEnv): UsageGate {
  * last 4 characters of the key — enough to correlate/deduplicate a specific
  * key across log lines for ops purposes, without ever reconstructing it.
  */
+/** Log-safe id. Never emits plaintext `dqlk_…` or `dqla_…`. */
+export function usageFingerprint(value: string): string {
+  if (value.startsWith('dqla_')) return fingerprintAccountToken(value);
+  if (value.startsWith('dqlk_')) return fingerprintKey(value);
+  return value.length > 16 ? `${value.slice(0, 12)}…${value.slice(-4)}` : `${value.slice(0, 12)}…`;
+}
+
 export function emitUsageLine(opts: {
   requestId: string;
   key: string;
@@ -103,7 +117,7 @@ export function emitUsageLine(opts: {
     JSON.stringify({
       type: 'dql_usage',
       request_id: opts.requestId,
-      key_fingerprint: fingerprintKey(opts.key),
+      key_fingerprint: usageFingerprint(opts.key),
       owner: opts.owner,
       dev_access: opts.devAccess,
       price_usd: opts.priceUsd,

@@ -13,6 +13,12 @@
       "maxDuration": 300
     }
   },
+  "crons": [
+    {
+      "path": "/dql/internal/sweep-reservations",
+      "schedule": "0 6 * * *"
+    }
+  ],
   "headers": [
     {
       "source": "/(.*)",

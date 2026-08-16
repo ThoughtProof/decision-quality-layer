@@ -13,7 +13,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 /**
  * Shared response-header block for every status code the verify handler
- * produces itself (200/400/405/413/415/500). The config-invalid 503 path
+ * produces itself (200/400/401/405/413/415/500). The config-invalid 503 path
  * deliberately declares only X-DQL-Version + X-Request-Id — on that path no
  * diagnostics collector exists (v5 delta, R4).
  */
@@ -36,7 +36,7 @@ const spec = {
     // bare `guidance` is not a valid OpenAPI 3.1 info property and fails
     // strict 3.1 validation (unevaluatedProperties). Content unchanged.
     'x-guidance':
-      'POST /dql/verify with (mandate, proposed_action, reasoning, context?) to receive per-axis verdicts plus an aggregate. Set `sandbox: true` in the body for a free deterministic mock response — useful for integration testing against the schema. GET /dql/axes for axis metadata (question and failure mode per axis). Live rails: X-DQL-Key (env ∪ Upstash store), Stripe meter dql_verify_call, x402 on Base. Public Checkout key-mint and the post-purchase account API are code-complete behind DQL_CHECKOUT_ENABLED (default off) — merge does not enable the flag and is not a live self-serve claim.',
+      'POST /dql/verify with (mandate, proposed_action, reasoning, context?) to receive per-axis verdicts plus an aggregate. Set `sandbox: true` in the body for a free deterministic mock response — useful for integration testing against the schema. GET /dql/axes for axis metadata (question and failure mode per axis). Live rails: X-DQL-Key (env ∪ Upstash store) or X-DQL-Account / Bearer dqla_… (bills the bound prepaid ledger; never returns dqlk_…), Stripe meter dql_verify_call, x402 on Base. Public Checkout key-mint and the post-purchase account API are code-complete behind DQL_CHECKOUT_ENABLED (default off) — merge does not enable the flag and is not a live self-serve claim.',
     contact: {
       url: 'https://thoughtproof.ai',
       email: 'support@thoughtproof.ai',
@@ -52,14 +52,32 @@ const spec = {
       description: 'Production',
     },
   ],
-  security: [{ dqlKey: [] }, {}],
+  security: [{ dqlKey: [] }, { dqlAccount: [] }, {}],
   paths: {
     '/dql/verify': {
       post: {
         operationId: 'dqlVerify',
         summary: 'Verify a proposed agent action across five axes',
         description:
-          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md.',
+          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md. Auth: `X-DQL-Key: dqlk_…` (unchanged) or `X-DQL-Account: dqla_…` / `Authorization: Bearer dqla_…` (bills the bound credit ledger; response never includes the raw verify key). `dqla_…` is not accepted as `X-DQL-Key`. Invalid/missing account token → 401. Exhausted credits → 402 before the engine. Account path: per-account reserve + fencing token + full request digest; in-progress → 409; payload mismatch → 409; committed replay returns the stored result; PAYG meter failure stores meter_pending and remeters on retry. Optional `Idempotency-Key` / validated `X-Request-Id` is the reservation id. Not a self-serve product claim.',
+        parameters: [
+          {
+            name: 'Idempotency-Key',
+            in: 'header',
+            required: false,
+            description:
+              'Optional client idempotency key for account-token verify admission. Charset [A-Za-z0-9._:-], length 8–128. Namespaced per account and bound to the full request digest. Echoed as X-Request-Id. In-progress → 409; different payload → 409; committed replay returns the stored result. Two accounts may reuse the same ordinary key. Values that look like secrets (`dqlk_`, `dqla_`, `sk_…`) are rejected (400 INVALID_IDEMPOTENCY_KEY).',
+            schema: { type: 'string', minLength: 8, maxLength: 128 },
+          },
+          {
+            name: 'X-Request-Id',
+            in: 'header',
+            required: false,
+            description:
+              'Optional client request id used as the reservation id when Idempotency-Key is absent and the value passes the same charset/length checks. Invalid values are ignored and the server generates an id. Echoed on the response X-Request-Id.',
+            schema: { type: 'string' },
+          },
+        ],
         requestBody: {
           required: true,
           content: {
@@ -102,6 +120,16 @@ const spec = {
           },
           '400': {
             description: 'Validation failed',
+            headers: verifyResponseHeaders,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/DqlError' },
+              },
+            },
+          },
+          '401': {
+            description:
+              'Missing or invalid account token (`X-DQL-Account` / `Authorization: Bearer dqla_…`). Code `ACCOUNT_UNAUTHORIZED`.',
             headers: verifyResponseHeaders,
             content: {
               'application/json': {
@@ -345,12 +373,12 @@ const spec = {
       },
       DqlRequestId: {
         description:
-          'Server-generated request correlation id; identical to DqlResponse.id and DiagnosticsSnapshot.requestId. Incoming X-Request-Id headers are ignored — the id is never echoed from the caller.',
+          'Request correlation id; identical to DqlResponse.id and DiagnosticsSnapshot.requestId. Echoes a valid client `Idempotency-Key` or `X-Request-Id` when present; otherwise a server-generated `dql_…` id. Used as the account-path reservation id.',
         schema: {
           // R3: opaker String-Vertrag, KEIN pattern — der Generator kann im
           // Randfall (Math.random() === 0) einen leeren Suffix erzeugen.
           type: 'string',
-          description: 'Server-generated opaque id with dql_ prefix.',
+          description: 'Opaque request id (client idempotency key or server-generated dql_ prefix).',
           example: 'dql_abc123_x7k9p2',
         },
       },
@@ -384,14 +412,14 @@ const spec = {
         in: 'header',
         name: 'X-DQL-Key',
         description:
-          'DQL API key (`dqlk_…`). Dev-access keys are granted manually (free). Self-serve keys are billable ($0.05/call) when Checkout is enabled. Alias: Authorization: Bearer. Contact support@thoughtproof.ai for dev access. Account tokens (`dqla_…`) are not accepted here.',
+          'DQL API key (`dqlk_…`). Dev-access keys are granted manually (free). Self-serve keys are billable ($0.05/call) when Checkout is enabled. Alias: Authorization: Bearer dqlk_…. Contact support@thoughtproof.ai for dev access. Account tokens (`dqla_…`) are not accepted on this header — use `X-DQL-Account`.',
       },
       dqlAccount: {
         type: 'apiKey',
         in: 'header',
         name: 'X-DQL-Account',
         description:
-          'Post-purchase account session (`dqla_…`). Shown once on checkout reveal. Alias: Authorization: Bearer dqla_…. Not a verify key. Not a login product.',
+          'Post-purchase account session (`dqla_…`). Shown once on checkout reveal. Alias: Authorization: Bearer dqla_…. Authorizes `/dql/account` and `POST /dql/verify` (credits billed to the bound ledger; response never includes `dqlk_…`). Not accepted as `X-DQL-Key`. Not a login product.',
       },
     },
     schemas: {

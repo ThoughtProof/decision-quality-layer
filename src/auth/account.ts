@@ -3,7 +3,8 @@
  *
  * Identity after checkout is an account token (`dqla_…`), not the raw
  * `dqlk_…` verify key. The token is shown once on reveal; only its hash
- * is stored. Account token is never a verify key.
+ * is stored. Account token is never accepted as `X-DQL-Key`. It does
+ * authorize `POST /dql/verify` via `X-DQL-Account` / Bearer `dqla_…`.
  *
  * Merge ≠ flag-on ≠ self-serve product. These routes do not enable
  * `DQL_CHECKOUT_ENABLED`.
@@ -12,11 +13,14 @@
 import { fingerprintAccountToken, fingerprintKey, sha256Hex } from './key-hash.js';
 import {
   newStoredKeyRecord,
+  storedToAuthRecord,
   type KeyStore,
   type StoredKeyRecord,
 } from './key-store.js';
 import { generateApiKey } from './checkout.js';
 import { stripeFormRequest } from './stripe-http.js';
+import { PRICE_USD_PER_CALL } from '../pricing.js';
+import type { AuthDecision } from './keys.js';
 
 export const ACCOUNT_HEADER = 'X-DQL-Account';
 
@@ -63,6 +67,231 @@ export async function authorizeAccount(opts: {
   const record = await opts.store.lookupByAccountToken(token);
   if (!record) return { kind: 'unauthorized' };
   return { kind: 'ok', token, record };
+}
+
+const ACCOUNT_UNAUTHORIZED: AuthDecision = {
+  kind: 'deny',
+  status: 401,
+  payload: {
+    error: 'Valid account token required (X-DQL-Account or Authorization: Bearer dqla_…).',
+    code: 'ACCOUNT_UNAUTHORIZED',
+  },
+};
+
+/**
+ * Authorize `POST /dql/verify` with the post-purchase account token.
+ * Identity only: valid `dqla_…` + live (non-revoked) key hash.
+ * Does not consume credits or increment daily-cap — that is
+ * `reserveVerifyWithAccount` (admission) before `runVerification()`.
+ * Missing/invalid/revoked → 401. Never returns `dqlk_…`.
+ */
+export async function authorizeVerifyWithAccount(opts: {
+  headers: HeaderMap;
+  store: KeyStore;
+}): Promise<AuthDecision> {
+  const token = extractAccountToken(opts.headers);
+  if (!token) return ACCOUNT_UNAUTHORIZED;
+
+  const stored = await opts.store.lookupByAccountToken(token);
+  if (!stored || stored.revoked === true) return ACCOUNT_UNAUTHORIZED;
+
+  return {
+    kind: 'allow',
+    key: stored.hash,
+    record: storedToAuthRecord(stored),
+    via: 'account',
+  };
+}
+
+export type AccountReserveDecision =
+  | {
+      kind: 'execute';
+      key: string;
+      record: import('./keys.js').ApiKeyRecord;
+      billing: import('./keys.js').AllowBilling;
+      reservation: import('./key-store.js').VerifyReservation;
+    }
+  | {
+      kind: 'replay';
+      key: string;
+      record: import('./keys.js').ApiKeyRecord;
+      billing: import('./keys.js').AllowBilling;
+      reservation: import('./key-store.js').VerifyReservation;
+      result: unknown;
+    }
+  | {
+      kind: 'meter_pending';
+      key: string;
+      record: import('./keys.js').ApiKeyRecord;
+      billing: import('./keys.js').AllowBilling;
+      reservation: import('./key-store.js').VerifyReservation;
+      result: unknown;
+    }
+  | { kind: 'deny'; status: number; payload: Record<string, unknown> };
+
+/**
+ * Atomic pre-execution reservation of prepaid credit (or confirmed PAYG)
+ * and daily-cap (one Redis EVAL). Namespaced per account key hash + requestId
+ * + payload digest. Call before `runVerification()`.
+ *   execute        — new hold; caller may run the engine
+ *   replay         — committed; return stored result; do not run
+ *   meter_pending  — engine already done; retry meter only
+ *   deny 409       — in-progress (same account+payload) or payload mismatch
+ *   deny 403       — same namespaced key bound to another hash (defense in depth)
+ *   deny 402/429/503 — empty / quota / store error
+ */
+export async function reserveVerifyWithAccount(opts: {
+  requestId: string;
+  keyHash: string;
+  payloadDigest: string;
+  record: import('./keys.js').ApiKeyRecord;
+  store: KeyStore;
+  now?: Date;
+}): Promise<AccountReserveDecision> {
+  const result = await opts.store.reserveVerify({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    payloadDigest: opts.payloadDigest,
+    dailyCap: opts.record.daily_cap,
+    paygOptIn: opts.record.payg_opt_in === true,
+    now: opts.now,
+  });
+  if (result.kind === 'ok') {
+    return {
+      kind: 'execute',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: result.reservation.billing,
+      reservation: result.reservation,
+    };
+  }
+  if (result.kind === 'replay') {
+    return {
+      kind: 'replay',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: result.reservation.billing,
+      reservation: result.reservation,
+      result: result.reservation.result,
+    };
+  }
+  if (result.kind === 'meter_pending') {
+    return {
+      kind: 'meter_pending',
+      key: opts.keyHash,
+      record: opts.record,
+      billing: result.reservation.billing,
+      reservation: result.reservation,
+      result: result.reservation.result,
+    };
+  }
+  if (result.kind === 'in_progress') {
+    return {
+      kind: 'deny',
+      status: 409,
+      payload: {
+        error: 'A verify with this Idempotency-Key is already in progress.',
+        code: 'IDEMPOTENCY_IN_PROGRESS',
+      },
+    };
+  }
+  if (result.kind === 'conflict') {
+    if (result.reason === 'account') {
+      return {
+        kind: 'deny',
+        status: 403,
+        payload: {
+          error: 'This Idempotency-Key is bound to another account.',
+          code: 'IDEMPOTENCY_KEY_BOUND',
+        },
+      };
+    }
+    return {
+      kind: 'deny',
+      status: 409,
+      payload: {
+        error: 'Idempotency-Key was used with a different verify payload.',
+        code: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+      },
+    };
+  }
+  if (result.kind === 'quota') {
+    return {
+      kind: 'deny',
+      status: 429,
+      payload: {
+        error: `Daily cap of ${opts.record.daily_cap} calls exceeded for this key.`,
+        code: 'QUOTA_EXCEEDED',
+        retry_after: 'next UTC day',
+      },
+    };
+  }
+  if (result.kind === 'error') {
+    return {
+      kind: 'deny',
+      status: 503,
+      payload: {
+        error: 'Credit ledger unavailable.',
+        code: 'CREDITS_UNAVAILABLE',
+        no_freemium: true,
+      },
+    };
+  }
+  return {
+    kind: 'deny',
+    status: 402,
+    payload: {
+      error: 'Prepaid credits exhausted. Opt in to pay-as-you-go or buy a credit pack.',
+      code: 'CREDITS_EXHAUSTED',
+      price_usd_per_call: PRICE_USD_PER_CALL,
+      no_freemium: true,
+    },
+  };
+}
+
+export async function commitVerifyReservation(opts: {
+  requestId: string;
+  keyHash: string;
+  fence: number;
+  store: KeyStore;
+  result?: unknown;
+  meter?: import('./key-store.js').VerifyReservation['meter'];
+}): Promise<import('./key-store.js').CommitReservationAck> {
+  return opts.store.commitVerifyReservation({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    fence: opts.fence,
+    result: opts.result,
+    meter: opts.meter,
+  });
+}
+
+export async function persistMeterPending(opts: {
+  requestId: string;
+  keyHash: string;
+  fence: number;
+  store: KeyStore;
+  result: unknown;
+}): Promise<import('./key-store.js').PersistPendingAck> {
+  return opts.store.persistMeterPending({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    fence: opts.fence,
+    result: opts.result,
+  });
+}
+
+export async function releaseVerifyReservation(opts: {
+  requestId: string;
+  keyHash: string;
+  fence: number;
+  store: KeyStore;
+}): Promise<import('./key-store.js').ReleaseReservationAck> {
+  return opts.store.releaseVerifyReservation({
+    requestId: opts.requestId,
+    keyHash: opts.keyHash,
+    fence: opts.fence,
+  });
 }
 
 export interface AccountSnapshot {
