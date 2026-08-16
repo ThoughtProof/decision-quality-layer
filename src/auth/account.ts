@@ -305,6 +305,8 @@ export interface AccountSnapshot {
   usage_today: number;
   daily_cap: number;
   email_masked: string;
+  /** Full email for the authenticated owner only (top-up / portal UX). */
+  email?: string;
   revoked: boolean;
 }
 
@@ -317,6 +319,7 @@ export async function getAccountSnapshot(opts: {
     opts.store.creditBalance(opts.record.hash),
     opts.store.usageToday(opts.record.hash, opts.now),
   ]);
+  const email = (opts.record.email_normalized ?? '').trim().toLowerCase();
   return {
     key_prefix: opts.record.prefix,
     credits,
@@ -324,7 +327,9 @@ export async function getAccountSnapshot(opts: {
     payg_opt_in: opts.record.payg_opt_in === true,
     usage_today,
     daily_cap: opts.record.daily_cap,
-    email_masked: maskEmail(opts.record.email_normalized),
+    email_masked: maskEmail(email),
+    // Authenticated account session — owner may see their own address for top-up.
+    email: email || undefined,
     revoked: opts.record.revoked === true,
   };
 }
@@ -543,7 +548,8 @@ export async function requestAccountLogin(opts: {
 
   const base = opts.appBaseUrl.replace(/\/$/, '');
   const link = `${base}/account?login=${encodeURIComponent(loginToken)}`;
-  const from = (opts.fromEmail ?? '').trim() || 'ThoughtProof <raul@thoughtproof.ai>';
+  const from =
+    (opts.fromEmail ?? '').trim() || 'ThoughtProof <noreply@thoughtproof.ai>';
 
   const sent = await sendLoginEmail({
     apiKey: resendKey,
