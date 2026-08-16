@@ -547,7 +547,8 @@ export async function requestAccountLogin(opts: {
   });
 
   const base = opts.appBaseUrl.replace(/\/$/, '');
-  const link = `${base}/account?login=${encodeURIComponent(loginToken)}`;
+  // Server-side exchange route — email clients must not depend on client JS.
+  const link = `${base}/api/account/login?login=${encodeURIComponent(loginToken)}`;
   const from =
     (opts.fromEmail ?? '').trim() || 'ThoughtProof <noreply@thoughtproof.ai>';
 
