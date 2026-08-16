@@ -530,6 +530,12 @@ async function applyToExistingKey(opts: {
     opts.rec.email_normalized = opts.emailNormalized;
     await opts.store.putKey(opts.rec);
   }
+  if (opts.emailNormalized || opts.rec.email_normalized) {
+    await opts.store.putEmailIndex(
+      opts.emailNormalized || opts.rec.email_normalized || '',
+      opts.rec.hash,
+    );
+  }
 
   if (def.credits > 0) {
     const grant: CreditGrant = {
@@ -713,6 +719,9 @@ export async function finalizeCheckoutMint(opts: {
   await opts.store.putCustomerKey(opts.customerId, record.hash);
   await opts.store.putCustomerMap(opts.owner, opts.customerId);
   await opts.store.putAccountIndex(record.account_token_hash!, record.hash);
+  if (opts.emailNormalized) {
+    await opts.store.putEmailIndex(opts.emailNormalized, record.hash);
+  }
 
   if (def.credits > 0) {
     await opts.store.addCredits(record.hash, def.credits);
@@ -1019,6 +1028,9 @@ export async function revealCheckoutKey(opts: {
       const next: typeof rec = { ...rec, account_token_hash: accountHash };
       await opts.store.putKey(next);
       await opts.store.putAccountIndex(accountHash, next.hash);
+      if (next.email_normalized) {
+        await opts.store.putEmailIndex(next.email_normalized, next.hash);
+      }
       const credits = await opts.store.creditBalance(next.hash);
       return {
         kind: 'already_delivered',

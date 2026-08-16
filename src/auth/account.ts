@@ -10,6 +10,8 @@
  * `DQL_CHECKOUT_ENABLED`.
  */
 
+import { randomBytes } from 'node:crypto';
+
 import { fingerprintAccountToken, fingerprintKey, sha256Hex } from './key-hash.js';
 import {
   newStoredKeyRecord,
@@ -17,7 +19,8 @@ import {
   type KeyStore,
   type StoredKeyRecord,
 } from './key-store.js';
-import { generateApiKey } from './checkout.js';
+import { generateAccountToken, generateApiKey } from './checkout.js';
+import { normalizeCheckoutEmail } from './packs.js';
 import { stripeFormRequest } from './stripe-http.js';
 import { PRICE_USD_PER_CALL } from '../pricing.js';
 import type { AuthDecision } from './keys.js';
@@ -400,6 +403,9 @@ export async function rotateAccountKey(opts: {
   if (next.account_token_hash) {
     await opts.store.putAccountIndex(next.account_token_hash, next.hash);
   }
+  if (next.email_normalized) {
+    await opts.store.putEmailIndex(next.email_normalized, next.hash);
+  }
   await opts.store.revokeByHash(live.hash);
 
   console.log(
@@ -436,4 +442,234 @@ export async function revokeAccountKey(opts: {
     }),
   );
   return { kind: 'ok', key_prefix: opts.record.prefix, revoked: true };
+}
+
+// ── Email magic-link login (public account recovery) ───────────────────────
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const LOGIN_TOKEN_PREFIX = 'dqll_';
+
+export function generateLoginToken(): string {
+  return `${LOGIN_TOKEN_PREFIX}${randomBytes(32).toString('hex')}`;
+}
+
+export type ResolveAccountByEmailResult =
+  | { kind: 'ok'; record: StoredKeyRecord }
+  | { kind: 'not_found' }
+  | { kind: 'error'; reason: string };
+
+/** Prefer Redis email index; fall back to Stripe customer → cus-key. */
+export async function resolveAccountByEmail(opts: {
+  email: string;
+  store: KeyStore;
+  secretKey?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<ResolveAccountByEmailResult> {
+  const email = normalizeCheckoutEmail(opts.email);
+  if (!EMAIL_RE.test(email)) return { kind: 'not_found' };
+
+  const indexed = await opts.store.lookupByEmail(email);
+  if (indexed && indexed.revoked !== true) return { kind: 'ok', record: indexed };
+
+  const secretKey = (opts.secretKey ?? '').trim();
+  if (!secretKey) return { kind: 'not_found' };
+
+  const existing = await stripeFormRequest<{ data?: Array<{ id?: string }> }>({
+    secretKey,
+    method: 'GET',
+    path: '/customers',
+    params: { email, limit: '1' },
+    fetchImpl: opts.fetchImpl,
+  });
+  if (existing.kind === 'error') return { kind: 'error', reason: existing.reason };
+  const customerId = existing.body.data?.[0]?.id;
+  if (!customerId?.startsWith('cus_')) return { kind: 'not_found' };
+
+  const keyHash = await opts.store.getKeyHashByCustomer(customerId);
+  if (!keyHash) return { kind: 'not_found' };
+  const rec = await opts.store.getRecordByHash(keyHash);
+  if (!rec || rec.revoked === true) return { kind: 'not_found' };
+
+  // Heal indexes for next login.
+  await opts.store.putEmailIndex(email, rec.hash);
+  if (!rec.email_normalized) {
+    const next = { ...rec, email_normalized: email };
+    await opts.store.putKey(next);
+    return { kind: 'ok', record: next };
+  }
+  return { kind: 'ok', record: rec };
+}
+
+export type RequestLoginResult =
+  | { kind: 'sent'; email_masked: string }
+  | { kind: 'accepted' } // no account / no enumeration
+  | { kind: 'invalid_email' }
+  | { kind: 'unconfigured'; reason: string }
+  | { kind: 'error'; reason: string };
+
+export async function requestAccountLogin(opts: {
+  email: string;
+  store: KeyStore;
+  secretKey?: string;
+  resendApiKey?: string;
+  fromEmail?: string;
+  appBaseUrl: string;
+  fetchImpl?: typeof fetch;
+}): Promise<RequestLoginResult> {
+  const email = normalizeCheckoutEmail(opts.email);
+  if (!EMAIL_RE.test(email)) return { kind: 'invalid_email' };
+
+  const resolved = await resolveAccountByEmail({
+    email,
+    store: opts.store,
+    secretKey: opts.secretKey,
+    fetchImpl: opts.fetchImpl,
+  });
+
+  // Always return accepted for unknown emails (no enumeration).
+  if (resolved.kind === 'not_found') return { kind: 'accepted' };
+  if (resolved.kind === 'error') return { kind: 'error', reason: resolved.reason };
+
+  const resendKey = (opts.resendApiKey ?? '').trim();
+  if (!resendKey) return { kind: 'unconfigured', reason: 'missing_resend' };
+
+  const loginToken = generateLoginToken();
+  const tokenHash = sha256Hex(loginToken);
+  await opts.store.putLoginToken(tokenHash, {
+    key_hash: resolved.record.hash,
+    email_normalized: email,
+    created_at: new Date().toISOString(),
+  });
+
+  const base = opts.appBaseUrl.replace(/\/$/, '');
+  const link = `${base}/account?login=${encodeURIComponent(loginToken)}`;
+  const from = (opts.fromEmail ?? '').trim() || 'ThoughtProof <raul@thoughtproof.ai>';
+
+  const sent = await sendLoginEmail({
+    apiKey: resendKey,
+    from,
+    to: email,
+    link,
+    fetchImpl: opts.fetchImpl,
+  });
+  if (sent.kind !== 'ok') return { kind: 'error', reason: sent.reason };
+
+  console.log(
+    JSON.stringify({
+      type: 'dql_account_login_sent',
+      email_masked: maskEmail(email),
+      owner: resolved.record.owner,
+      prefix: resolved.record.prefix,
+      ts: new Date().toISOString(),
+    }),
+  );
+
+  return { kind: 'sent', email_masked: maskEmail(email) };
+}
+
+export type ConsumeLoginResult =
+  | { kind: 'ok'; account_token: string; shown_once: true; key_prefix: string; credits: number }
+  | { kind: 'invalid' }
+  | { kind: 'error'; reason: string };
+
+/** Exchange one-time login token for a fresh `dqla_…` session handle. */
+export async function consumeAccountLogin(opts: {
+  loginToken: string;
+  store: KeyStore;
+}): Promise<ConsumeLoginResult> {
+  const raw = (opts.loginToken ?? '').trim();
+  if (!raw.startsWith(LOGIN_TOKEN_PREFIX) || raw.length < 20) return { kind: 'invalid' };
+
+  const payload = await opts.store.consumeLoginToken(sha256Hex(raw));
+  if (!payload) return { kind: 'invalid' };
+
+  const rec = await opts.store.getRecordByHash(payload.key_hash);
+  if (!rec || rec.revoked === true) return { kind: 'invalid' };
+
+  const accountToken = generateAccountToken();
+  const accountHash = sha256Hex(accountToken);
+  const prevAccountHash = rec.account_token_hash;
+  const next: StoredKeyRecord = {
+    ...rec,
+    account_token_hash: accountHash,
+    email_normalized: rec.email_normalized || payload.email_normalized,
+  };
+  await opts.store.putKey(next);
+  // Invalidate previous browser sessions on fresh login.
+  if (prevAccountHash && prevAccountHash !== accountHash) {
+    await opts.store.clearAccountIndex(prevAccountHash);
+  }
+  await opts.store.putAccountIndex(accountHash, next.hash);
+  await opts.store.putEmailIndex(next.email_normalized || payload.email_normalized, next.hash);
+
+  const credits = await opts.store.creditBalance(next.hash);
+
+  console.log(
+    JSON.stringify({
+      type: 'dql_account_login_consumed',
+      email_masked: maskEmail(payload.email_normalized),
+      owner: next.owner,
+      prefix: next.prefix,
+      account_fingerprint: fingerprintAccountToken(accountToken),
+      ts: new Date().toISOString(),
+    }),
+  );
+
+  return {
+    kind: 'ok',
+    account_token: accountToken,
+    shown_once: true,
+    key_prefix: next.prefix,
+    credits,
+  };
+}
+
+async function sendLoginEmail(opts: {
+  apiKey: string;
+  from: string;
+  to: string;
+  link: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ kind: 'ok' } | { kind: 'error'; reason: string }> {
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const res = await fetchImpl('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${opts.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        from: opts.from,
+        to: [opts.to],
+        subject: 'Sign in to your ThoughtProof DQL account',
+        text: [
+          'Sign in to manage your DQL credits and API key.',
+          '',
+          opts.link,
+          '',
+          'This link expires in 15 minutes and can be used once.',
+          'If you did not request this, ignore the email.',
+        ].join('\n'),
+        html: `<p>Sign in to manage your DQL credits and API key.</p>
+<p><a href="${opts.link}">Open your DQL account</a></p>
+<p style="color:#666;font-size:13px">This link expires in 15 minutes and can be used once. If you did not request this, ignore the email.</p>`,
+      }),
+    });
+    if (!res.ok) {
+      return { kind: 'error', reason: `resend_http_${res.status}` };
+    }
+    return { kind: 'ok' };
+  } catch (err) {
+    const reason =
+      err instanceof Error && /aborted|timeout|AbortError/i.test(err.message)
+        ? 'timeout'
+        : 'resend_failed';
+    return { kind: 'error', reason };
+  } finally {
+    clearTimeout(timer);
+  }
 }

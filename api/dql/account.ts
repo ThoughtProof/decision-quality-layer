@@ -5,30 +5,34 @@
  *   POST /dql/account/portal
  *   POST /dql/account/rotate
  *   POST /dql/account/revoke
+ *   POST /dql/account/login     { email }           — magic-link request
+ *   POST /dql/account/session   { login_token }     — exchange for dqla_…
  *
- * Auth: `X-DQL-Account: dqla_…` or `Authorization: Bearer dqla_…`.
- * The verify key (`dqlk_…`) is not accepted.
+ * Auth (except login/session): `X-DQL-Account: dqla_…` or
+ * `Authorization: Bearer dqla_…`. The verify key (`dqlk_…`) is not accepted.
  *
- * Path routing via vercel.json rewrites (`?action=portal|rotate|revoke`)
- * or residual URL path. Does not enable `DQL_CHECKOUT_ENABLED`.
+ * Path routing via vercel.json rewrites (`?action=…`) or residual URL path.
+ * Does not enable `DQL_CHECKOUT_ENABLED`.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 import {
   authorizeAccount,
+  consumeAccountLogin,
   createBillingPortalSession,
   getAccountSnapshot,
+  requestAccountLogin,
   revokeAccountKey,
   rotateAccountKey,
 } from '../../src/auth/account.js';
-import { loadCheckoutConfig } from '../../src/auth/checkout.js';
+import { loadCheckoutConfig, publicAppUrl } from '../../src/auth/checkout.js';
 import { createKeyStore } from '../../src/auth/key-store.js';
 import { PACKAGE_VERSION } from '../../src/package-version.js';
 
 const VERSION = PACKAGE_VERSION;
 
-type AccountAction = 'root' | 'portal' | 'rotate' | 'revoke';
+type AccountAction = 'root' | 'portal' | 'rotate' | 'revoke' | 'login' | 'session';
 
 function cors(res: VercelResponse, methods: string): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -43,15 +47,38 @@ function firstString(v: unknown): string | null {
   return null;
 }
 
+function bodyObject(req: VercelRequest): Record<string, unknown> {
+  const b = req.body;
+  if (b && typeof b === 'object' && !Array.isArray(b)) return b as Record<string, unknown>;
+  if (typeof b === 'string') {
+    try {
+      const parsed = JSON.parse(b) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return {};
+}
+
 /** Resolve action from rewrite query or residual path. */
 export function resolveAccountAction(req: VercelRequest): AccountAction {
   const q = firstString(req.query?.action)?.trim().toLowerCase();
-  if (q === 'portal' || q === 'rotate' || q === 'revoke') return q;
+  if (
+    q === 'portal' ||
+    q === 'rotate' ||
+    q === 'revoke' ||
+    q === 'login' ||
+    q === 'session'
+  ) {
+    return q;
+  }
 
   const raw = typeof req.url === 'string' ? req.url : '';
   const pathOnly = raw.split('?')[0] ?? '';
-  // Matches /dql/account/portal, /api/dql/account/portal, trailing slash ok.
-  const m = /\/account\/(portal|rotate|revoke)\/?$/i.exec(pathOnly);
+  const m = /\/account\/(portal|rotate|revoke|login|session)\/?$/i.exec(pathOnly);
   if (m?.[1]) return m[1].toLowerCase() as AccountAction;
   return 'root';
 }
@@ -76,6 +103,76 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(503).json({
       error: 'Account store unavailable',
       code: 'ACCOUNT_UNAVAILABLE',
+    });
+  }
+
+  // Public login endpoints — no X-DQL-Account required.
+  if (action === 'login') {
+    const body = bodyObject(req);
+    const email = typeof body.email === 'string' ? body.email : '';
+    const cfg = loadCheckoutConfig(process.env);
+    const appBase =
+      publicAppUrl(process.env) ||
+      (cfg.publicApp ? cfg.publicApp : '') ||
+      'https://app.thoughtproof.ai';
+    const result = await requestAccountLogin({
+      email,
+      store,
+      secretKey: cfg.secretKey || process.env.STRIPE_SECRET_KEY,
+      resendApiKey: process.env.RESEND_API_KEY,
+      fromEmail: process.env.DQL_LOGIN_FROM_EMAIL || process.env.RESEND_FROM,
+      appBaseUrl: appBase,
+    });
+    if (result.kind === 'invalid_email') {
+      return res.status(400).json({
+        error: 'A valid email is required.',
+        code: 'INVALID_REQUEST',
+      });
+    }
+    if (result.kind === 'unconfigured') {
+      return res.status(503).json({
+        error: 'Account login email is not configured.',
+        code: 'LOGIN_UNAVAILABLE',
+      });
+    }
+    if (result.kind === 'error') {
+      return res.status(502).json({
+        error: 'Unable to send login email.',
+        code: 'LOGIN_FAILED',
+      });
+    }
+    // sent | accepted — same public response (no enumeration)
+    return res.status(200).json({
+      ok: true,
+      message: 'If an account exists for that email, a sign-in link was sent. Check your inbox.',
+    });
+  }
+
+  if (action === 'session') {
+    const body = bodyObject(req);
+    const loginToken =
+      (typeof body.login_token === 'string' && body.login_token) ||
+      (typeof body.token === 'string' && body.token) ||
+      '';
+    const consumed = await consumeAccountLogin({ loginToken, store });
+    if (consumed.kind === 'invalid') {
+      return res.status(401).json({
+        error: 'This sign-in link is invalid or already used.',
+        code: 'LOGIN_INVALID',
+      });
+    }
+    if (consumed.kind !== 'ok') {
+      return res.status(502).json({
+        error: 'Unable to complete sign-in.',
+        code: 'ACCOUNT_UNAVAILABLE',
+      });
+    }
+    return res.status(200).json({
+      account_token: consumed.account_token,
+      shown_once: true,
+      key_prefix: consumed.key_prefix,
+      credits: consumed.credits,
+      header: 'X-DQL-Account',
     });
   }
 

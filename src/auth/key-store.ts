@@ -18,6 +18,8 @@
  *   dql:trial-email:<sha256(email)> → claim marker
  *   dql:trial-fp:<card_fingerprint> → claim marker
  *   dql:account:<sha256(dqla_…)>    → live key hash (account session; hash only)
+ *   dql:email-key:<sha256(email)>   → live key hash (login recovery; hash only)
+ *   dql:login:<sha256(token)>       → { key_hash, email_normalized } (magic link; short TTL)
  *   dql:reserve:<keyHash>:<requestId> → VerifyReservation (per-account idempotency namespace)
  *   dql:reserve-held                  → ZSET score=leaseExpiresAt member=<keyHash>:<requestId>
  *   dql:reserve-fence                 → INCR fencing token (commit/release must match)
@@ -61,10 +63,15 @@ export const CREDIT_LEDGER_PREFIX = 'dql:credit-ledger:';
 export const TRIAL_EMAIL_PREFIX = 'dql:trial-email:';
 export const TRIAL_FP_PREFIX = 'dql:trial-fp:';
 export const ACCOUNT_PREFIX = 'dql:account:';
+/** email → live key hash (login recovery). Hash of normalized email only. */
+export const EMAIL_KEY_PREFIX = 'dql:email-key:';
+/** one-time magic-link login: sha256(login_token) → payload */
+export const LOGIN_PREFIX = 'dql:login:';
 export const RESERVE_PREFIX = 'dql:reserve:';
 
 export const REVEAL_TTL_SEC = 15 * 60;
 export const MINT_LOCK_TTL_SEC = 60;
+export const LOGIN_TTL_SEC = 15 * 60;
 export const RESERVE_TTL_SEC = RESERVE_LEASE_SEC;
 
 export interface StoredKeyRecord {
@@ -209,7 +216,12 @@ export interface KeyStore {
   getCreditLedger(keyHash: string): Promise<CreditLedgerRecord | null>;
   claimTrial(emailNormalized: string, cardFingerprint: string): Promise<TrialClaimResult>;
   putAccountIndex(accountTokenHash: string, keyHash: string): Promise<void>;
+  clearAccountIndex(accountTokenHash: string): Promise<void>;
   lookupByAccountToken(plaintextToken: string): Promise<StoredKeyRecord | null>;
+  putEmailIndex(emailNormalized: string, keyHash: string): Promise<void>;
+  lookupByEmail(emailNormalized: string): Promise<StoredKeyRecord | null>;
+  putLoginToken(tokenHash: string, payload: LoginTokenPayload, ttlSec?: number): Promise<void>;
+  consumeLoginToken(tokenHash: string): Promise<LoginTokenPayload | null>;
   usageToday(keyHash: string, now?: Date): Promise<number>;
   reserveVerify(opts: {
     requestId: string;
@@ -243,6 +255,12 @@ export interface KeyStore {
     now?: Date;
   }): Promise<'released' | 'noop'>;
   recoverExpiredHeldReservations(now?: Date): Promise<SweepHeldResult>;
+}
+
+export interface LoginTokenPayload {
+  key_hash: string;
+  email_normalized: string;
+  created_at: string;
 }
 
 function asRecord(v: unknown): StoredKeyRecord | null {
@@ -558,6 +576,11 @@ export class UpstashKeyStore implements KeyStore {
     await this.kv.set(`${ACCOUNT_PREFIX}${accountTokenHash}`, keyHash);
   }
 
+  async clearAccountIndex(accountTokenHash: string): Promise<void> {
+    if (!accountTokenHash) return;
+    await this.kv.del(`${ACCOUNT_PREFIX}${accountTokenHash}`);
+  }
+
   async lookupByAccountToken(plaintextToken: string): Promise<StoredKeyRecord | null> {
     if (!plaintextToken.startsWith('dqla_')) return null;
     try {
@@ -568,6 +591,64 @@ export class UpstashKeyStore implements KeyStore {
     } catch {
       return null;
     }
+  }
+
+  async putEmailIndex(emailNormalized: string, keyHash: string): Promise<void> {
+    const email = emailNormalized.trim().toLowerCase();
+    if (!email || !keyHash) return;
+    await this.kv.set(`${EMAIL_KEY_PREFIX}${sha256Hex(email)}`, keyHash);
+  }
+
+  async lookupByEmail(emailNormalized: string): Promise<StoredKeyRecord | null> {
+    const email = emailNormalized.trim().toLowerCase();
+    if (!email) return null;
+    try {
+      const v = await this.kv.get(`${EMAIL_KEY_PREFIX}${sha256Hex(email)}`);
+      const keyHash = typeof v === 'string' && v.length > 0 ? v : undefined;
+      if (!keyHash) return null;
+      return this.getRecordByHash(keyHash);
+    } catch {
+      return null;
+    }
+  }
+
+  async putLoginToken(
+    tokenHash: string,
+    payload: LoginTokenPayload,
+    ttlSec: number = LOGIN_TTL_SEC,
+  ): Promise<void> {
+    if (!tokenHash || !payload.key_hash) return;
+    await this.kv.set(`${LOGIN_PREFIX}${tokenHash}`, payload, { ex: ttlSec });
+  }
+
+  async consumeLoginToken(tokenHash: string): Promise<LoginTokenPayload | null> {
+    if (!tokenHash) return null;
+    const redisKey = `${LOGIN_PREFIX}${tokenHash}`;
+    let raw: unknown = null;
+    if (this.kv.getdel) {
+      raw = await this.kv.getdel(redisKey);
+    } else {
+      raw = await this.kv.get(redisKey);
+      if (raw != null) await this.kv.del(redisKey);
+    }
+    if (raw == null) return null;
+    let obj: unknown = raw;
+    if (typeof raw === 'string') {
+      try {
+        obj = JSON.parse(raw);
+      } catch {
+        return null;
+      }
+    }
+    if (typeof obj !== 'object' || obj === null) return null;
+    const r = obj as Record<string, unknown>;
+    if (typeof r.key_hash !== 'string' || !r.key_hash) return null;
+    if (typeof r.email_normalized !== 'string') return null;
+    return {
+      key_hash: r.key_hash,
+      email_normalized: r.email_normalized,
+      created_at: typeof r.created_at === 'string' ? r.created_at : new Date().toISOString(),
+    };
   }
 
   async usageToday(keyHash: string, now: Date = new Date()): Promise<number> {

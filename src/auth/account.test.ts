@@ -4,11 +4,13 @@ import {
   authorizeAccount,
   authorizeVerifyWithAccount,
   commitVerifyReservation,
+  consumeAccountLogin,
   createBillingPortalSession,
   extractAccountToken,
   getAccountSnapshot,
   maskEmail,
   releaseVerifyReservation,
+  requestAccountLogin,
   reserveVerifyWithAccount,
   revokeAccountKey,
   rotateAccountKey,
@@ -886,5 +888,113 @@ describe('generateAccountToken', () => {
     expect(t.startsWith('dqla_')).toBe(true);
     expect(generateApiKey().startsWith('dqlk_')).toBe(true);
     expect(t).not.toBe(generateAccountToken());
+  });
+});
+
+describe('email magic-link login', () => {
+  it('request + consume restores a fresh dqla_ session without re-emitting dqlk_', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const minted = await finalizeCheckoutMint({
+      sessionId: 'cs_login',
+      customerId: 'cus_login',
+      owner: selfServeOwner('cus_login'),
+      store,
+      pack: 'starter',
+      emailNormalized: 'buyer@example.com',
+    });
+    expect(minted.kind).toBe('minted');
+    if (minted.kind !== 'minted') return;
+
+    // Simulate lost browser session: old dqla_ still works until rotated by login.
+    const oldAuth = await authorizeAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(oldAuth.kind).toBe('ok');
+
+    let capturedLink = '';
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('api.resend.com')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { html?: string; text?: string };
+        const hay = `${body.html ?? ''}\n${body.text ?? ''}`;
+        const m = /login=(dqll_[0-9a-f]+)/i.exec(hay);
+        if (m?.[1]) capturedLink = m[1];
+        return { ok: true, status: 200, json: async () => ({ id: 're_test' }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+
+    const sent = await requestAccountLogin({
+      email: 'Buyer@Example.com',
+      store,
+      resendApiKey: 're_test',
+      appBaseUrl: 'https://app.thoughtproof.ai',
+      fetchImpl,
+    });
+    expect(sent.kind).toBe('sent');
+    if (sent.kind === 'sent') expect(sent.email_masked).toBe('b***@example.com');
+    expect(capturedLink.startsWith('dqll_')).toBe(true);
+    expect(JSON.stringify(sent)).not.toContain(minted.plaintext);
+    expect(JSON.stringify(sent)).not.toContain(minted.accountToken);
+
+    const consumed = await consumeAccountLogin({
+      loginToken: capturedLink,
+      store,
+    });
+    expect(consumed.kind).toBe('ok');
+    if (consumed.kind !== 'ok') return;
+    expect(consumed.account_token.startsWith('dqla_')).toBe(true);
+    expect(consumed.account_token).not.toBe(minted.accountToken);
+    expect(consumed.credits).toBe(STARTER_CREDITS);
+    expect(JSON.stringify(consumed)).not.toContain(minted.plaintext);
+
+    // One-time: second consume fails.
+    const again = await consumeAccountLogin({
+      loginToken: capturedLink,
+      store,
+    });
+    expect(again.kind).toBe('invalid');
+
+    // New session works; old dqla_ is dead (token rotated).
+    const newAuth = await authorizeAccount({
+      headers: { 'x-dql-account': consumed.account_token },
+      store,
+    });
+    expect(newAuth.kind).toBe('ok');
+    const oldDead = await authorizeAccount({
+      headers: { 'x-dql-account': minted.accountToken },
+      store,
+    });
+    expect(oldDead.kind).toBe('unauthorized');
+  });
+
+  it('unknown email returns accepted without enumeration and without sending', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 'should_not_send' }),
+    })) as unknown as typeof fetch;
+
+    const sent = await requestAccountLogin({
+      email: 'nobody@example.com',
+      store,
+      resendApiKey: 're_test',
+      appBaseUrl: 'https://app.thoughtproof.ai',
+      fetchImpl,
+    });
+    expect(sent.kind).toBe('accepted');
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('invalid email is rejected', async () => {
+    const store = new UpstashKeyStore(createMemoryKv());
+    const bad = await requestAccountLogin({
+      email: 'not-an-email',
+      store,
+      resendApiKey: 're_test',
+      appBaseUrl: 'https://app.thoughtproof.ai',
+    });
+    expect(bad.kind).toBe('invalid_email');
   });
 });
