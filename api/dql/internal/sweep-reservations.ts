@@ -2,12 +2,15 @@
  * GET|POST /dql/internal/sweep-reservations
  *
  * Production crash recovery for expired account-path verify holds.
- * Vercel Cron hits this route; it refunds stale `held` reservations
- * (credit + daily-cap) without requiring the client to retry that id.
- * Does not refund `meter_pending` or `committed`.
+ * GitHub Actions hits this route every 15 minutes (lease interval).
+ * Vercel Cron (`0 6 * * *`) is a Hobby-legal daily backup only.
+ * Refunds stale `held` reservations (credit + daily-cap) without
+ * requiring the client to retry that id. Does not refund
+ * `meter_pending` or `committed`.
  *
  * Auth: `Authorization: Bearer` matching `DQL_CRON_SECRET` or `CRON_SECRET`.
  * Fail closed when no secret is configured.
+ * Sweep EVAL/Redis failure → 503 SWEEP_UNAVAILABLE (not 200 / refunded: 0).
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -48,10 +51,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  const refunded = await store.recoverExpiredHeldReservations();
-  return res.status(200).json({
-    ok: true,
-    refunded,
-    note: SWEEP_LIMIT_NOTE,
-  });
+  try {
+    const swept = await store.recoverExpiredHeldReservations();
+    if (swept.kind !== 'ok') {
+      return res.status(503).json({
+        error: 'Reservation sweep did not complete.',
+        code: 'SWEEP_UNAVAILABLE',
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      refunded: swept.refunded,
+      note: SWEEP_LIMIT_NOTE,
+    });
+  } catch {
+    return res.status(503).json({
+      error: 'Reservation sweep did not complete.',
+      code: 'SWEEP_UNAVAILABLE',
+    });
+  }
 }

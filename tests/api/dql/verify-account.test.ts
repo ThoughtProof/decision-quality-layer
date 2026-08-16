@@ -316,6 +316,8 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     await mod.default(req, res);
     expect(state.statusCode).toBe(500);
     expect(state.jsonBody.code).toBe('INTERNAL_ERROR');
+    expect(state.jsonBody.details).toBeUndefined();
+    expect(JSON.stringify(state.jsonBody)).not.toContain('provider down');
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.plaintext);
     expect(JSON.stringify(state.jsonBody)).not.toContain(minted.accountToken);
     expect(harness.verifyCalls).toBe(1);
@@ -592,6 +594,14 @@ describe('POST /dql/verify — account token (dqla_)', () => {
     expect(harness.verifyCalls).toBe(1);
     expect(harness.meterCalls).toBe(3);
     expect(await harness.store!.usageToday(hash)).toBe(1);
+
+    const replay = makeReqRes({ ...validVerifyBody, sandbox: false }, 'POST', headers);
+    await mod.default(replay.req, replay.res);
+    expect(replay.state.statusCode).toBe(200);
+    expect(replay.state.headers['X-DQL-Meter']).toBe('ok');
+    expect(replay.state.headers['X-DQL-Billing']).toBe('metered');
+    expect(harness.verifyCalls).toBe(1);
+    expect(harness.meterCalls).toBe(3);
   });
 
   it('changing context, structured_context, or gate_mode is 409 and does not replay', async () => {

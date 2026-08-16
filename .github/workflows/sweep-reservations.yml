@@ -1,0 +1,41 @@
+# Primary recovery path for expired account-path verify holds.
+# Lease is 15 minutes; Hobby Vercel cron is daily-only, so this workflow
+# POSTs /dql/internal/sweep-reservations every 15 minutes.
+# Vercel cron `0 6 * * *` remains a backup — do not put */5 in vercel.json.
+#
+# Required repo secrets:
+#   CRON_SECRET or DQL_CRON_SECRET  — Bearer token (same as the route)
+#   DQL_SWEEP_URL                   — sweep endpoint
+# Documented default for DQL_SWEEP_URL (set the secret; do not rely on a
+# hardcoded fallback): https://dql.thoughtproof.ai/dql/internal/sweep-reservations
+#
+# Missing secrets or a non-2xx sweep response fail the job (no 200-skip).
+
+name: Sweep reservations
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sweep-reservations
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: sweep-reservations
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: POST sweep
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          DQL_CRON_SECRET: ${{ secrets.DQL_CRON_SECRET }}
+          DQL_SWEEP_URL: ${{ secrets.DQL_SWEEP_URL }}
+        run: bash scripts/sweep-reservations.sh

@@ -411,7 +411,7 @@ describe('UpstashKeyStore (memory)', () => {
     expect(await store.usageToday(rec.hash, t0)).toBe(0);
 
     const swept = await store.recoverExpiredHeldReservations(later);
-    expect(swept).toBe(0);
+    expect(swept).toEqual({ kind: 'ok', refunded: 0 });
   });
 
   it('sweep refunds an expired hold without a client retry of that id', async () => {
@@ -436,7 +436,7 @@ describe('UpstashKeyStore (memory)', () => {
     expect(held.kind).toBe('ok');
     expect(await store.creditBalance(rec.hash)).toBe(1);
     const later = new Date(t0.getTime() + 16 * 60 * 1000);
-    expect(await store.recoverExpiredHeldReservations(later)).toBe(1);
+    expect(await store.recoverExpiredHeldReservations(later)).toEqual({ kind: 'ok', refunded: 1 });
     expect(await store.creditBalance(rec.hash)).toBe(2);
     expect(await store.usageToday(rec.hash, t0)).toBe(0);
   });
@@ -571,7 +571,7 @@ describe('UpstashKeyStore (memory)', () => {
       'pending',
     );
     const later = new Date(t0.getTime() + 16 * 60 * 1000);
-    expect(await store.recoverExpiredHeldReservations(later)).toBe(0);
+    expect(await store.recoverExpiredHeldReservations(later)).toEqual({ kind: 'ok', refunded: 0 });
     expect(await store.usageToday(rec.hash, t0)).toBe(1);
     const again = await store.reserveVerify({
       requestId: 'dql_pending',
@@ -583,6 +583,26 @@ describe('UpstashKeyStore (memory)', () => {
     });
     expect(again.kind).toBe('meter_pending');
     if (again.kind === 'meter_pending') expect(again.reservation.result).toEqual({ id: 'pending' });
+  });
+
+  it('sweep EVAL/Redis failure is not reported as 0 refunded', async () => {
+    const kv = createMemoryKv();
+    const orig = kv.eval.bind(kv);
+    kv.eval = (script, keys, args) => {
+      if (String(script).includes('DQL_SWEEP_V3')) return Promise.reject(new Error('EVAL failed'));
+      return orig(script, keys, args);
+    };
+    const store = new UpstashKeyStore(kv);
+    const failed = await store.recoverExpiredHeldReservations();
+    expect(failed).toEqual({ kind: 'error' });
+    expect(failed).not.toEqual({ kind: 'ok', refunded: 0 });
+
+    kv.eval = (script, keys, args) => {
+      if (String(script).includes('DQL_SWEEP_V3')) return Promise.resolve(null);
+      return orig(script, keys, args);
+    };
+    const bogus = await store.recoverExpiredHeldReservations();
+    expect(bogus).toEqual({ kind: 'error' });
   });
 
   it('reveal is one-time (GETDEL)', async () => {

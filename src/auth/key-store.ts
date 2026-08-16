@@ -179,6 +179,7 @@ export type ReserveVerifyResult =
 export type CommitReservationAck = 'committed' | 'noop' | 'error';
 export type PersistPendingAck = 'pending' | 'noop' | 'error';
 export type ReleaseReservationAck = 'released' | 'noop';
+export type SweepHeldResult = { kind: 'ok'; refunded: number } | { kind: 'error' };
 
 export interface KeyStore {
   lookup(plaintextKey: string): Promise<ApiKeyRecord | undefined>;
@@ -241,7 +242,7 @@ export interface KeyStore {
     keyHash: string;
     now?: Date;
   }): Promise<'released' | 'noop'>;
-  recoverExpiredHeldReservations(now?: Date): Promise<number>;
+  recoverExpiredHeldReservations(now?: Date): Promise<SweepHeldResult>;
 }
 
 function asRecord(v: unknown): StoredKeyRecord | null {
@@ -699,17 +700,21 @@ export class UpstashKeyStore implements KeyStore {
     }
   }
 
-  async recoverExpiredHeldReservations(now: Date = new Date()): Promise<number> {
+  async recoverExpiredHeldReservations(now: Date = new Date()): Promise<SweepHeldResult> {
     try {
       const raw = await this.kv.eval(LUA_SWEEP, [HELD_INDEX_KEY], [
         String(RESERVE_RECORD_TTL_SEC),
         String(now.getTime()),
       ]);
-      if (typeof raw === 'number' && Number.isFinite(raw)) return Math.max(0, Math.floor(raw));
-      if (typeof raw === 'string' && /^-?\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
-      return 0;
+      if (typeof raw === 'number' && Number.isFinite(raw)) {
+        return { kind: 'ok', refunded: Math.max(0, Math.floor(raw)) };
+      }
+      if (typeof raw === 'string' && /^-?\d+$/.test(raw)) {
+        return { kind: 'ok', refunded: Math.max(0, parseInt(raw, 10)) };
+      }
+      return { kind: 'error' };
     } catch {
-      return 0;
+      return { kind: 'error' };
     }
   }
 

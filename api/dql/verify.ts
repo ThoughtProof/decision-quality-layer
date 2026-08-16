@@ -126,8 +126,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     billing?: import('../../src/auth/keys.js').AllowBilling;
   };
   let accountHold: AccountHold | null = null;
-  let accountReplay: { result: unknown; billing?: import('../../src/auth/keys.js').AllowBilling } | null =
-    null;
+  let accountReplay: {
+    result: unknown;
+    billing?: import('../../src/auth/keys.js').AllowBilling;
+    meter?: import('../../src/auth/key-store.js').VerifyReservation['meter'];
+  } | null = null;
   let accountMeterPending: { result: unknown; hold: AccountHold } | null = null;
 
   // v0.4.3.1 §C+integration: per-request diagnostics collector, created ONLY
@@ -369,7 +372,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 billing: reserved.billing,
                 via: 'account',
               };
-              accountReplay = { result: reserved.result, billing: reserved.billing };
+              accountReplay = {
+                result: reserved.result,
+                billing: reserved.billing,
+                meter: reserved.reservation.meter,
+              };
             } else if (reserved.kind === 'meter_pending') {
               authPath = {
                 kind: 'allow',
@@ -417,6 +424,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             };
           } else {
             applyAccountBillingHeaders(res, accountReplay.billing);
+            if (accountReplay.billing === 'payg' || accountReplay.meter === 'ok') {
+              res.setHeader('X-DQL-Meter', 'ok');
+            }
             status = 200;
             payload = accountReplay.result;
           }
@@ -666,9 +676,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       accountHold = null;
     }
-    const message = err instanceof Error ? err.message : 'Unknown error';
     status = 500;
-    payload = { error: 'Internal server error', code: 'INTERNAL_ERROR', details: message };
+    payload = { error: 'Internal server error', code: 'INTERNAL_ERROR' };
   }
 
   return sendJsonWithDiagnostics(res, collector, status, payload);
