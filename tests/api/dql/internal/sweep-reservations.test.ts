@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { createServer, type AddressInfo } from 'node:http';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 import { finalizeCheckoutMint } from '../../../../src/auth/checkout.js';
 import { sha256Hex } from '../../../../src/auth/key-hash.js';
@@ -195,47 +195,57 @@ describe('GitHub Actions 15-minute sweep scheduler', () => {
     ).toThrow();
   });
 
-  it('fails the job on a non-2xx sweep response and succeeds on 200', async () => {
-    const seen: { auth?: string } = {};
-    const server = createServer((req, res) => {
-      seen.auth = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-      if (req.url === '/fail') {
-        res.writeHead(503, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ code: 'SWEEP_UNAVAILABLE' }));
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, refunded: 0 }));
-    });
-    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
-    const { port } = server.address() as AddressInfo;
-    try {
-      expect(() =>
-        execFileSync('bash', [scriptPath], {
-          env: {
-            ...cleanEnv,
-            CRON_SECRET: 'sweep-test-secret',
-            DQL_SWEEP_URL: `http://127.0.0.1:${port}/fail`,
-          },
-          encoding: 'utf8',
-          stdio: 'pipe',
-        }),
-      ).toThrow();
+  it('fails the job on a non-2xx sweep response and succeeds on 200', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dql-sweep-'));
+    const fakeCurl = join(dir, 'fake-curl');
+    const logFile = join(dir, 'curl-args.log');
+    writeFileSync(
+      fakeCurl,
+      `#!/usr/bin/env bash
+set -euo pipefail
+echo "$@" >> "${logFile}"
+out=""
+url=""
+prev=""
+for a in "$@"; do
+  if [ "\${prev}" = "-o" ]; then out="$a"; fi
+  url="$a"
+  prev="$a"
+done
+if [ -n "\${out}" ]; then printf '%s' '{"ok":true}' > "\${out}"; fi
+case "\${url}" in
+  *fail*) printf '%s' '503' ;;
+  *) printf '%s' '200' ;;
+esac
+`,
+      { mode: 0o755 },
+    );
 
+    expect(() =>
       execFileSync('bash', [scriptPath], {
         env: {
           ...cleanEnv,
-          DQL_CRON_SECRET: 'sweep-test-secret',
-          DQL_SWEEP_URL: `http://127.0.0.1:${port}/ok`,
+          CRON_SECRET: 'sweep-test-secret',
+          DQL_SWEEP_URL: 'https://example.test/dql/internal/sweep-reservations/fail',
+          DQL_SWEEP_CURL: fakeCurl,
         },
         encoding: 'utf8',
         stdio: 'pipe',
-      });
-      expect(seen.auth).toBe('Bearer sweep-test-secret');
-    } finally {
-      await new Promise<void>((resolveClose, reject) =>
-        server.close((err) => (err ? reject(err) : resolveClose())),
-      );
-    }
+      }),
+    ).toThrow();
+
+    execFileSync('bash', [scriptPath], {
+      env: {
+        ...cleanEnv,
+        DQL_CRON_SECRET: 'sweep-test-secret',
+        DQL_SWEEP_URL: 'https://example.test/dql/internal/sweep-reservations',
+        DQL_SWEEP_CURL: fakeCurl,
+      },
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+    const logged = readFileSync(logFile, 'utf8');
+    expect(logged).toContain('Authorization: Bearer sweep-test-secret');
+    expect(logged).toContain('-X POST');
   });
 });

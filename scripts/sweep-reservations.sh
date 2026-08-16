@@ -20,11 +20,14 @@ fi
 BODY="$(mktemp)"
 trap 'rm -f "${BODY}"' EXIT
 
+CURL_BIN="${DQL_SWEEP_CURL:-curl}"
+TIMEOUT="${DQL_SWEEP_TIMEOUT:-60}"
+
 set +e
-CODE="$(curl -sS -o "${BODY}" -w '%{http_code}' -X POST \
+CODE="$("${CURL_BIN}" -sS -o "${BODY}" -w '%{http_code}' -X POST \
   -H "Authorization: Bearer ${SECRET}" \
   -H "Accept: application/json" \
-  --max-time 60 \
+  --max-time "${TIMEOUT}" \
   "${URL}")"
 CURL_STATUS=$?
 set -e
