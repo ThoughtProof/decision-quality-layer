@@ -118,6 +118,12 @@ describe('response headers on POST /dql/verify', () => {
     );
   });
 
+  it('200 verify body stays DqlResponse (x402 402 does not alter success schema)', () => {
+    expect(verifyResponses['200'].content['application/json'].schema.$ref).toBe(
+      '#/components/schemas/DqlResponse',
+    );
+  });
+
   it('JSON headers are modeled as string + contentMediaType, never format:json or object $ref', () => {
     for (const name of ['DqlDiagnostics', 'DqlDiagnosticsCounts']) {
       const s = headers[name].schema;
@@ -308,6 +314,75 @@ describe('DiagnosticsTruncationCounts', () => {
     expect(dropped.additionalProperties).toBe(false);
     for (const stream of FIVE_STREAMS) {
       expect(dropped.properties[stream]).toMatchObject({ type: 'integer', minimum: 0 });
+    }
+  });
+});
+
+describe('POST /dql/verify 402 x402 handshake (unpaid live)', () => {
+  const PAY_TO = '0xAB9f84864662f980614bD1453dB9950Ef2b82E83';
+  const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+  const RESOURCE = 'https://dql.thoughtproof.ai/dql/verify';
+
+  it('declares 402 with PAYMENT-REQUIRED plus the diagnostics header set', () => {
+    const r = verifyResponses['402'];
+    expect(r).toBeDefined();
+    expect(r.headers['PAYMENT-REQUIRED'].$ref).toBe('#/components/headers/PaymentRequired');
+    expect(r.headers['X-DQL-Version'].$ref).toBe('#/components/headers/DqlVersion');
+    expect(r.headers['X-Request-Id'].$ref).toBe('#/components/headers/DqlRequestId');
+    expect(r.content['application/json'].schema.$ref).toBe(
+      '#/components/schemas/X402PaymentRequired',
+    );
+  });
+
+  it('PAYMENT-REQUIRED header is a base64 x402 v2 string (not JSON format)', () => {
+    const s = headers.PaymentRequired.schema;
+    expect(s.type).toBe('string');
+    expect(s.format).toBeUndefined();
+    expect(headers.PaymentRequired.description).toMatch(/PAYMENT-REQUIRED/);
+    expect(headers.PaymentRequired.description).toMatch(/payment-required/);
+    expect(headers.PaymentRequired.description).toMatch(/base64/i);
+  });
+
+  it('body.x402.accepts documents scheme/network/amount/asset/payTo (vanilla exact)', () => {
+    const body = schemas.X402PaymentRequired;
+    expect(body.required).toEqual(expect.arrayContaining(['error', 'code', 'x402']));
+    expect(body.properties.code.const).toBe('PAYMENT_REQUIRED');
+    expect(body.properties.protocol.const).toBe('x402');
+    expect(body.properties.x402.$ref).toBe('#/components/schemas/X402Challenge');
+
+    const challenge = schemas.X402Challenge;
+    expect(challenge.required).toEqual(expect.arrayContaining(['x402Version', 'accepts']));
+    expect(challenge.properties.x402Version.const).toBe(2);
+    expect(challenge.properties.accepts.minItems).toBe(2);
+    expect(challenge.properties.accepts.items.$ref).toBe('#/components/schemas/X402Accept');
+
+    const accept = schemas.X402Accept;
+    expect(accept.required.sort()).toEqual(
+      ['amount', 'asset', 'network', 'payTo', 'resource', 'scheme'].sort(),
+    );
+    expect(accept.properties.scheme.const).toBe('exact');
+    expect(accept.properties.network.enum.sort()).toEqual(['base', 'eip155:8453']);
+    expect(accept.properties.amount.const).toBe('50000');
+    expect(accept.properties.asset.const).toBe(USDC_BASE);
+    expect(accept.properties.payTo.const).toBe(PAY_TO);
+    expect(accept.properties.resource.const).toBe(RESOURCE);
+    expect(accept.properties.scheme.enum ?? []).not.toContain('gateway');
+  });
+
+  it('402 example matches the live unpaid handshake (two accepts, same price/wallet)', () => {
+    const example = verifyResponses['402'].content['application/json'].example;
+    expect(example.code).toBe('PAYMENT_REQUIRED');
+    expect(example.protocol).toBe('x402');
+    expect(example.x402.x402Version).toBe(2);
+    const accepts = example.x402.accepts as Array<Record<string, unknown>>;
+    expect(accepts).toHaveLength(2);
+    expect(accepts.map((a) => a.network).sort()).toEqual(['base', 'eip155:8453']);
+    for (const row of accepts) {
+      expect(row.scheme).toBe('exact');
+      expect(row.amount).toBe('50000');
+      expect(row.asset).toBe(USDC_BASE);
+      expect(row.payTo).toBe(PAY_TO);
+      expect(row.resource).toBe(RESOURCE);
     }
   });
 });
