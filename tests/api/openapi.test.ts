@@ -3,17 +3,15 @@
  * handler against the wire contract of d7a8ff6 (v5 OpenAPI delta, approved).
  *
  * Mechanics (R5, v5 §6): the test invokes the handler with a response double
- * and inspects the JSON it would serve — no `spec` export, no runtime-code
- * delta. The enum literals below are AUDITED EXPECTATION VALUES from the live
- * d7a8ff6 audit (v5 delta §3): `MAX_FIELD_LENGTH` is not exported from
- * src/validation.ts, and FailureCategory / the circuit-event unions are pure
- * TypeScript types with no runtime representation — so the literals are
- * pinned here. Synchronized drift on both sides is NOT auto-discriminated;
- * that residual risk is covered by the single-source follow-up (v5 §0b).
+ * and inspects the JSON it would serve — no `spec` export. The 402 x402
+ * contract test is the exception: it calls `buildX402Challenge` and compares
+ * that runtime object to the published example. Other enum literals below
+ * are AUDITED EXPECTATION VALUES from the live d7a8ff6 audit (v5 delta §3).
  */
 
 import { describe, it, expect } from 'vitest';
 import handler from '../../api/openapi.js';
+import { buildX402Challenge } from '../../src/auth/x402.js';
 
 type AnyObj = Record<string, any>;
 
@@ -115,6 +113,12 @@ describe('response headers on POST /dql/verify', () => {
   it('503 body is DqlConfigError', () => {
     expect(verifyResponses['503'].content['application/json'].schema.$ref).toBe(
       '#/components/schemas/DqlConfigError',
+    );
+  });
+
+  it('200 verify body stays DqlResponse (x402 402 does not alter success schema)', () => {
+    expect(verifyResponses['200'].content['application/json'].schema.$ref).toBe(
+      '#/components/schemas/DqlResponse',
     );
   });
 
@@ -308,6 +312,119 @@ describe('DiagnosticsTruncationCounts', () => {
     expect(dropped.additionalProperties).toBe(false);
     for (const stream of FIVE_STREAMS) {
       expect(dropped.properties[stream]).toMatchObject({ type: 'integer', minimum: 0 });
+    }
+  });
+});
+
+describe('POST /dql/verify 402 (x402 handshake + credits exhausted)', () => {
+  const media = verifyResponses['402'].content['application/json'];
+
+  it('declares 402 with PAYMENT-REQUIRED plus the diagnostics header set', () => {
+    const r = verifyResponses['402'];
+    expect(r).toBeDefined();
+    expect(r.headers['PAYMENT-REQUIRED'].$ref).toBe('#/components/headers/PaymentRequired');
+    expect(r.headers['X-DQL-Version'].$ref).toBe('#/components/headers/DqlVersion');
+    expect(r.headers['X-Request-Id'].$ref).toBe('#/components/headers/DqlRequestId');
+    expect(media.schema.oneOf).toEqual([
+      { $ref: '#/components/schemas/X402PaymentRequired' },
+      { $ref: '#/components/schemas/CreditsExhaustedResponse' },
+    ]);
+  });
+
+  it('PAYMENT-REQUIRED header is a base64 x402 v2 string (not JSON format)', () => {
+    const s = headers.PaymentRequired.schema;
+    expect(s.type).toBe('string');
+    expect(s.format).toBeUndefined();
+    expect(headers.PaymentRequired.description).toMatch(/PAYMENT-REQUIRED/);
+    expect(headers.PaymentRequired.description).toMatch(/payment-required/);
+    expect(headers.PaymentRequired.description).toMatch(/base64/i);
+  });
+
+  it('X402Challenge / X402Accept required sets match the live v2 handshake', () => {
+    const body = schemas.X402PaymentRequired;
+    expect(body.required).toEqual(expect.arrayContaining(['error', 'code', 'x402']));
+    expect(body.properties.code.const).toBe('PAYMENT_REQUIRED');
+    expect(body.properties.protocol.const).toBe('x402');
+    expect(body.properties.x402.$ref).toBe('#/components/schemas/X402Challenge');
+
+    const challenge = schemas.X402Challenge;
+    expect(challenge.required.sort()).toEqual(['accepts', 'resource', 'x402Version']);
+    expect(challenge.properties.x402Version.const).toBe(2);
+    expect(challenge.properties.accepts.minItems).toBe(2);
+    expect(challenge.properties.accepts.items.$ref).toBe('#/components/schemas/X402Accept');
+
+    const accept = schemas.X402Accept;
+    expect(accept.required.sort()).toEqual(
+      ['amount', 'asset', 'maxTimeoutSeconds', 'network', 'payTo', 'scheme'].sort(),
+    );
+    expect(accept.required).not.toContain('resource');
+    expect(accept.properties.scheme.const).toBe('exact');
+    expect(accept.properties.network.enum.sort()).toEqual(['base', 'eip155:8453']);
+    expect(accept.properties.scheme.enum ?? []).not.toContain('gateway');
+    for (const field of ['amount', 'asset', 'payTo', 'resource', 'maxTimeoutSeconds']) {
+      expect(accept.properties[field].const, `${field} must be example not const`).toBeUndefined();
+      expect(accept.properties[field].example).toBeDefined();
+    }
+    expect(accept.properties.payTo.description).toBe('Current production recipient on Base.');
+    expect(JSON.stringify(accept)).not.toMatch(/do not rotate/i);
+  });
+
+  it('CreditsExhaustedResponse matches the runtime deny payload', () => {
+    const s = schemas.CreditsExhaustedResponse;
+    expect(s.required.sort()).toEqual(['code', 'error', 'no_freemium', 'price_usd_per_call']);
+    expect(s.properties.code.const).toBe('CREDITS_EXHAUSTED');
+    expect(s.properties.no_freemium.const).toBe(true);
+    expect(s.properties.x402).toBeUndefined();
+    expect(s.properties.price_usd_per_call.const).toBeUndefined();
+    expect(s.properties.price_usd_per_call.example).toBe(0.05);
+  });
+
+  it('publishes both 402 examples; unpaid example has no personal grant email', () => {
+    const examples = media.examples;
+    expect(examples.x402PaymentRequired.value.code).toBe('PAYMENT_REQUIRED');
+    expect(examples.creditsExhausted.value).toEqual({
+      error: 'Prepaid credits exhausted. Opt in to pay-as-you-go or buy a credit pack.',
+      code: 'CREDITS_EXHAUSTED',
+      price_usd_per_call: 0.05,
+      no_freemium: true,
+    });
+    expect(JSON.stringify(examples.x402PaymentRequired.value)).not.toMatch(/raul@/i);
+    expect(examples.x402PaymentRequired.value.access).toMatch(/ThoughtProof/i);
+  });
+
+  it('buildX402Challenge matches the published x402 example (amount/asset/payTo/resource/networks/timeout)', () => {
+    // Empty env = code defaults (isolated from process.env). Compare runtime
+    // output to the published example — do not re-pin the same literals here.
+    const example = media.examples.x402PaymentRequired.value;
+    const { body, paymentRequiredHeader } = buildX402Challenge({});
+    const challenge = body.x402 as {
+      resource: { url: string };
+      accepts: Array<{
+        scheme: string;
+        network: string;
+        amount: string;
+        asset: string;
+        payTo: string;
+        resource: string;
+        maxTimeoutSeconds: number;
+      }>;
+    };
+    const published = example.x402 as typeof challenge;
+    const decoded = JSON.parse(Buffer.from(paymentRequiredHeader, 'base64').toString('utf8'));
+    expect(decoded).toEqual(body.x402);
+    expect(challenge).toEqual(published);
+    expect(body.price_usd_per_call).toBe(example.price_usd_per_call);
+    expect(challenge.resource.url).toBe(published.resource.url);
+    expect(challenge.accepts.map((a) => a.network).sort()).toEqual(
+      published.accepts.map((a) => a.network).sort(),
+    );
+    for (const [i, row] of challenge.accepts.entries()) {
+      const want = published.accepts[i]!;
+      expect(row.amount).toBe(want.amount);
+      expect(row.asset).toBe(want.asset);
+      expect(row.payTo).toBe(want.payTo);
+      expect(row.resource).toBe(want.resource);
+      expect(row.maxTimeoutSeconds).toBe(want.maxTimeoutSeconds);
     }
   });
 });

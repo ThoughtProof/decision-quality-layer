@@ -13,9 +13,9 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 /**
  * Shared response-header block for every status code the verify handler
- * produces itself (200/400/401/405/413/415/500). The config-invalid 503 path
- * deliberately declares only X-DQL-Version + X-Request-Id — on that path no
- * diagnostics collector exists (v5 delta, R4).
+ * produces itself (200/400/401/405/413/415/500, and 402 plus PAYMENT-REQUIRED).
+ * The config-invalid 503 path deliberately declares only X-DQL-Version +
+ * X-Request-Id — on that path no diagnostics collector exists (v5 delta, R4).
  */
 const verifyResponseHeaders = {
   'X-DQL-Version': { $ref: '#/components/headers/DqlVersion' },
@@ -59,7 +59,7 @@ const spec = {
         operationId: 'dqlVerify',
         summary: 'Verify a proposed agent action across five axes',
         description:
-          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md. Auth: `X-DQL-Key: dqlk_…` (unchanged) or `X-DQL-Account: dqla_…` / `Authorization: Bearer dqla_…` (bills the bound credit ledger; response never includes the raw verify key). `dqla_…` is not accepted as `X-DQL-Key`. Invalid/missing account token → 401. Exhausted credits → 402 before the engine. Account path: per-account reserve + fencing token + full request digest; in-progress → 409; payload mismatch → 409; committed replay returns the stored result; PAYG meter failure stores meter_pending and remeters on retry. Optional `Idempotency-Key` / validated `X-Request-Id` is the reservation id. Not a self-serve product claim.',
+          'Runs the requested axes in parallel through the serv-nano → serv-swift cascade. Returns per-axis verdicts (PASS / FAIL / UNCERTAIN with confidence and objection) and an aggregate verdict (ALLOW / BLOCK / REVIEW). Aggregation rules are pre-registered and documented in docs/ARCHITECTURE.md. Auth: `X-DQL-Key: dqlk_…` (unchanged) or `X-DQL-Account: dqla_…` / `Authorization: Bearer dqla_…` (bills the bound credit ledger; response never includes the raw verify key). `dqla_…` is not accepted as `X-DQL-Key`. Invalid/missing account token → 401. Unpaid (no key, no `PAYMENT-SIGNATURE`) → 402 x402 handshake (`PAYMENT-REQUIRED` + `body.x402.accepts` / `payTo`). Exhausted credits → 402 before the engine. Account path: per-account reserve + fencing token + full request digest; in-progress → 409; payload mismatch → 409; committed replay returns the stored result; PAYG meter failure stores meter_pending and remeters on retry. Optional `Idempotency-Key` / validated `X-Request-Id` is the reservation id. Not a self-serve product claim.',
         parameters: [
           {
             name: 'Idempotency-Key',
@@ -134,6 +134,80 @@ const spec = {
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/DqlError' },
+              },
+            },
+          },
+          '402': {
+            description:
+              'Payment required. Two bodies: (1) unpaid `POST /dql/verify` (no `X-DQL-Key`, no `PAYMENT-SIGNATURE`) — x402 v2 handshake, header `PAYMENT-REQUIRED` (`payment-required` on the wire) is the base64-encoded challenge, JSON wraps the same object at `x402` (`x402.accepts[]` with `scheme`, `network`, `amount`, `asset`, `payTo`). Vanilla `exact` only — Base USDC (`eip155:8453` and alias `base`), no Circle Gateway scheme. Retry with `PAYMENT-SIGNATURE` or a valid API key. (2) Account-token / prepaid credit exhaustion — `CREDITS_EXHAUSTED` without the handshake or `PAYMENT-REQUIRED` header.',
+            headers: {
+              ...verifyResponseHeaders,
+              'PAYMENT-REQUIRED': { $ref: '#/components/headers/PaymentRequired' }, // present on unpaid x402; absent on CREDITS_EXHAUSTED
+            },
+            content: {
+              'application/json': {
+                schema: {
+                  oneOf: [
+                    { $ref: '#/components/schemas/X402PaymentRequired' },
+                    { $ref: '#/components/schemas/CreditsExhaustedResponse' },
+                  ],
+                },
+                examples: {
+                  x402PaymentRequired: {
+                    summary: 'Unpaid x402 v2 handshake',
+                    value: {
+                      error:
+                        'This endpoint requires a valid API key (X-DQL-Key), x402 payment, or sandbox: true.',
+                      code: 'PAYMENT_REQUIRED',
+                      price_usd_per_call: 0.05,
+                      protocol: 'x402',
+                      access: 'stripe: contact ThoughtProof for metered access',
+                      x402: {
+                        x402Version: 2,
+                        error: 'Payment required',
+                        resource: {
+                          url: 'https://dql.thoughtproof.ai/dql/verify',
+                          description: 'DQL 5-axis mandate verification — $0.05/call USDC on Base',
+                          mimeType: 'application/json',
+                        },
+                        accepts: [
+                          {
+                            scheme: 'exact',
+                            network: 'eip155:8453',
+                            amount: '50000',
+                            maxAmountRequired: '50000',
+                            asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+                            payTo: '0xAB9f84864662f980614bD1453dB9950Ef2b82E83',
+                            resource: 'https://dql.thoughtproof.ai/dql/verify',
+                            maxTimeoutSeconds: 300,
+                            extra: { name: 'USD Coin', version: '2' },
+                          },
+                          {
+                            scheme: 'exact',
+                            network: 'base',
+                            amount: '50000',
+                            maxAmountRequired: '50000',
+                            asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+                            payTo: '0xAB9f84864662f980614bD1453dB9950Ef2b82E83',
+                            resource: 'https://dql.thoughtproof.ai/dql/verify',
+                            maxTimeoutSeconds: 300,
+                            extra: { name: 'USD Coin', version: '2' },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                  creditsExhausted: {
+                    summary: 'Prepaid credits exhausted (no x402 handshake)',
+                    value: {
+                      error:
+                        'Prepaid credits exhausted. Opt in to pay-as-you-go or buy a credit pack.',
+                      code: 'CREDITS_EXHAUSTED',
+                      price_usd_per_call: 0.05,
+                      no_freemium: true,
+                    },
+                  },
+                },
               },
             },
           },
@@ -405,6 +479,14 @@ const spec = {
           description: 'JSON-encoded DiagnosticsTruncationCounts',
         },
       },
+      PaymentRequired: {
+        description:
+          'x402 `PAYMENT-REQUIRED` handshake. Base64-encoded x402 v2 challenge JSON — the same object as `body.x402` (version, resource, `accepts[]` with `scheme`/`network`/`amount`/`asset`/`payTo`). Live HTTP/2 header name is `payment-required`. Vanilla `exact` on Base USDC only; no Circle Gateway scheme.',
+        schema: {
+          type: 'string',
+          description: 'Base64-encoded x402 v2 PaymentRequired challenge',
+        },
+      },
     },
     securitySchemes: {
       dqlKey: {
@@ -671,6 +753,126 @@ const spec = {
         },
         description:
           'Body of 503 Service Unavailable when cold-start config resolution failed. reasons lists every validation failure collected by the resolver.',
+      },
+      X402PaymentRequired: {
+        type: 'object',
+        required: ['error', 'code', 'protocol', 'x402'],
+        description:
+          'Unpaid 402 body for POST /dql/verify. Wrapper plus standard `x402` challenge. `x402.accepts` is the machine-readable price list (`payTo`, `amount`, `asset`, `network`). Matches the live unpaid handshake; vanilla x402 `exact` only.',
+        properties: {
+          error: { type: 'string' },
+          code: { type: 'string', const: 'PAYMENT_REQUIRED' },
+          price_usd_per_call: {
+            type: 'number',
+            description: 'USD price per verify call. USDC 6dp amount is price × 1e6.',
+            example: 0.05,
+          },
+          protocol: { type: 'string', const: 'x402' },
+          access: { type: 'string' },
+          x402: { $ref: '#/components/schemas/X402Challenge' },
+        },
+      },
+      CreditsExhaustedResponse: {
+        type: 'object',
+        required: ['error', 'code', 'price_usd_per_call', 'no_freemium'],
+        description:
+          '402 when a valid account token / prepaid key has no remaining credits and is not PAYG. Runtime shape from authorizeCall / reserveVerifyWithAccount — no `x402` object and no `PAYMENT-REQUIRED` header.',
+        properties: {
+          error: { type: 'string' },
+          code: { type: 'string', const: 'CREDITS_EXHAUSTED' },
+          price_usd_per_call: {
+            type: 'number',
+            description: 'USD price per verify call after credits are exhausted.',
+            example: 0.05,
+          },
+          no_freemium: { type: 'boolean', const: true },
+        },
+      },
+      X402Challenge: {
+        type: 'object',
+        required: ['x402Version', 'resource', 'accepts'],
+        description:
+          'x402 v2 challenge (also the decoded `PAYMENT-REQUIRED` header). Top-level `resource` is the v2 resource. Two `accepts` rows: CAIP-2 `eip155:8453` and alias `base`, same price and wallet.',
+        properties: {
+          x402Version: { type: 'integer', const: 2 },
+          error: { type: 'string' },
+          resource: {
+            type: 'object',
+            required: ['url', 'description', 'mimeType'],
+            properties: {
+              url: { type: 'string', format: 'uri', example: 'https://dql.thoughtproof.ai/dql/verify' },
+              description: { type: 'string' },
+              mimeType: { type: 'string', example: 'application/json' },
+            },
+          },
+          accepts: {
+            type: 'array',
+            minItems: 2,
+            description:
+              'Vanilla x402 `exact` accepts only (no Circle Gateway). Same amount/asset/payTo on `eip155:8453` and `base`.',
+            items: { $ref: '#/components/schemas/X402Accept' },
+          },
+        },
+      },
+      // Price, USDC asset, payTo, resource, and timeout are `example` not `const`:
+      // payTo follows PAYMENT_WALLET; the others are code defaults in
+      // buildX402Challenge. Published examples match production defaults.
+      // A contract test compares those examples to buildX402Challenge output.
+      X402Accept: {
+        type: 'object',
+        required: ['scheme', 'network', 'amount', 'asset', 'payTo', 'maxTimeoutSeconds'],
+        description:
+          'One x402 payment option. Vanilla `exact` on Base USDC. `amount` is atomic USDC (6 decimals). Accept-level `resource` is a compatibility field; v2 resource is top-level on the challenge.',
+        properties: {
+          scheme: {
+            type: 'string',
+            const: 'exact',
+            description: 'Vanilla x402 exact scheme. No Gateway / extra rails.',
+          },
+          network: {
+            type: 'string',
+            enum: ['eip155:8453', 'base'],
+            description: 'Base mainnet CAIP-2 (`eip155:8453`) or the `base` alias. Same price/wallet on both rows.',
+          },
+          amount: {
+            type: 'string',
+            description: 'Atomic USDC (6 decimals). 50000 = $0.05.',
+            example: '50000',
+          },
+          maxAmountRequired: {
+            type: 'string',
+            description: 'x402 v1 alias of `amount`. Same atomic USDC units.',
+            example: '50000',
+          },
+          asset: {
+            type: 'string',
+            description: 'USDC on Base.',
+            example: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+          },
+          payTo: {
+            type: 'string',
+            description: 'Current production recipient on Base.',
+            example: '0xAB9f84864662f980614bD1453dB9950Ef2b82E83',
+          },
+          resource: {
+            type: 'string',
+            format: 'uri',
+            description: 'Compatibility copy of the challenge resource URL. v2 resource is top-level.',
+            example: 'https://dql.thoughtproof.ai/dql/verify',
+          },
+          maxTimeoutSeconds: {
+            type: 'integer',
+            description: 'Payment authorization validity window in seconds.',
+            example: 300,
+          },
+          extra: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', example: 'USD Coin' },
+              version: { type: 'string', example: '2' },
+            },
+          },
+        },
       },
       FailureCategory: {
         type: 'string',
