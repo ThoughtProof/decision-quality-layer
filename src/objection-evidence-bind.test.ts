@@ -271,6 +271,25 @@ describe('bindObjectionText — Sony-class free-text bounds', () => {
     expect(r.status).toBe('verified');
     expect(r.surface).toBe('pass_through');
   });
+
+  it('verifies deterministic enforce overshoot with explicit USD markers', () => {
+    const r = bindObjectionText(
+      'Proposed amount $2000 exceeds granted maximum $200. The principal did not authorize this magnitude.',
+      {
+        structured_context: {
+          granted: { max_amount: 200 },
+          proposed: { amount: 2000 },
+        },
+      },
+    );
+    expect(r.status).toBe('verified');
+    expect(r.surface).toBe('pass_through');
+    expect(r.safe_reason).toMatch(/2000/);
+    expect(r.safe_reason).toMatch(/200/);
+    expect(r.safe_reason).not.toMatch(
+      /numeric claims? without bound evidence|\[objection_unverified\]/i,
+    );
+  });
 });
 
 describe('bindAxisResults', () => {

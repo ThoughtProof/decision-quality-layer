@@ -110,6 +110,8 @@ describe('runStructuralPrecheck', () => {
     );
     expect(r.would_block).toBe(true);
     expect(r.violations[0]?.kind).toBe('amount_overshoot');
+    expect(r.violations[0]?.detail).toMatch(/\$1000/);
+    expect(r.violations[0]?.detail).toMatch(/\$100/);
   });
 
   it('detects recipient mismatch (case-insensitive)', () => {
