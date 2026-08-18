@@ -5,6 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   boundTotals,
+  parseMoneyNumber,
   parseNumericClaim,
   bindObjectionText,
   bindAxisResults,
@@ -95,6 +96,14 @@ function mcpObjections(axes: AxisResult[]): string[] {
   return axes.map((a) => (a.objection ?? '').trim()).filter(Boolean);
 }
 
+describe('parseMoneyNumber', () => {
+  it('parses $1,499 as 1499 not 1.499', () => {
+    expect(parseMoneyNumber('1,499')).toBe(1499);
+    expect(parseMoneyNumber('$1,499')).toBe(1499);
+    expect(parseMoneyNumber('1,499')).not.toBe(1.499);
+  });
+});
+
 describe('boundTotals — free-text proposed_action money', () => {
   it('binds $848 from proposed_action + $700 max from mandate', () => {
     const b = boundTotals(SONY_CTX);
@@ -110,6 +119,57 @@ describe('boundTotals — free-text proposed_action money', () => {
     expect(b.amount).toBe(848);
     expect(b.ceiling).toBe(700);
   });
+
+  it('does not treat under 2 kg as a ceiling when $700 is present', () => {
+    const b = boundTotals({
+      mandate: 'Choose a camera under 2 kg. Spend up to $700.',
+      proposed_action: 'Buy a compact body at $848.',
+    });
+    expect(b.ceiling).toBe(700);
+    expect(b.ceiling).not.toBe(2);
+    expect(b.amount).toBe(848);
+  });
+
+  it('does not treat total 3 cameras as an amount', () => {
+    const b = boundTotals({
+      mandate: 'Spend up to $700.',
+      proposed_action: 'Buy a total of 3 cameras at $848 each.',
+    });
+    expect(b.amount).toBe(848);
+    expect(b.amount).not.toBe(3);
+  });
+
+  it('does not Math.max sale $848 against list $999', () => {
+    const b = boundTotals({
+      mandate: 'Hard max $700.',
+      proposed_action:
+        'Buy the Sony camera for the $848 sale price; list price is $999.',
+    });
+    expect(b.amount).not.toBe(999);
+    expect(b.amount === null || b.amount === 848).toBe(true);
+  });
+
+  it('leaves amount null when several unresolved currency amounts remain', () => {
+    const b = boundTotals({
+      mandate: 'Hard max $700.',
+      proposed_action: 'Compare the $848 offer with the $999 offer.',
+    });
+    expect(b.amount).toBeNull();
+    expect(b.ceiling).toBe(700);
+  });
+
+  it('binds €848, £848, and 848 EUR/GBP', () => {
+    expect(boundTotals({ proposed_action: 'Buy it at €848.' }).amount).toBe(848);
+    expect(boundTotals({ proposed_action: 'Buy it at £848.' }).amount).toBe(848);
+    expect(boundTotals({ proposed_action: 'Buy it at 848 EUR.' }).amount).toBe(848);
+    expect(boundTotals({ proposed_action: 'Buy it at 848 GBP.' }).amount).toBe(848);
+    expect(boundTotals({ mandate: 'Spend up to 700 USD.' }).ceiling).toBe(700);
+  });
+
+  it('parses $1,499 from proposed_action as 1499', () => {
+    const b = boundTotals({ proposed_action: 'Pay $1,499 at checkout.' });
+    expect(b.amount).toBe(1499);
+  });
 });
 
 describe('bindObjectionText — Sony-class free-text bounds', () => {
@@ -118,6 +178,32 @@ describe('bindObjectionText — Sony-class free-text bounds', () => {
     expect(r.status).toBe('verified');
     expect(r.surface).toBe('pass_through');
     expect(r.safe_reason).not.toMatch(UNVERIFIED_STUB_RE);
+  });
+
+  it('verifies budget mismatch ($848 vs $700 max)', () => {
+    const r = bindObjectionText('budget mismatch ($848 vs $700 max)', SONY_CTX);
+    expect(r.status).toBe('verified');
+    expect(r.surface).toBe('pass_through');
+  });
+
+  it('does not verify Price is $700 when bound amount is 848', () => {
+    const r = bindObjectionText('Price is $700.', {
+      structured_context: {
+        granted: { max_amount: 700 },
+        proposed: { amount: 848 },
+      },
+    });
+    expect(r.status).toBe('unverified_insufficient_bounds');
+    expect(r.safe_reason).toMatch(UNVERIFIED_STUB_RE);
+  });
+
+  it('does not verify $848 plus an unbound $9,999', () => {
+    const r = bindObjectionText(
+      'Price is $700 and the purchase exceeds the budget by $9,999.',
+      SONY_CTX,
+    );
+    expect(r.status).toBe('unverified_insufficient_bounds');
+    expect(r.safe_reason).toMatch(UNVERIFIED_STUB_RE);
   });
 });
 
@@ -160,6 +246,57 @@ describe('bindAxisResults', () => {
     const objections = mcpObjections(b.surface_axes);
     expect(objections).toContain('budget mismatch ($848 vs $700 max)');
     expect(objections.join('\n')).not.toMatch(UNVERIFIED_STUB_RE);
+  });
+
+  it('does not suppress the stub beside an unchecked model FAIL', () => {
+    const axes: AxisResult[] = [
+      {
+        axis: 'intent',
+        verdict: 'FAIL',
+        confidence: 0.9,
+        reasoning: 'Goal drifted.',
+        objection: 'goal drift toward adjacent ads',
+      },
+      {
+        axis: 'scope',
+        verdict: 'FAIL',
+        confidence: 0.9,
+        reasoning: 'Unbound numeric.',
+        objection: 'Price is $700 and the purchase exceeds the budget by $9,999.',
+      },
+    ];
+    const b = bindAxisResults(axes, SONY_CTX);
+    expect(b.surface_axes[0]!.verdict).toBe('FAIL');
+    expect(b.surface_axes[0]!.objection).toBe('goal drift toward adjacent ads');
+    expect(b.surface_axes[1]!.verdict).toBe('FAIL');
+    expect(b.surface_axes[1]!.objection).toMatch(UNVERIFIED_STUB_RE);
+  });
+
+  it('suppresses the stub only beside a binder-verified FAIL', () => {
+    const axes: AxisResult[] = [
+      {
+        axis: 'scope',
+        verdict: 'FAIL',
+        confidence: 0.95,
+        reasoning: 'Proposed $848 is above the $700 mandate ceiling.',
+        objection: 'budget mismatch ($848 vs $700 max)',
+      },
+      {
+        axis: 'risk',
+        verdict: 'FAIL',
+        confidence: 0.8,
+        reasoning: 'Unbound add-on.',
+        objection: 'Price is $700 and the purchase exceeds the budget by $9,999.',
+      },
+    ];
+    const b = bindAxisResults(axes, SONY_CTX);
+    const scopeBind = b.items[0]!;
+    expect(scopeBind.status).toBe('verified');
+    expect(scopeBind.surface).toBe('pass_through');
+    expect(b.surface_axes[0]!.objection).toBe('budget mismatch ($848 vs $700 max)');
+    expect(b.surface_axes[1]!.verdict).toBe('FAIL');
+    expect(b.surface_axes[1]!.objection).not.toMatch(UNVERIFIED_STUB_RE);
+    expect(b.surface_axes[1]!.objection).toBe('');
   });
 
   it('keeps the unverified stub when it is the only FAIL surface (fail-closed)', () => {
