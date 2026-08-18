@@ -158,12 +158,20 @@ describe('boundTotals — free-text proposed_action money', () => {
     expect(b.ceiling).toBe(700);
   });
 
-  it('binds €848, £848, and 848 EUR/GBP', () => {
-    expect(boundTotals({ proposed_action: 'Buy it at €848.' }).amount).toBe(848);
-    expect(boundTotals({ proposed_action: 'Buy it at £848.' }).amount).toBe(848);
-    expect(boundTotals({ proposed_action: 'Buy it at 848 EUR.' }).amount).toBe(848);
-    expect(boundTotals({ proposed_action: 'Buy it at 848 GBP.' }).amount).toBe(848);
+  it('binds USD only; € / £ / EUR / GBP stay unbound', () => {
+    expect(boundTotals({ proposed_action: 'Buy it at €848.' }).amount).toBeNull();
+    expect(boundTotals({ proposed_action: 'Buy it at £848.' }).amount).toBeNull();
+    expect(boundTotals({ proposed_action: 'Buy it at 848 EUR.' }).amount).toBeNull();
+    expect(boundTotals({ proposed_action: 'Buy it at 848 GBP.' }).amount).toBeNull();
+    expect(boundTotals({ proposed_action: 'Buy it at $848.' }).amount).toBe(848);
     expect(boundTotals({ mandate: 'Spend up to 700 USD.' }).ceiling).toBe(700);
+  });
+
+  it('does not mix neighbor labels across Budget $700 / Price $848', () => {
+    const text = 'Budget is $700. Price is $848.';
+    const b = boundTotals({ mandate: text, proposed_action: text });
+    expect(b.ceiling).toBe(700);
+    expect(b.amount).toBe(848);
   });
 
   it('parses $1,499 from proposed_action as 1499', () => {
@@ -204,6 +212,43 @@ describe('bindObjectionText — Sony-class free-text bounds', () => {
     );
     expect(r.status).toBe('unverified_insufficient_bounds');
     expect(r.safe_reason).toMatch(UNVERIFIED_STUB_RE);
+  });
+
+  it('does not verify €848 against a $700 cap (no FX)', () => {
+    const r = bindObjectionText('€848 exceeds the $700 budget.', {
+      mandate: 'Hard cap $700.',
+      proposed_action: 'Buy it for €848.',
+    });
+    expect(r.status).toBe('unverified_insufficient_bounds');
+    expect(r.safe_reason).toMatch(UNVERIFIED_STUB_RE);
+    expect(r.bounds.amount).toBeNull();
+    expect(r.bounds.ceiling).toBe(700);
+  });
+
+  it('does not treat $856 as bound to amount 848', () => {
+    const r = bindObjectionText('Price is $856.', SONY_CTX);
+    expect(r.status).toBe('unverified_insufficient_bounds');
+  });
+
+  it('does not treat $707 as bound to ceiling 700', () => {
+    const r = bindObjectionText('Budget is $707.', SONY_CTX);
+    expect(r.status).toBe('unverified_insufficient_bounds');
+  });
+
+  it('does not verify unbound standalone counts or percents', () => {
+    expect(
+      bindObjectionText('Price is $848 and the seller has 999 complaints.', SONY_CTX)
+        .status,
+    ).toBe('unverified_insufficient_bounds');
+    expect(
+      bindObjectionText('Price is $848 with a 99% failure rate.', SONY_CTX).status,
+    ).toBe('unverified_insufficient_bounds');
+  });
+
+  it('exempts A6400 model numbers while still binding $848', () => {
+    const r = bindObjectionText('Sony A6400 at $848', SONY_CTX);
+    expect(r.status).toBe('verified');
+    expect(r.surface).toBe('pass_through');
   });
 });
 
