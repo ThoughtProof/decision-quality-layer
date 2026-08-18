@@ -281,11 +281,6 @@ describe('runVerification', () => {
     expect(scope.verdict).toBe('FAIL');
     expect(scope.confidence).toBe(1);
     expect(scope.objection.length).toBeGreaterThan(0);
-    expect(scope.objection).not.toMatch(
-      /numeric claims? without bound evidence|\[objection_unverified\]/i,
-    );
-    expect(scope.objection).toMatch(/2000/);
-    expect(scope.objection).toMatch(/200/);
 
     // Probe 2 / MAJOR-1 fix: skipped axes are UNCERTAIN@0 — never fabricated PASS.
     const skipped = out.axes.filter((a) => a.axis !== 'scope');

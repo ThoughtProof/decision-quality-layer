@@ -271,16 +271,6 @@ function extractStandaloneNumbers(text: string, money: MoneyToken[]): number[] {
   return out;
 }
 
-function standaloneNumbersBound(nums: number[], bounds: BoundTotals, tol: number): boolean {
-  const extras = Object.values(bounds.components);
-  return nums.every(
-    (n) =>
-      closeNum(n, bounds.amount, tol) ||
-      closeNum(n, bounds.ceiling, tol) ||
-      extras.some((c) => closeNum(n, c, tol)),
-  );
-}
-
 function moneyTokensBound(tokens: MoneyToken[], bounds: BoundTotals, tol: number): boolean {
   if (tokens.length === 0) return true;
   const extras = Object.values(bounds.components);
@@ -649,10 +639,11 @@ export function bindObjectionText(
 
   // Every monetary figure in the claim must be bound, with semantic
   // assignment (price/amount/cost/total → amount; budget/cap/max → ceiling).
-  // Standalone counts / percents must also bind; model ids (A6400) are exempt.
+  // After the A6400 / model-id exemption, any leftover standalone number
+  // (counts, percents) is fail-closed — never bound to amount/ceiling.
   if (
     (money.length > 0 && !moneyTokensBound(money, bounds, tol)) ||
-    (standalone.length > 0 && !standaloneNumbersBound(standalone, bounds, tol))
+    standalone.length > 0
   ) {
     result.status = 'unverified_insufficient_bounds';
     result.surface = 'strip_reason';

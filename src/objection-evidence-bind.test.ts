@@ -245,8 +245,29 @@ describe('bindObjectionText — Sony-class free-text bounds', () => {
     ).toBe('unverified_insufficient_bounds');
   });
 
+  it('does not bind 99% to amount $99', () => {
+    const r = bindObjectionText('Price is $99 with a 99% failure rate.', {
+      structured_context: {
+        granted: { max_amount: 700 },
+        proposed: { amount: 99 },
+      },
+    });
+    expect(r.status).toBe('unverified_insufficient_bounds');
+  });
+
+  it('does not bind 700 complaints to ceiling $700', () => {
+    const r = bindObjectionText('Budget is $700 with 700 complaints.', SONY_CTX);
+    expect(r.status).toBe('unverified_insufficient_bounds');
+  });
+
   it('exempts A6400 model numbers while still binding $848', () => {
     const r = bindObjectionText('Sony A6400 at $848', SONY_CTX);
+    expect(r.status).toBe('verified');
+    expect(r.surface).toBe('pass_through');
+  });
+
+  it('verifies $848 vs $700', () => {
+    const r = bindObjectionText('budget mismatch ($848 vs $700 max)', SONY_CTX);
     expect(r.status).toBe('verified');
     expect(r.surface).toBe('pass_through');
   });
