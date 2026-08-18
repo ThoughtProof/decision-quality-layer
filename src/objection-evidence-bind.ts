@@ -21,15 +21,29 @@ const WITHIN_RE =
   /(within\s+(?:budget|limit|ceiling)|under\s+(?:budget|limit|ceiling)|below\s+(?:the\s+)?(?:budget|limit|ceiling)|does\s+not\s+exceed)/i;
 
 const TOTAL_RE =
-  /(?:total|sum|cost|amount|price|notional|size)\s*(?:is|=|:)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)/i;
+  /(?:total|sum|cost|amount|price|notional)\s*(?:is|=|:)\s*(?:[$€£])?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/i;
 
 const CEILING_RE =
-  /(?:budget|ceiling|limit|max(?:imum)?)\s*(?:of|is|=|:)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)/i;
+  /(?:budget|ceiling|limit|max(?:imum)?|cap)\s*(?:of|is|=|:)?\s*(?:[$€£])?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/i;
 
-const NUM_RE = /([0-9]+(?:[.,][0-9]+)?)/g;
+const NUM_RE = /([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g;
 
+/** `$100 + $200 = $300` — USD only; no FX. */
 const MONEY_PAIR_RE =
-  /\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*(?:\+|and|,)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*=\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)/i;
+  /\$\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?:\+|and)\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*=\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/i;
+
+const MONEY_NUM = String.raw`[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?`;
+const MONEY_SYM_RE = /\$\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g;
+const MONEY_ISO_RE = new RegExp(`(${MONEY_NUM})\\s*(USD)\\b`, 'gi');
+const NON_USD_MONEY_RE = /[€£]|\b(?:EUR|GBP)\b/i;
+
+/** Currency precision for money compares — no relative 1%. */
+const MONEY_ABS_TOL = 0.005;
+
+const UNVERIFIED_STUB =
+  '[objection_unverified] numeric claim without bound evidence';
+const UNVERIFIED_STUB_RE =
+  /numeric claims? without bound evidence|\[objection_unverified\]/i;
 
 export type BindSurface = 'pass_through' | 'strip_reason' | 'rewrite_reason';
 
@@ -94,12 +108,217 @@ export interface BindContext {
 function num(x: unknown): number | null {
   if (x === null || x === undefined || typeof x === 'boolean') return null;
   if (typeof x === 'number' && Number.isFinite(x)) return x;
-  if (typeof x === 'string') {
-    const s = x.trim().replace(/,/g, '').replace(/\$/g, '');
-    const m = s.match(/-?\d+(?:\.\d+)?/);
-    if (!m) return null;
-    const v = Number(m[0]);
+  if (typeof x === 'string') return parseMoneyNumber(x);
+  return null;
+}
+
+/**
+ * Parse a finance figure. `$1,499` → 1499 (comma thousands), never 1.499.
+ * Accepts optional `$` / `€` / `£` wrappers.
+ */
+export function parseMoneyNumber(raw: string): number | null {
+  const s = String(raw ?? '')
+    .trim()
+    .replace(/[$€£]/g, '')
+    .replace(/\s+/g, '');
+  if (!s) return null;
+  if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) {
+    const v = Number(s.replace(/,/g, ''));
     return Number.isFinite(v) ? v : null;
+  }
+  if (/^-?\d+(\.\d+)?$/.test(s)) {
+    const v = Number(s);
+    return Number.isFinite(v) ? v : null;
+  }
+  return null;
+}
+
+type MoneyLabel = 'amount' | 'ceiling' | 'list' | null;
+
+interface MoneyToken {
+  value: number;
+  raw: string;
+  start: number;
+  end: number;
+  label: MoneyLabel;
+}
+
+function closeNum(n: number, target: number | null, tol: number): boolean {
+  if (target === null) return false;
+  return Math.abs(n - target) <= Math.max(tol, MONEY_ABS_TOL);
+}
+
+function clauseBounds(text: string, start: number, end: number): { from: number; to: number } {
+  const prev = Math.max(
+    text.lastIndexOf('.', start - 1),
+    text.lastIndexOf(';', start - 1),
+    text.lastIndexOf('!', start - 1),
+    text.lastIndexOf('?', start - 1),
+  );
+  const nextHits = ['.', ';', '!', '?']
+    .map((ch) => text.indexOf(ch, end))
+    .filter((i) => i >= 0);
+  const next = nextHits.length > 0 ? Math.min(...nextHits) : text.length;
+  return { from: prev + 1, to: next };
+}
+
+function labelAround(
+  text: string,
+  start: number,
+  end: number,
+  clipFrom = 0,
+  clipTo = text.length,
+): MoneyLabel {
+  type Cand = { label: MoneyLabel; dist: number; pri: number };
+  const specs: Array<{ re: RegExp; label: MoneyLabel; pri: number }> = [
+    { re: /\blist(\s+price)?\b|\bmsrp\b|\boriginal(\s+price)?\b|\bwas\b/gi, label: 'list', pri: 3 },
+    { re: /\b(?:budget|cap|ceiling|max(?:imum)?|limit)\b/gi, label: 'ceiling', pri: 2 },
+    { re: /\b(?:under|below|up to|at most|no more than)\b/gi, label: 'ceiling', pri: 2 },
+    { re: /\b(?:price|amount|cost|total|notional|sale|purchase)\b/gi, label: 'amount', pri: 1 },
+  ];
+  const clause = clauseBounds(text, start, end);
+  const winStart = Math.max(clipFrom, clause.from, start - 48);
+  const winEnd = Math.min(clipTo, clause.to, end + 28);
+  if (winEnd <= winStart) return null;
+  const win = text.slice(winStart, winEnd);
+  let best: Cand | null = null;
+  for (const spec of specs) {
+    spec.re.lastIndex = 0;
+    for (const m of win.matchAll(spec.re)) {
+      if (m.index === undefined) continue;
+      const absStart = winStart + m.index;
+      const absEnd = absStart + m[0].length;
+      if (spec.label === 'ceiling') {
+        const around = text.slice(absStart, absEnd + 16).toLowerCase();
+        if (/^budget\s+mismatch\b/.test(around)) continue;
+      }
+      const dist =
+        absEnd <= start ? start - absEnd : absStart >= end ? absStart - end : 0;
+      if (!best || dist < best.dist || (dist === best.dist && spec.pri > best.pri)) {
+        best = { label: spec.label, dist, pri: spec.pri };
+      }
+    }
+  }
+  return best?.label ?? null;
+}
+
+export function extractMoneyTokens(text: string): MoneyToken[] {
+  const found: Array<Omit<MoneyToken, 'label'>> = [];
+  if (!text) return [];
+  const occupied: Array<{ start: number; end: number }> = [];
+  const overlaps = (start: number, end: number) =>
+    occupied.some((r) => start < r.end && end > r.start);
+
+  for (const m of text.matchAll(MONEY_SYM_RE)) {
+    if (m.index === undefined) continue;
+    const v = parseMoneyNumber(m[1] ?? '');
+    if (v === null) continue;
+    const start = m.index;
+    const end = start + m[0].length;
+    occupied.push({ start, end });
+    found.push({ value: v, raw: m[0], start, end });
+  }
+  for (const m of text.matchAll(MONEY_ISO_RE)) {
+    if (m.index === undefined) continue;
+    const v = parseMoneyNumber(m[1] ?? '');
+    if (v === null) continue;
+    const start = m.index;
+    const end = start + m[0].length;
+    if (overlaps(start, end)) continue;
+    occupied.push({ start, end });
+    found.push({ value: v, raw: m[0], start, end });
+  }
+  found.sort((a, b) => a.start - b.start);
+
+  const out: MoneyToken[] = found.map((t, i) => {
+    const clipFrom = i > 0 ? found[i - 1]!.end : 0;
+    const clipTo = i + 1 < found.length ? found[i + 1]!.start : text.length;
+    return { ...t, label: labelAround(text, t.start, t.end, clipFrom, clipTo) };
+  });
+
+  // `$848 vs $700` — left is amount, right is ceiling.
+  for (let i = 0; i < out.length - 1; i++) {
+    const a = out[i]!;
+    const b = out[i + 1]!;
+    const between = text.slice(a.end, b.start);
+    if (/^\s*vs\.?\s*$/i.test(between)) {
+      a.label = 'amount';
+      b.label = 'ceiling';
+    }
+  }
+  return out;
+}
+
+function isModelIdentifier(text: string, start: number): boolean {
+  if (start <= 0) return false;
+  const prev = text[start - 1]!;
+  if (/[A-Za-z]/.test(prev)) return true;
+  return prev === '-' && start >= 2 && /[A-Za-z]/.test(text[start - 2]!);
+}
+
+function extractStandaloneNumbers(text: string, money: MoneyToken[]): number[] {
+  const out: number[] = [];
+  if (!text) return out;
+  for (const m of text.matchAll(NUM_RE)) {
+    if (m.index === undefined) continue;
+    const start = m.index;
+    const end = start + m[0].length;
+    if (money.some((t) => start >= t.start && end <= t.end)) continue;
+    if (isModelIdentifier(text, start)) continue;
+    const v = parseMoneyNumber(m[1] ?? '');
+    if (v !== null) out.push(v);
+  }
+  return out;
+}
+
+function moneyTokensBound(tokens: MoneyToken[], bounds: BoundTotals, tol: number): boolean {
+  if (tokens.length === 0) return true;
+  const extras = Object.values(bounds.components);
+  const isBoundValue = (n: number) =>
+    closeNum(n, bounds.amount, tol) ||
+    closeNum(n, bounds.ceiling, tol) ||
+    extras.some((c) => closeNum(n, c, tol));
+
+  for (const t of tokens) {
+    if (t.label === 'amount') {
+      if (!closeNum(t.value, bounds.amount, tol)) return false;
+    } else if (t.label === 'ceiling') {
+      if (!closeNum(t.value, bounds.ceiling, tol)) return false;
+    } else if (!isBoundValue(t.value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function amountFromProposedAction(text: string): number | null {
+  const tokens = extractMoneyTokens(text);
+  if (tokens.length === 0) return null;
+  const actionable = tokens.filter((t) => t.label !== 'list');
+  const labeled = actionable.filter((t) => t.label === 'amount');
+  if (labeled.length === 1) return labeled[0]!.value;
+  if (labeled.length > 1) {
+    const first = labeled[0]!.value;
+    return labeled.every((t) => t.value === first) ? first : null;
+  }
+  if (actionable.length === 1) return actionable[0]!.value;
+  const eq = MONEY_PAIR_RE.exec(text);
+  if (eq) {
+    const a = parseMoneyNumber(eq[1] ?? '');
+    const b = parseMoneyNumber(eq[2] ?? '');
+    const c = parseMoneyNumber(eq[3] ?? '');
+    if (a !== null && b !== null && c !== null && Math.abs(a + b - c) <= 0.02) return c;
+  }
+  return null;
+}
+
+function ceilingFromFreeText(text: string): number | null {
+  const tokens = extractMoneyTokens(text);
+  const labeled = tokens.filter((t) => t.label === 'ceiling');
+  if (labeled.length === 1) return labeled[0]!.value;
+  if (labeled.length > 1) {
+    const first = labeled[0]!.value;
+    return labeled.every((t) => t.value === first) ? first : null;
   }
   return null;
 }
@@ -289,23 +508,33 @@ export function boundTotals(ctx: BindContext): BoundTotals {
     }
   }
 
-  // free-text ceiling from free-text fields if still missing
+  // Free-text finance values require an explicit currency in the match
+  // ($ / € / £ or ISO USD/EUR/GBP). `under 2 kg` / `total 3 cameras` stay out.
   if (out.ceiling === null) {
     for (const t of [ctx.mandate, ctx.proposed_action, ctx.reasoning, ctx.context]) {
       if (!t) continue;
-      const m = CEILING_RE.exec(t);
-      if (m) {
-        const v = num(m[1]);
-        if (v !== null) {
-          out.ceiling = v;
-          out.sources.push('text.ceiling');
-          break;
-        }
+      const v = ceilingFromFreeText(t);
+      if (v !== null) {
+        out.ceiling = v;
+        out.sources.push('text.ceiling');
+        break;
       }
     }
   }
 
+  if (out.amount === null && ctx.proposed_action) {
+    const v = amountFromProposedAction(ctx.proposed_action);
+    if (v !== null) {
+      out.amount = v;
+      out.sources.push('text.proposed_action.money');
+    }
+  }
+
   return out;
+}
+
+export function isUnverifiedNumericStub(text: string): boolean {
+  return UNVERIFIED_STUB_RE.test(String(text ?? ''));
 }
 
 export function parseNumericClaim(text: string): NumericClaim {
@@ -322,7 +551,7 @@ export function parseNumericClaim(text: string): NumericClaim {
 
   const nums: number[] = [];
   for (const m of s.matchAll(NUM_RE)) {
-    const v = num(m[1]);
+    const v = parseMoneyNumber(m[1] ?? '');
     if (v !== null) nums.push(v);
   }
   claim.parsed_numbers = nums.slice(0, 8);
@@ -337,18 +566,30 @@ export function parseNumericClaim(text: string): NumericClaim {
 
   const mt = TOTAL_RE.exec(s);
   if (mt) {
-    claim.stated_total = num(mt[1]);
+    claim.stated_total = parseMoneyNumber(mt[1] ?? '');
     claim.is_numericish = true;
   }
   const mc = CEILING_RE.exec(s);
   if (mc) {
-    claim.stated_ceiling = num(mc[1]);
+    claim.stated_ceiling = parseMoneyNumber(mc[1] ?? '');
     claim.is_numericish = true;
   }
   const mp = MONEY_PAIR_RE.exec(s);
   if (mp) {
-    claim.stated_total = num(mp[3]);
+    claim.stated_total = parseMoneyNumber(mp[3] ?? '');
     claim.is_numericish = true;
+  }
+
+  const money = extractMoneyTokens(s);
+  if (money.length > 0) {
+    claim.is_numericish = true;
+    const vsAmount = money.find((t) => t.label === 'amount');
+    const vsCeiling = money.find((t) => t.label === 'ceiling');
+    if (vsAmount && claim.stated_total === null) claim.stated_total = vsAmount.value;
+    if (vsCeiling && claim.stated_ceiling === null) claim.stated_ceiling = vsCeiling.value;
+    if (/\bmismatch\b|\bvs\.?\b/i.test(s) && vsAmount && vsCeiling) {
+      claim.relation = claim.relation ?? 'exceed';
+    }
   }
 
   return claim;
@@ -377,20 +618,53 @@ export function bindObjectionText(
   const ceiling = bounds.ceiling;
   const statedTotal = claim.stated_total;
   const statedCeiling = claim.stated_ceiling;
+  const rawText = String(text ?? '');
+  const money = extractMoneyTokens(rawText);
+  const standalone = extractStandaloneNumbers(rawText, money);
+
+  // USD-only this PR: non-USD currency in the claim is not comparable (no FX).
+  if (NON_USD_MONEY_RE.test(rawText)) {
+    result.status = 'unverified_insufficient_bounds';
+    result.surface = 'strip_reason';
+    result.safe_reason = UNVERIFIED_STUB;
+    result.log_code = 'numeric_unverified';
+    result.detail = {
+      has_amount: amount !== null,
+      has_ceiling: ceiling !== null,
+      relation: claim.relation,
+      non_usd_currency: true,
+    };
+    return result;
+  }
+
+  // Every monetary figure in the claim must be bound, with semantic
+  // assignment (price/amount/cost/total → amount; budget/cap/max → ceiling).
+  // After the A6400 / model-id exemption, any leftover standalone number
+  // (counts, percents) is fail-closed — never bound to amount/ceiling.
+  if (
+    (money.length > 0 && !moneyTokensBound(money, bounds, tol)) ||
+    standalone.length > 0
+  ) {
+    result.status = 'unverified_insufficient_bounds';
+    result.surface = 'strip_reason';
+    result.safe_reason = UNVERIFIED_STUB;
+    result.log_code = 'numeric_unverified';
+    result.detail = {
+      has_amount: amount !== null,
+      has_ceiling: ceiling !== null,
+      relation: claim.relation,
+      unbound_money: true,
+    };
+    return result;
+  }
 
   if (claim.relation === 'exceed' && amount !== null && ceiling !== null) {
     const actuallyExceeds = amount > ceiling + tol;
     let numMismatch = false;
-    if (
-      statedTotal !== null &&
-      Math.abs(statedTotal - amount) > Math.max(tol, 0.01 * Math.max(Math.abs(amount), 1))
-    ) {
+    if (statedTotal !== null && !closeNum(statedTotal, amount, tol)) {
       numMismatch = true;
     }
-    if (
-      statedCeiling !== null &&
-      Math.abs(statedCeiling - ceiling) > Math.max(tol, 0.01 * Math.max(Math.abs(ceiling), 1))
-    ) {
+    if (statedCeiling !== null && !closeNum(statedCeiling, ceiling, tol)) {
       numMismatch = true;
     }
 
@@ -446,10 +720,24 @@ export function bindObjectionText(
     return result;
   }
 
+  // All cited USD figures are bound and assigned. No exceed/within relation —
+  // still pass through (Sony `budget mismatch ($848 vs $700 max)`).
+  if (money.length > 0 && amount !== null && ceiling !== null) {
+    result.status = 'verified';
+    result.surface = 'pass_through';
+    result.log_code = 'numeric_bound_match';
+    result.detail = {
+      computed_amount: amount,
+      computed_ceiling: ceiling,
+      relation: claim.relation,
+    };
+    return result;
+  }
+
   // Numericish but insufficient bounds — fail-closed on surface text only
   result.status = 'unverified_insufficient_bounds';
   result.surface = 'strip_reason';
-  result.safe_reason = '[objection_unverified] numeric claim without bound evidence';
+  result.safe_reason = UNVERIFIED_STUB;
   result.log_code = 'numeric_unverified';
   result.detail = {
     has_amount: amount !== null,
@@ -477,28 +765,28 @@ function applyTextBind(
   counters: { non: number; verified: number; fail: number; unverified: number },
   items: BindItemResult[],
   codes: string[],
-): string {
+): { text: string; item: BindItemResult } {
   const r = bindObjectionText(text ?? '', ctx);
   items.push(r);
   if (r.log_code) codes.push(r.log_code);
   if (r.status === 'non_numeric') {
     counters.non++;
-    return text ?? '';
+    return { text: text ?? '', item: r };
   }
   if (r.status === 'verified') {
     counters.verified++;
-    return text ?? '';
+    return { text: text ?? '', item: r };
   }
   if (r.status === 'numbers_rewritten') {
     counters.verified++;
-    return r.safe_reason;
+    return { text: r.safe_reason, item: r };
   }
   if (r.status === 'objection_evidence_fail') {
     counters.fail++;
-    return r.safe_reason;
+    return { text: r.safe_reason, item: r };
   }
   counters.unverified++;
-  return r.safe_reason;
+  return { text: r.safe_reason, item: r };
 }
 
 /**
@@ -513,23 +801,34 @@ export function bindAxisResults(
   const codes: string[] = [];
   const counters = { non: 0, verified: 0, fail: 0, unverified: 0 };
   const surface: AxisResult[] = [];
+  const objectionBinds: Array<BindItemResult | null> = [];
 
   for (const axis of axes ?? []) {
     const next: AxisResult = { ...axis };
+    let objectionBind: BindItemResult | null = null;
     // Bind objection first (primary surface for FAIL/UNCERTAIN)
     if ((next.objection ?? '').trim()) {
-      next.objection = applyTextBind(next.objection, ctx, counters, items, codes);
+      const applied = applyTextBind(next.objection, ctx, counters, items, codes);
+      next.objection = applied.text;
+      objectionBind = applied.item;
     } else {
       counters.non++;
     }
     // Bind reasoning second (always present)
     if ((next.reasoning ?? '').trim()) {
-      next.reasoning = applyTextBind(next.reasoning, ctx, counters, items, codes);
+      const applied = applyTextBind(next.reasoning, ctx, counters, items, codes);
+      next.reasoning = applied.text;
     } else {
       counters.non++;
     }
+    objectionBinds.push(objectionBind);
     surface.push(next);
   }
+
+  // Receipt / MCP hygiene: suppress the unverified stub only beside a
+  // binder-verified FAIL (status verified + pass_through/rewrite_reason).
+  // Unchecked model text must not hide the last unbound-numeric stub.
+  suppressUnverifiedStubBesideConcreteFail(surface, objectionBinds);
 
   return {
     n: items.length,
@@ -542,4 +841,33 @@ export function bindAxisResults(
     items,
     codes,
   };
+}
+
+function isConcreteVerifiedFail(
+  axis: AxisResult,
+  objectionBind: BindItemResult | null,
+): boolean {
+  if (axis.verdict !== 'FAIL' || !objectionBind) return false;
+  return (
+    objectionBind.status === 'verified' &&
+    (objectionBind.surface === 'pass_through' || objectionBind.surface === 'rewrite_reason')
+  );
+}
+
+function suppressUnverifiedStubBesideConcreteFail(
+  axes: AxisResult[],
+  objectionBinds: Array<BindItemResult | null>,
+): void {
+  const hasConcreteFail = axes.some((a, i) =>
+    isConcreteVerifiedFail(a, objectionBinds[i] ?? null),
+  );
+  if (!hasConcreteFail) return;
+  for (const axis of axes) {
+    if (isUnverifiedNumericStub(axis.objection ?? '')) {
+      axis.objection = '';
+    }
+    if (isUnverifiedNumericStub(axis.reasoning ?? '')) {
+      axis.reasoning = '';
+    }
+  }
 }

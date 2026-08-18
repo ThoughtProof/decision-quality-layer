@@ -224,11 +224,15 @@ export function runStructuralPrecheck(
         const ceiling = maxAmount * (1 + AMOUNT_OVERSHOOT_TOLERANCE);
         if (actionAmount > ceiling) {
           const unit = gCur ? ` ${gCur}` : '';
+          // Implicit same unit (both currencies unset) is USD for bind:
+          // bare 2000/200 would be leftover standalones and fail-closed to
+          // the unverified stub. `$2000` / `$200` stay concrete money.
+          const fmt = (n: number) => (unit ? `${n}${unit}` : `$${n}`);
           violations.push({
             kind: 'amount_overshoot',
             detail:
-              `Proposed amount ${actionAmount}${unit} exceeds granted maximum ` +
-              `${maxAmount}${unit}. The principal did not authorize this magnitude.`,
+              `Proposed amount ${fmt(actionAmount)} exceeds granted maximum ` +
+              `${fmt(maxAmount)}. The principal did not authorize this magnitude.`,
           });
         }
       }
