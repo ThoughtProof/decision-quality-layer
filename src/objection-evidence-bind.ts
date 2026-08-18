@@ -31,6 +31,20 @@ const NUM_RE = /([0-9]+(?:[.,][0-9]+)?)/g;
 const MONEY_PAIR_RE =
   /\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*(?:\+|and|,)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*=\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)/i;
 
+/** `$848` or `848 USD` — not bare model numbers (A6400). */
+const DOLLAR_RE = /\$\s*([0-9]+(?:[.,][0-9]+)?)/g;
+const CURRENCY_AMT_RE =
+  /(?:^|[^\w.])([0-9]+(?:[.,][0-9]+)?)\s*(?:usd|eur|gbp)\b/gi;
+const AMOUNT_TEXT_RE =
+  /(?:amount|price|cost|total|notional)\s*(?:is|=|:)?\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)/i;
+const UNDER_CEILING_RE =
+  /(?:under|below|up to|at most|no more than)\s+\$?\s*([0-9]+(?:[.,][0-9]+)?)/i;
+
+const UNVERIFIED_STUB =
+  '[objection_unverified] numeric claim without bound evidence';
+const UNVERIFIED_STUB_RE =
+  /numeric claims? without bound evidence|\[objection_unverified\]/i;
+
 export type BindSurface = 'pass_through' | 'strip_reason' | 'rewrite_reason';
 
 export type BindStatus =
@@ -293,7 +307,7 @@ export function boundTotals(ctx: BindContext): BoundTotals {
   if (out.ceiling === null) {
     for (const t of [ctx.mandate, ctx.proposed_action, ctx.reasoning, ctx.context]) {
       if (!t) continue;
-      const m = CEILING_RE.exec(t);
+      const m = CEILING_RE.exec(t) ?? UNDER_CEILING_RE.exec(t);
       if (m) {
         const v = num(m[1]);
         if (v !== null) {
@@ -305,7 +319,48 @@ export function boundTotals(ctx: BindContext): BoundTotals {
     }
   }
 
+  // Free-text proposed_action money (Sony / A6400 family): `$848` is bound
+  // evidence for the action amount when structured.proposed.amount is absent.
+  // Do not harvest bare integers — model numbers like A6400 are not amounts.
+  if (out.amount === null && ctx.proposed_action) {
+    const fromLabel = AMOUNT_TEXT_RE.exec(ctx.proposed_action);
+    const labeled = fromLabel ? num(fromLabel[1]) : null;
+    if (labeled !== null && labeled !== out.ceiling) {
+      out.amount = labeled;
+      out.sources.push('text.proposed_action.amount');
+    } else {
+      const money = extractMoneyAmounts(ctx.proposed_action).filter(
+        (v) => out.ceiling === null || Math.abs(v - out.ceiling) > 1e-6,
+      );
+      if (money.length === 1) {
+        out.amount = money[0]!;
+        out.sources.push('text.proposed_action.money');
+      } else if (money.length > 1) {
+        out.amount = Math.max(...money);
+        out.sources.push('text.proposed_action.money_max');
+      }
+    }
+  }
+
   return out;
+}
+
+function extractMoneyAmounts(text: string): number[] {
+  const out: number[] = [];
+  if (!text) return out;
+  for (const m of text.matchAll(DOLLAR_RE)) {
+    const v = num(m[1]);
+    if (v !== null) out.push(v);
+  }
+  for (const m of text.matchAll(CURRENCY_AMT_RE)) {
+    const v = num(m[1]);
+    if (v !== null) out.push(v);
+  }
+  return out;
+}
+
+export function isUnverifiedNumericStub(text: string): boolean {
+  return UNVERIFIED_STUB_RE.test(String(text ?? ''));
 }
 
 export function parseNumericClaim(text: string): NumericClaim {
@@ -446,10 +501,32 @@ export function bindObjectionText(
     return result;
   }
 
+  // Numericish without exceed/within wording, but the cited figures are
+  // already bound (proposed_action / structured_context). Pass through —
+  // do not invent an unverified stub next to a bound-checked mismatch.
+  if (amount !== null && ceiling !== null && claim.parsed_numbers.length > 0) {
+    const boundMatch = claim.parsed_numbers.some(
+      (n) =>
+        Math.abs(n - amount) <= Math.max(tol, 0.01 * Math.max(Math.abs(amount), 1)) ||
+        Math.abs(n - ceiling) <= Math.max(tol, 0.01 * Math.max(Math.abs(ceiling), 1)),
+    );
+    if (boundMatch) {
+      result.status = 'verified';
+      result.surface = 'pass_through';
+      result.log_code = 'numeric_bound_match';
+      result.detail = {
+        computed_amount: amount,
+        computed_ceiling: ceiling,
+        relation: claim.relation,
+      };
+      return result;
+    }
+  }
+
   // Numericish but insufficient bounds — fail-closed on surface text only
   result.status = 'unverified_insufficient_bounds';
   result.surface = 'strip_reason';
-  result.safe_reason = '[objection_unverified] numeric claim without bound evidence';
+  result.safe_reason = UNVERIFIED_STUB;
   result.log_code = 'numeric_unverified';
   result.detail = {
     has_amount: amount !== null,
@@ -531,6 +608,12 @@ export function bindAxisResults(
     surface.push(next);
   }
 
+  // Receipt / MCP hygiene: if a real FAIL objection already cites the
+  // bound-checked reason, do not also emit the unverified stub. Verdicts
+  // stay unchanged. If the stub is the only FAIL surface, keep it
+  // (fail-closed).
+  suppressUnverifiedStubBesideConcreteFail(surface);
+
   return {
     n: items.length,
     n_non_numeric: counters.non,
@@ -542,4 +625,21 @@ export function bindAxisResults(
     items,
     codes,
   };
+}
+
+function suppressUnverifiedStubBesideConcreteFail(axes: AxisResult[]): void {
+  const hasConcreteFail = axes.some((a) => {
+    if (a.verdict !== 'FAIL') return false;
+    const o = (a.objection ?? '').trim();
+    return o.length > 0 && !isUnverifiedNumericStub(o);
+  });
+  if (!hasConcreteFail) return;
+  for (const axis of axes) {
+    if (isUnverifiedNumericStub(axis.objection ?? '')) {
+      axis.objection = '';
+    }
+    if (isUnverifiedNumericStub(axis.reasoning ?? '')) {
+      axis.reasoning = '';
+    }
+  }
 }

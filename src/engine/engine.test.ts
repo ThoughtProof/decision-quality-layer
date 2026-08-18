@@ -281,6 +281,11 @@ describe('runVerification', () => {
     expect(scope.verdict).toBe('FAIL');
     expect(scope.confidence).toBe(1);
     expect(scope.objection.length).toBeGreaterThan(0);
+    expect(scope.objection).not.toMatch(
+      /numeric claims? without bound evidence|\[objection_unverified\]/i,
+    );
+    expect(scope.objection).toMatch(/2000/);
+    expect(scope.objection).toMatch(/200/);
 
     // Probe 2 / MAJOR-1 fix: skipped axes are UNCERTAIN@0 — never fabricated PASS.
     const skipped = out.axes.filter((a) => a.axis !== 'scope');
@@ -326,5 +331,50 @@ describe('runVerification', () => {
     expect(out.structural!.would_block).toBe(false);
     expect(out.structural!.enforced).toBe(false);
     expect(out.aggregate.verdict).toBe('ALLOW');
+  });
+
+  it('BLOCK budget-mismatch receipt does not emit the unverified numeric stub', async () => {
+    const cascade = new ScriptedCascade((axis) => ({
+      axis: axis as AxisResult['axis'],
+      verdict: axis === 'scope' || axis === 'risk' ? 'FAIL' : 'PASS',
+      confidence: 0.92,
+      reasoning:
+        axis === 'scope'
+          ? 'Proposed $848 is above the $700 mandate ceiling.'
+          : axis === 'risk'
+            ? 'Price is $848 with no structured evidence row.'
+            : 'ok',
+      objection:
+        axis === 'scope'
+          ? 'budget mismatch ($848 vs $700 max)'
+          : axis === 'risk'
+            ? 'price is $848'
+            : '',
+    }));
+
+    const out = await runVerification({
+      request: {
+        ...req,
+        mandate: 'Buy a compact camera. Hard max $700.',
+        proposed_action: 'Buy the Sony ZV-E10 at $848 from the retailer cart.',
+        reasoning: 'Best image quality in the shortlist.',
+      },
+      cascade,
+      sandboxCascade: sandbox,
+      requestId: 'test_sony_budget_mismatch',
+      version: '0.1.0',
+    });
+
+    expect(out.aggregate.verdict).toBe('BLOCK');
+    const scope = out.axes.find((a) => a.axis === 'scope')!;
+    const risk = out.axes.find((a) => a.axis === 'risk')!;
+    expect(scope.verdict).toBe('FAIL');
+    expect(risk.verdict).toBe('FAIL');
+    expect(scope.objection).toBe('budget mismatch ($848 vs $700 max)');
+
+    const stubRe = /numeric claims? without bound evidence|\[objection_unverified\]/i;
+    const objections = out.axes.map((a) => a.objection).filter((s) => s.trim());
+    expect(objections.join('\n')).not.toMatch(stubRe);
+    expect(out.axes.map((a) => a.reasoning).join('\n')).not.toMatch(stubRe);
   });
 });

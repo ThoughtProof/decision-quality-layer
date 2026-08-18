@@ -35,7 +35,7 @@ import {
   logStructuralShadowSample,
   recordStructuralSample,
 } from './structural-metrics.js';
-import { bindAxisResults } from '../objection-evidence-bind.js';
+import { bindAxisResults, type BindContext } from '../objection-evidence-bind.js';
 
 export interface EngineInput {
   request: Required<Omit<DqlRequest, 'context' | 'structured_context' | 'gate_mode'>> &
@@ -84,6 +84,13 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
       precheck,
       structuralField,
       started,
+      bindCtx: {
+        mandate: input.request.mandate,
+        proposed_action: input.request.proposed_action,
+        reasoning: input.request.reasoning,
+        context: input.request.context,
+        structured_context: input.request.structured_context,
+      },
     });
     emitStructuralMetrics({
       requestId: input.requestId,
@@ -305,6 +312,7 @@ function buildEnforcedBlockResponse(args: {
   precheck: StructuralPrecheckResult;
   structuralField: ReturnType<typeof toStructuralField>;
   started: number;
+  bindCtx: BindContext;
 }): DqlResponse {
   const detail = args.precheck.violations.map((v) => v.detail).join(' ');
   const kinds = args.precheck.violations.map((v) => v.kind).join(', ');
@@ -358,9 +366,10 @@ function buildEnforcedBlockResponse(args: {
     };
   }
 
-  // Enforce short-circuit path: still bind surface text (gate details are
-  // deterministic, but keep one code path for clients).
-  const bind = bindAxisResults(axisResults, {});
+  // Enforce short-circuit path: bind with the same request bounds as the
+  // cascade path. Empty ctx would treat the deterministic overshoot
+  // sentence as an unbound numeric claim and replace it with the stub.
+  const bind = bindAxisResults(axisResults, args.bindCtx);
   const surfaceAxes = bind.surface_axes;
 
   return {
