@@ -112,6 +112,34 @@ describe('deadline layering', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(0); // rejected before attempt when W already exhausted
   });
 
+  it('request signal abort with budget remaining sets DeadlineExceededError.aborted', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const fetchImpl = vi.fn().mockImplementation(() => {
+      const err = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+      return Promise.reject(err);
+    });
+    const client = new HttpLlmClient(BINDING, ENV, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => undefined,
+      maxAttempts: 2,
+      timeoutMs: 5_000,
+      disableCircuitBreaker: true,
+    });
+    const ctx: CallContext = {
+      requestId: 'req-abort',
+      requestSignal: ac.signal,
+      deadlineAt: Date.now() + 60_000,
+      providerCallBudgetMs: 40_000,
+    };
+    await expect(client.call('serv-nano', { system: 's', user: 'u' }, ctx)).rejects.toMatchObject({
+      name: 'DeadlineExceededError',
+      aborted: true,
+      timeoutSource: 'request_deadline',
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   // Issue #24 note: this deadline-skip test is intentionally UNCHANGED by
   // the #24 fix. The secondary is never attempted here (request budget ran
   // out before it could be called) — no provider failure occurred, so

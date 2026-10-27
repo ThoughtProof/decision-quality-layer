@@ -291,6 +291,23 @@ export interface DqlRequest {
   sandbox?: boolean;
 }
 
+/**
+ * Why a verification produced no provider answer.
+ *
+ *   outage     — both SERV circuits open (CircuitAllOpenError)
+ *   http_error — provider HTTP or transport failure (ProviderCallError)
+ *   deadline   — attempt / call / request budget exhausted
+ *   abort      — request aborted (not an attempt timeout)
+ *
+ * A model-emitted UNCERTAIN is not one of these: the provider answered.
+ */
+export type NoProviderAnswerReason = 'outage' | 'http_error' | 'deadline' | 'abort';
+
+/** Present on DqlResponse.meta only when every evaluated axis is unserved. */
+export interface NoProviderAnswerMarker {
+  reasons: NoProviderAnswerReason[];
+}
+
 export interface DqlResponse {
   id: string;
   version: string;
@@ -320,6 +337,14 @@ export interface DqlResponse {
       codes: string[];
       verdict_unchanged: true;
     };
+    /**
+     * Set only when no evaluated axis received a provider answer (outage,
+     * HTTP/transport error, deadline, or abort). Absent when at least one
+     * axis was served — including a genuine model UNCERTAIN, which stays
+     * billable. Billing (credit commit, PAYG meter, x402 settle) must not
+     * run when this field is present. Per-axis verdicts stay UNCERTAIN.
+     */
+    no_provider_answer?: NoProviderAnswerMarker;
   };
 }
 

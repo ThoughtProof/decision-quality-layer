@@ -219,15 +219,27 @@ export class ProviderCallError extends Error {
 export type TimeoutSource = 'attempt_timeout' | 'call_budget' | 'request_deadline';
 export class DeadlineExceededError extends ProviderCallError {
   public readonly timeoutSource: TimeoutSource;
+  /**
+   * True when the request signal aborted the call. False for budget
+   * exhaustion and per-attempt timeouts. The engine uses this flag — not
+   * the message string — to mark `abort` vs `deadline`.
+   */
+  public readonly aborted: boolean;
   constructor(
     message: string,
     provider: string,
     timeoutSource: TimeoutSource,
-    options?: { cause?: unknown },
+    options?: { cause?: unknown; aborted?: boolean },
   ) {
-    super(message, provider, undefined, options);
+    super(
+      message,
+      provider,
+      undefined,
+      options?.cause !== undefined ? { cause: options.cause } : undefined,
+    );
     this.name = 'DeadlineExceededError';
     this.timeoutSource = timeoutSource;
+    this.aborted = options?.aborted === true;
   }
 }
 
@@ -1092,6 +1104,7 @@ export class HttpLlmClient implements LlmClient {
           `[llm-client] request aborted before attempt ${attempt}`,
           binding.provider,
           'request_deadline',
+          { aborted: true },
         );
       }
 
@@ -1278,7 +1291,7 @@ export class HttpLlmClient implements LlmClient {
             `[llm-client] request deadline aborted after ${Date.now() - started}ms`,
             binding.provider,
             'request_deadline',
-            { cause: err },
+            { cause: err, aborted: true },
           );
         }
         // Per-attempt timeout stays retryable within PC budget (legacy contract
