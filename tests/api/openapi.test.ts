@@ -453,3 +453,20 @@ describe('AxisResult provider attribution (d7a8ff6 wire fields)', () => {
     expect(s.required).not.toContain('provider_outcome');
   });
 });
+
+describe('NoProviderAnswer marker', () => {
+  it('meta.no_provider_answer is optional and reasons are the four unserved kinds', () => {
+    const meta = schemas.DqlResponse.properties.meta;
+    expect(meta.required).not.toContain('no_provider_answer');
+    expect(meta.properties.no_provider_answer.$ref).toBe('#/components/schemas/NoProviderAnswer');
+    const marker = schemas.NoProviderAnswer;
+    expect(marker.additionalProperties).toBe(false);
+    expect(marker.required).toEqual(['reasons']);
+    expect(marker.properties.reasons.items.enum).toEqual([
+      'outage',
+      'http_error',
+      'deadline',
+      'abort',
+    ]);
+  });
+});

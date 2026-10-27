@@ -688,6 +688,26 @@ const spec = {
           },
         },
       },
+      NoProviderAnswer: {
+        type: 'object',
+        required: ['reasons'],
+        additionalProperties: false,
+        description:
+          'Typed marker that no provider answer was produced. Distinct from a model-emitted UNCERTAIN, which omits this object.',
+        properties: {
+          reasons: {
+            type: 'array',
+            minItems: 1,
+            uniqueItems: true,
+            items: {
+              type: 'string',
+              enum: ['outage', 'http_error', 'deadline', 'abort'],
+            },
+            description:
+              'outage: both circuits open. http_error: provider HTTP or transport failure. deadline: attempt, call, or request budget exhausted. abort: request aborted (not an attempt timeout).',
+          },
+        },
+      },
       DqlResponse: {
         type: 'object',
         required: ['id', 'version', 'axes', 'aggregate', 'meta'],
@@ -720,6 +740,11 @@ const spec = {
                 items: { $ref: '#/components/schemas/Axis' },
               },
               sandbox: { type: 'boolean' },
+              no_provider_answer: {
+                $ref: '#/components/schemas/NoProviderAnswer',
+                description:
+                  'Present only when every evaluated axis failed before a provider served an answer (outage, HTTP/transport error, deadline, or abort). Absent when at least one axis was served, including a genuine model UNCERTAIN — that result stays billable. When present, credit is released (not committed), PAYG is not metered, and x402 is not settled. Per-axis verdict stays UNCERTAIN; aggregate is never ALLOW. HTTP status stays 200.',
+              },
             },
           },
         },

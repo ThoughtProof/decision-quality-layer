@@ -23,6 +23,10 @@ import { AXIS_PROMPT_BUILDERS } from './axes/index.js';
 import { aggregate } from '../aggregation.js';
 import type { Cascade } from './cascade.js';
 import { CircuitAllOpenError, ProviderCallError } from './llm-client.js';
+import {
+  classifyUnservedProviderFailure,
+  noProviderAnswerMarker,
+} from './no-provider-answer.js';
 import { generateCallId, type CallContext } from './call-context.js';
 import type { RuntimeDiagnosticsCollector } from './runtime-diagnostics.js';
 import {
@@ -154,8 +158,10 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
           : {}),
       };
       try {
-        return await cascade.run({ axis, prompt, ctx });
+        const served = await cascade.run({ axis, prompt, ctx });
+        return { ...served, unserved: undefined };
       } catch (err) {
+        const unserved = classifyUnservedProviderFailure(err);
         const isCircuitAllOpen = err instanceof CircuitAllOpenError;
         const isProviderError = err instanceof ProviderCallError;
         const objection = isCircuitAllOpen
@@ -177,8 +183,13 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
         //     provider fetch was made            → 'provider_error'
         //   ProviderCallError (single-axis HTTP/transport failure that did
         //     NOT trip the breaker, e.g. HTTP 401) → 'provider_error'
+        //   Typed no-answer abort (raw AbortError) → 'provider_error' so the
+        //     aggregate cannot ALLOW.
         //   Any OTHER error (local config: missing key, unknown alias, or an
         //     unexpected bug) → no provider_outcome; retains prior policy.
+        // Outage / HTTP / deadline / abort on EVERY axis also sets
+        // meta.no_provider_answer. A served axis, including a genuine model
+        // UNCERTAIN, leaves that marker unset (still billable).
         let providerOutcome:
           | 'circuit_rejected'
           | 'provider_error'
@@ -189,6 +200,12 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
               ? 'circuit_rejected'
               : 'provider_error';
         } else if (isProviderError) {
+          providerOutcome = 'provider_error';
+        } else if (unserved) {
+          // Raw abort (and any other typed no-answer that is not already a
+          // ProviderCallError / CircuitAllOpenError) still fail-closes.
+          // Aggregation Rule 2 must see provenance so the aggregate is never
+          // ALLOW when no provider answered.
           providerOutcome = 'provider_error';
         }
         const result: AxisResult = {
@@ -201,13 +218,14 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
           // route ultimately SERVED a response, so no route may be named.
           ...(providerOutcome ? { provider_outcome: providerOutcome } : {}),
         };
-        return { result, modelsUsed: [] };
+        return { result, modelsUsed: [], unserved };
       }
     })
   );
 
   const axisResults: AxisResult[] = perAxis.map((p) => p.result);
   const modelsUsed = uniqueStrings(perAxis.flatMap((p) => p.modelsUsed));
+  const unservedMarker = noProviderAnswerMarker(perAxis.map((p) => p.unserved));
   let aggregateResult = aggregate(axisResults);
 
   // Principal materiality ceiling (autonomy bound): amount >= ceiling → REVIEW.
@@ -222,6 +240,19 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
     aggregateResult,
     input.request.structured_context,
   );
+
+  // No provider answer must never ALLOW. Rule 2 already maps
+  // provider_error / circuit_rejected to REVIEW; this is the belt if a
+  // future aggregator change drops that provenance.
+  if (unservedMarker && aggregateResult.verdict === 'ALLOW') {
+    aggregateResult = {
+      verdict: 'REVIEW',
+      confidence: Math.max(aggregateResult.confidence, 0.85),
+      triggered_by: axisResults.map((r) => r.axis),
+      rationale:
+        'No provider answer (outage, HTTP error, deadline, or abort). Fail-closed: human review required (not ALLOW).',
+    };
+  }
 
   // Surface gate: numeric objections/reasons are claims. Bind checkable
   // exceed/within text against structured_context + free-text fields before
@@ -266,6 +297,7 @@ export async function runVerification(input: EngineInput): Promise<DqlResponse> 
             },
           }
         : {}),
+      ...(unservedMarker ? { no_provider_answer: unservedMarker } : {}),
     },
   };
   } finally {

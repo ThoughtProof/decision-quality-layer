@@ -69,6 +69,7 @@ import {
 } from '../../src/engine/runtime-diagnostics.js';
 
 import { PACKAGE_VERSION } from '../../src/package-version.js';
+import { isNoProviderAnswer } from '../../src/engine/no-provider-answer.js';
 
 /** Artifact version (package.json). See docs/ENV.md § Version semantics. */
 const VERSION = PACKAGE_VERSION;
@@ -501,10 +502,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               : {}),
           });
 
-          // Account PAYG: persist result as meter_pending, then meter, then
-          // commit. A failed meter must not discard the engine result or
-          // release the debit — retry remeters only.
-          if (accountHold && KEY_STORE && accountHold.billing === 'payg' && authPath.kind === 'allow') {
+          // No provider answer (outage, HTTP error, deadline, abort): the
+          // engine still returns UNCERTAIN / fail-closed REVIEW, but that is
+          // not a billable result. Release the reservation, do not meter
+          // PAYG, do not settle x402. HTTP status stays 200 — same body
+          // shape clients already handle. A genuine model UNCERTAIN omits
+          // meta.no_provider_answer and stays on the commit path below.
+          if (isNoProviderAnswer(response)) {
+            if (accountHold && KEY_STORE) {
+              await releaseHeldReservation(accountHold, KEY_STORE, 'no_provider_answer');
+              accountHold = null;
+            }
+            status = 200;
+            payload = response;
+          } else if (accountHold && KEY_STORE && accountHold.billing === 'payg' && authPath.kind === 'allow') {
             const pending = await persistMeterPending({
               requestId: accountHold.requestId,
               keyHash: accountHold.keyHash,
@@ -555,7 +566,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
           }
 
-          // 4) Payment settle / Stripe meter ONLY after successful DQL.
+          // 4) Payment settle / Stripe meter ONLY after a billable DQL result.
+          // payload is already set for no-provider-answer, so this block does
+          // not meter and the x402 branch does not settle.
           if (authPath.kind === 'allow' && status === 200 && payload === null) {
             const price = priceForCall({
               sandbox: false,
@@ -613,9 +626,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
             status = 200;
             payload = response;
-          } else if (authPath.kind === 'x402_verified') {
-            // Settle only after successful DQL. Outcome may be settled,
-            // PAYMENT_FAILED, PAYMENT_UNAVAILABLE, or PAYMENT_STATUS_UNKNOWN.
+          } else if (authPath.kind === 'x402_verified' && payload === null) {
+            // Settle only after a billable DQL result. No-provider-answer
+            // already filled payload and must not settle. Outcome may be
+            // settled, PAYMENT_FAILED, PAYMENT_UNAVAILABLE, or
+            // PAYMENT_STATUS_UNKNOWN.
             const settled = await settleX402Payment(authPath.ctx, process.env);
             if (settled.kind === 'reject') {
               status = settled.status;
@@ -652,7 +667,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               status = 200;
               payload = response;
             }
-          } else if (authPath.kind === 'free_sandbox') {
+          } else if (authPath.kind === 'free_sandbox' && payload === null) {
             res.setHeader('X-DQL-Billing', 'sandbox');
             res.setHeader('X-DQL-Price-Usd', '0.00');
             status = 200;
@@ -664,16 +679,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   } catch (err) {
     if (accountHold && KEY_STORE) {
-      try {
-        await releaseVerifyReservation({
-          requestId: accountHold.requestId,
-          keyHash: accountHold.keyHash,
-          fence: accountHold.fence,
-          store: KEY_STORE,
-        });
-      } catch {
-        // Release must not mask the original failure.
-      }
+      await releaseHeldReservation(accountHold, KEY_STORE, 'handler_throw');
       accountHold = null;
     }
     status = 500;
@@ -681,6 +687,49 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   return sendJsonWithDiagnostics(res, collector, status, payload);
+}
+
+/**
+ * Refund a held verify reservation. Failures are logged without secrets
+ * and do not mask the handler outcome. The reservation sweep remains the
+ * fallback when release does not ack.
+ */
+async function releaseHeldReservation(
+  hold: { requestId: string; keyHash: string; fence: number },
+  store: NonNullable<typeof KEY_STORE>,
+  reason: 'no_provider_answer' | 'handler_throw',
+): Promise<void> {
+  try {
+    const ack = await releaseVerifyReservation({
+      requestId: hold.requestId,
+      keyHash: hold.keyHash,
+      fence: hold.fence,
+      store,
+    });
+    if (ack !== 'released') {
+      logReservationReleaseFailure(hold.requestId, reason, 'noop');
+    }
+  } catch {
+    logReservationReleaseFailure(hold.requestId, reason, 'error');
+  }
+}
+
+function logReservationReleaseFailure(
+  requestId: string,
+  reason: 'no_provider_answer' | 'handler_throw',
+  outcome: 'noop' | 'error',
+): void {
+  // requestId is the idempotency id (already rejected if it looks like a
+  // secret). Do not log key hashes, account tokens, or error messages.
+  console.error(
+    JSON.stringify({
+      type: 'dql_reservation_release',
+      outcome,
+      reason,
+      request_id: requestId,
+      ts: new Date().toISOString(),
+    }),
+  );
 }
 
 function meterUnavailablePayload(): Record<string, unknown> {
