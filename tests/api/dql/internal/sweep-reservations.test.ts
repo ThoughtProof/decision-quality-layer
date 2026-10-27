@@ -247,5 +247,10 @@ esac
     const logged = readFileSync(logFile, 'utf8');
     expect(logged).toContain('Authorization: Bearer sweep-test-secret');
     expect(logged).toContain('-X POST');
+    expect(logged).toContain('--max-time');
+    expect(logged).toContain('--retry 3');
+    expect(logged).toContain('--retry-delay 10');
+    expect(logged).toContain('--retry-all-errors');
+    expect(logged).not.toMatch(/(^|\s)(-f|--fail)(\s|$)/m);
   });
 });

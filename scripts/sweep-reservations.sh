@@ -3,6 +3,11 @@
 # or a non-2xx response is a job failure (never skip-success).
 # Required env: DQL_SWEEP_URL and (DQL_CRON_SECRET or CRON_SECRET).
 # Do not echo the bearer token or treat a missing secret as success.
+#
+# The sweep is idempotent (only still-held expired leases are refunded),
+# so transient DNS/connect failures are retried. Do not pass -f/--fail:
+# that would turn HTTP statuses into curl errors, and --retry-all-errors
+# would retry them (including 401). Non-2xx is failed from %{http_code}.
 set -euo pipefail
 
 SECRET="${DQL_CRON_SECRET:-${CRON_SECRET:-}}"
@@ -28,6 +33,9 @@ CODE="$("${CURL_BIN}" -sS -o "${BODY}" -w '%{http_code}' -X POST \
   -H "Authorization: Bearer ${SECRET}" \
   -H "Accept: application/json" \
   --max-time "${TIMEOUT}" \
+  --retry 3 \
+  --retry-delay 10 \
+  --retry-all-errors \
   "${URL}")"
 CURL_STATUS=$?
 set -e
