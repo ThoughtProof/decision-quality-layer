@@ -12,10 +12,13 @@ import { UpstashKeyStore, createMemoryKv, selfServeOwner } from '../../../src/au
 import { STARTER_CREDITS } from '../../../src/auth/packs.js';
 
 type Mode = 'outage' | 'http' | 'deadline' | 'abort' | 'uncertain' | 'allow' | 'block';
+type PartialFail = 'outage' | 'http' | 'deadline';
 
 const harness = vi.hoisted(() => ({
   store: null as InstanceType<typeof UpstashKeyStore> | null,
   mode: 'outage' as Mode,
+  /** When set, `intent` is served and `scope` fails. Null keeps `mode` for every axis. */
+  partial: null as PartialFail | null,
   runs: 0,
   meterCalls: 0,
 }));
@@ -47,20 +50,35 @@ vi.mock('../../../src/engine/cascade.js', async (importOriginal) => {
       // Re-import on each call so the thrown classes match the engine copy
       // after vi.resetModules() (instanceof would otherwise miss).
       const llm = await import('../../../src/engine/llm-client.js');
-      if (harness.mode === 'outage') {
+      if (harness.partial && input.axis === 'intent') {
+        return {
+          result: {
+            axis: input.axis,
+            verdict: 'PASS' as const,
+            confidence: 0.9,
+            reasoning: 'scripted provider answer',
+            objection: '',
+            provider_outcome: 'served' as const,
+            provider_route: 'primary' as const,
+          },
+          modelsUsed: ['serv:scripted'],
+        };
+      }
+      const failKind = harness.partial ?? harness.mode;
+      if (failKind === 'outage') {
         throw new llm.CircuitAllOpenError('serv-nano', 'serv-swift', 'open', 'open', []);
       }
-      if (harness.mode === 'http') {
+      if (failKind === 'http') {
         throw new llm.ProviderCallError('[llm-client] serv 503: unavailable', 'serv', 503);
       }
-      if (harness.mode === 'deadline') {
+      if (failKind === 'deadline') {
         throw new llm.DeadlineExceededError(
           '[llm-client] request deadline exhausted',
           'serv',
           'request_deadline',
         );
       }
-      if (harness.mode === 'abort') {
+      if (!harness.partial && harness.mode === 'abort') {
         const err = new Error('The operation was aborted');
         err.name = 'AbortError';
         throw err;
@@ -162,6 +180,7 @@ describe.sequential('POST /dql/verify — no provider answer is not billed', () 
     }
     harness.store = new UpstashKeyStore(createMemoryKv());
     harness.mode = 'outage';
+    harness.partial = null;
     harness.runs = 0;
     harness.meterCalls = 0;
   });
@@ -185,11 +204,34 @@ describe.sequential('POST /dql/verify — no provider answer is not billed', () 
     return minted;
   }
 
-  async function post(headers: Record<string, string>) {
+  async function post(headers: Record<string, string>, requestBody: unknown = body) {
     const mod = await import('../../../api/dql/verify.js');
-    const made = makeReqRes(body, headers);
+    const made = makeReqRes(requestBody, headers);
     await mod.default(made.req, made.res);
     return made.state;
+  }
+
+  const partialBody = {
+    ...body,
+    axes: ['intent', 'scope'],
+  };
+
+  function expectPartialBillable(state: { statusCode: number; jsonBody: any }, failedOutcome: string) {
+    expect(state.statusCode).toBe(200);
+    const axes = state.jsonBody.axes as Array<{
+      axis: string;
+      verdict: string;
+      provider_outcome?: string;
+    }>;
+    const served = axes.find((axis) => axis.axis === 'intent');
+    const failed = axes.find((axis) => axis.axis === 'scope');
+    expect(served?.provider_outcome).toBe('served');
+    expect(served?.verdict).toBe('PASS');
+    expect(failed?.verdict).toBe('UNCERTAIN');
+    expect(failed?.provider_outcome).toBe(failedOutcome);
+    expect(state.jsonBody.meta.no_provider_answer).toBeUndefined();
+    expect(state.jsonBody.aggregate.verdict).not.toBe('ALLOW');
+    expect(JSON.stringify(state.jsonBody)).not.toMatch(/dqlk_|dqla_/);
   }
 
   it.each([
@@ -368,6 +410,78 @@ describe.sequential('POST /dql/verify — no provider answer is not billed', () 
     expect(await harness.store!.creditBalance(hash)).toBe(STARTER_CREDITS - 1);
     expect(harness.meterCalls).toBe(0);
   });
+
+  it.each([
+    ['outage', 'circuit_rejected'],
+    ['http', 'provider_error'],
+    ['deadline', 'provider_error'],
+  ] as const)(
+    'partial %s is billed in full (founder decision: never pro rata)',
+    async (fail, failedOutcome) => {
+      harness.partial = fail;
+      const counts = instrument(harness.store!);
+
+      const credit = await mint();
+      const creditHash = sha256Hex(credit.plaintext);
+      const creditState = await post(
+        { 'x-dql-account': credit.accountToken, 'idempotency-key': `partial-credit-${fail}` },
+        partialBody,
+      );
+      expectPartialBillable(creditState, failedOutcome);
+      expect(counts.commit).toBe(1);
+      expect(counts.release).toBe(0);
+      expect(harness.meterCalls).toBe(0);
+      expect(await harness.store!.creditBalance(creditHash)).toBe(STARTER_CREDITS - 1);
+      expect(await harness.store!.usageToday(creditHash)).toBe(1);
+
+      harness.meterCalls = 0;
+      const payg = await mint('payg');
+      const paygHash = sha256Hex(payg.plaintext);
+      const paygState = await post(
+        { 'x-dql-account': payg.accountToken, 'idempotency-key': `partial-payg-${fail}` },
+        partialBody,
+      );
+      expectPartialBillable(paygState, failedOutcome);
+      expect(paygState.headers['X-DQL-Meter']).toBe('ok');
+      expect(counts.commit).toBe(2);
+      expect(counts.release).toBe(0);
+      expect(counts.pending).toBe(1);
+      expect(harness.meterCalls).toBe(1);
+      expect(await harness.store!.creditBalance(paygHash)).toBe(0);
+      expect(await harness.store!.usageToday(paygHash)).toBe(1);
+      expect(await harness.store!.creditBalance(creditHash)).toBe(STARTER_CREDITS - 1);
+
+      harness.meterCalls = 0;
+      const fetchMock = vi.fn(async (url: string) => {
+        if (String(url).includes('/settle')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ success: true, transaction: '0xpartial' }),
+            text: async () => '',
+          };
+        }
+        if (String(url).includes('/verify')) {
+          return { ok: true, status: 200, json: async () => ({ isValid: true }), text: async () => '' };
+        }
+        return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      process.env.DQL_X402_ENABLED = 'true';
+      process.env.X402_FACILITATOR_URL = 'https://fac.example';
+      const sig = Buffer.from(
+        JSON.stringify({ network: 'base', payload: { authorization: { nonce: `n-partial-${fail}` } } }),
+      ).toString('base64');
+      const x402 = await post({ 'payment-signature': sig }, partialBody);
+      expectPartialBillable(x402, failedOutcome);
+      expect(x402.headers['X-DQL-Billing']).toBe('x402');
+      const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+      expect(urls.filter((url) => url.includes('/settle'))).toHaveLength(1);
+      expect(harness.meterCalls).toBe(0);
+      expect(counts.release).toBe(0);
+      expect(counts.commit).toBe(2);
+    },
+  );
 
   it('release failure is logged without secrets and leaves the hold for sweep', async () => {
     harness.mode = 'abort';
